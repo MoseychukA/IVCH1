@@ -1,0 +1,3 @@
+Layer Pairs Export File for PCB: C:\Users\akv.CYMPAK\Documents\Projects\Altium\RS485-STM32-Mysensors-Ethernet-light-gateway\STM32_GW.PcbDoc
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=stm32_gw-roundholes.txt|DrillLayers=gtl,gbl
+LayersSetName=Top_Bot_Slot_Holes|DrillFile=stm32_gw-slotholes.txt|DrillLayers=gtl,gbl

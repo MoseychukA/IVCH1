@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  %& <!-- links -->
+  <title>Темы и сайты - Arduino Mega Server</title>
+
+<script>
+function start() {
+  logoRotator();
+  getDashData();
+  cycleThemes();
+}
+
+var hideInfo1 = false;
+
+function showHide1() {
+  if (hideInfo1) {document.getElementById("hider-1").style.display = "block"; hideInfo1 = false;}
+            else {document.getElementById("hider-1").style.display = "none";  hideInfo1 = true;}
+}
+
+var themeCode = "";
+var reload = false;
+
+var oldTheme = "";
+
+function cycleThemes() {
+  var request = new XMLHttpRequest();
+  request.onreadystatechange = function() {
+    if (this.readyState == 4) {
+      if (this.status == 200) {
+        if (this.responseXML != null) {
+          // net activ
+          insertTick(30, bufferCpuLoad2);
+            
+          var theme = this.responseXML.getElementsByTagName('theme')[0].childNodes[0].nodeValue;
+
+          if (oldTheme != "" && oldTheme != theme) {reload = true;}
+
+          switch (theme) {  
+            case "1": document.getElementById("p1").checked = true; break;
+            //case "2": document.getElementById("p2").checked = true; break;
+            case "3": document.getElementById("p3").checked = true; break;
+            case "4": document.getElementById("p4").checked = true; break;
+            case "5": document.getElementById("df").checked = true; break;
+            case "6": document.getElementById("hm").checked = true; break;
+            case "7": document.getElementById("md").checked = true; break;
+            case "8": document.getElementById("hk").checked = true; break;
+          }
+          oldTheme = theme;          
+        } // if
+      } // if
+    } // if
+  } // request
+
+  if (reload) {
+    reload = false;
+    //alert('Сейчас стиль оформления будет изменён...')
+    location.reload();
+  }
+
+  request.open("GET", "request_themes" + themeCode + randomNoCache(), true);
+  request.send(null);
+  setTimeout('cycleThemes()', 2100);
+  themeCode = "";
+} // cycleSettings()
+
+function setRadio() {
+  themeCode = "";
+  if (document.getElementById("p1").checked) {themeCode = "&theme=1";}
+  //if (document.getElementById("p2").checked) {themeCode = "&theme=2";}
+  if (document.getElementById("p3").checked) {themeCode = "&theme=3";}
+  if (document.getElementById("p4").checked) {themeCode = "&theme=4";}
+  if (document.getElementById("df").checked) {themeCode = "&theme=5";}
+  if (document.getElementById("hm").checked) {themeCode = "&theme=6";}
+  if (document.getElementById("md").checked) {themeCode = "&theme=7";}
+  if (document.getElementById("hk").checked) {themeCode = "&theme=8";}
+}
+  
+%# // scripts.js
+var currentPage = 'themes-page';
+</script>
+</head>
+
+<body onload="start();">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">ТЕМЫ И САЙТЫ</h1>
+      <div class="level-title clickable" onclick="showHide1()">
+        <h2>Оформление и сайты партнёров</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-1">
+        <div class="cell-2">
+          <div class="box">
+            <h3>Сайты-темы партнёров</h3>
+            <p><input type="radio" name="choiceTheme" id="p1" onclick="setRadio()" /> Амперка</p>
+            <p><input type="radio" name="choiceTheme" id="p3" onclick="setRadio()" /> Geegrow</p>
+            <p><input type="radio" name="choiceTheme" id="p4" onclick="setRadio()" /> electromicroLab</p>
+            <p class="disable"><input type="radio" name="choiceTheme" id="p0" disabled="disabled" /> Ваша компания</p>
+            <p>Сайты-темы партнёров: настройки, примеры, информация и эксклюзивные предложения для вас</p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box">
+            <h3>Стили дизайна</h3>
+            <p><input type="radio" name="choiceTheme" id="df" onclick="setRadio()" /> Гик моде (по умолчанию)</p>
+            <p><input type="radio" name="choiceTheme" id="hm" onclick="setRadio()" /> Домашний</p>
+            <p><input type="radio" name="choiceTheme" id="md" onclick="setRadio()" /> Модерн</p>
+            <p><input type="radio" name="choiceTheme" id="hk" onclick="setRadio()" /> Хакер дизайн</p>
+            <p>То, как будет выглядеть ваш сайт. От техно-гиков к полному минимализму</p>
+          </div>
+        </div>
+      </div> <!-- hider -->
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+%5
+  
+%4 <!-- footer -->
+</body>
+</html>

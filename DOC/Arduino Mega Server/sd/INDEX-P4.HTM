@@ -1,0 +1,301 @@
+<!DOCTYPE html>      
+
+
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>electromicroLab - Arduino Mega Server</title>
+  
+<style>
+.zoomin15 {
+  display: inline-block;
+          transform: scale(1.7);
+  -webkit-transform: scale(1.7);
+}
+
+.zoomin2 {
+  display: inline-block;
+          transform: scale(2);
+  -webkit-transform: scale(2);
+}
+
+.zoomin25 {
+  display: inline-block;
+          transform: scale(2.4);
+  -webkit-transform: scale(2.4);
+}
+
+.zoomin3 {
+  display: inline-block;
+          transform: scale(3);
+  -webkit-transform: scale(3);
+}
+</style>
+
+<script>
+  function start() {
+    genNumber();
+    getDashData();    
+  }
+  
+%# // scripts.js
+</script>
+</head>
+
+<body onload="start();">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block bottom-40">
+      <h1 class="title-page center">electromicroLab</h1>
+      <div class="box-image">
+        <img class="auto" src="euno.jpg" alt="">
+      </div>
+      <p class="lead center">Разработка электроники полного цикла<br>от идеи до упаковки</p>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+
+  <div class="level" style="background-color:#E99B05; color:#fff;">
+    <div class="block spaces-20">
+      <div class="cell-2">
+        <div class="box-info" style="padding-bottom:5px;">
+          <h2 class="text-big alt2" style="line-height:50px;">Наша компания</h2>
+        </div> 
+      </div>
+      <div class="cell-2">
+      
+      </div>
+      <div style="clear:both"></div>
+      <div class="cell-1">
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Мы молодая и активно развивающаяся компания в сфере разработки, производства и продажи микроэлектроники. Наша компания работает с 2012 года и обладает хорошим опытом по разработке различных проектов. У нас работают опытные специалисты с большим стажем из России и Китая.</p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Кроме разработки мы занимаемся поставкой и продажей электронных устройств и комплектующих для рынка DIY и сотрудничаем со многими производственными компаниями в России, Китае и Европе.</p>
+          </div>
+        </div>
+      </div>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block bottom-40">
+      <h1 class="title-page center">Нам доступна любая сложность</h1>
+      <div class="box-image">
+        <img class="auto" src="eyotster.jpg" alt="">
+      </div>
+      <p class="lead center">IoT плата с микроконтроллером SAMD21G<br>и беспроводным модулем LoRa<br>на чипсете Semtech SX1276</p>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+
+  <div class="level" style="background-color:#E6364D; color:#fff;">
+    <div class="block spaces-20">
+      <div class="cell-2">
+        <div class="box-info" style="padding-bottom:5px;">
+          <h2 class="text-big alt2" style="line-height:50px;">Контрактная разработка</h2>
+        </div> 
+      </div>
+      <div class="cell-2">
+      
+      </div>
+      <div style="clear:both"></div>
+      <div class="cell-1">
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Мы занимаемся контрактной разработкой полного цикла от составления технического задания на будущее изделие до его производства, упаковки, отгрузки и технической поддержки. Все работы производятся строго с сохранением коммерческой тайны и заключением официальных договоров.</p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Также мы разрабатываем и продаём собственные платы и устройства под своим брендом для рынка DIY и IoT решений. У нас также имеется опыт и «ноу-хау» в разработке проектов  с использованием RFID, NFC и LoRa технологий и мы постоянно расширяем наш арсенал.</p>
+          </div>
+        </div>
+      </div>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+  
+  <div class="level" style="background-color:#E6364D; color:#fff;">
+    <div class="block bottom-30">
+      <div class="cell-3 top-10">
+          <div class="box-image">
+            <div class="box-info center">
+              <p class="zoomin25" style="font-size: 52px;"><i class="icono-sitemap" style="color:#ffc;"></i></p>
+              <h3 class="center" style="margin-top:12px; color:#fff;">Разработка </h3>
+            </div>
+          </div>
+      </div>
+      <div class="cell-3 top-10">
+          <div class="box-image">
+            <div class="box-info center">
+              <p class="zoomin15" style="font-size: 52px;"><i class="icono-icono" style="color:#ffc;"></i></p>
+              <h3 class="center" style="margin-top:12px; color:#fff;">Производство </h3>
+            </div>
+          </div>          
+      </div>
+      <div class="cell-3 top-10">
+          <div class="box-image">
+            <div class="box-info center">
+              <p class="zoomin2" style="font-size: 52px;"><i class="icono-headphone" style="color:#ffc;"></i></p>
+              <h3 class="center" style="margin-top:12px; color:#fff;">Сервис</h3>
+            </div>
+          </div>
+      </div>      
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->  
+  
+  <div class="level" style="background-color:#F4D4A3; color:#000;">
+    <div class="block spaces-20">
+      <div class="cell-2">
+        <div class="box-info" style="padding-bottom:5px;">
+          <h2 class="text-big alt2" style="line-height:50px; color:#000;">Обучение</h2>
+        </div> 
+      </div>
+      <div class="cell-2">
+      
+      </div>
+      <div style="clear:both"></div>
+      <div class="cell-1">
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Мы понимаем важность освоения новых технологий как подрастающим поколением, так и взрослыми людьми и поэтому большое внимание уделяем обучающим материалам для образовательных центров и школ робототехники.</p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Также мы пишем и публикуем книги по современным IT технологиям, в частности, по микроконтроллерам, у нас также имеется своя StartUp лаборатория и интернет-магазин, где можно купить комплектующие для ваших проектов.</p>
+          </div>
+        </div>
+      </div>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+  
+  <div class="level">
+    <div class="block top-10 bottom-50">
+      <h1 class="title-page center">Разрабатываем</h1>
+      <div class="cell-3 top-10">
+          <div class="box-image">
+            <div class="box-info center">
+              <p class="zoomin3" style="font-size: 52px;"><i class="icono-power" style="color:#3123CE;"></i></p>
+              <h3 class="center" style="margin-top:24px; color:#555;">Платы и устройства</h3>
+            </div>
+          </div>
+      </div>
+      <div class="cell-3 top-10">
+          <div class="box-image">
+            <div class="box-info center">
+              <p class="zoomin25" style="font-size: 52px;"><i class="icono-list" style="color:#3123CE;"></i></p>
+              <h3 class="center" style="margin-top:24px; color:#555;">Программы и прошивки</h3>
+            </div>
+          </div>          
+      </div>
+      <div class="cell-3 top-10">
+          <div class="box-image">
+            <div class="box-info center">
+              <p class="zoomin25" style="font-size: 52px;"><i class="icono-pin" style="color:#3123CE;"></i></p>
+              <h3 class="center" style="margin-top:24px; color:#555;">Сайты и сервисы</h3>
+            </div>
+          </div>
+      </div>      
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->  
+  
+  <div class="level" style="background-color:#E6364D; color:#fff;">
+    <div class="block spaces-20">
+      <div class="cell-2">
+        <div class="box-info" style="padding-bottom:5px;">
+          <h2 class="text-big alt2" style="line-height:50px;">Поддержка</h2>
+        </div> 
+      </div>
+      <div class="cell-2">
+      
+      </div>
+      <div style="clear:both"></div>
+      <div class="cell-1">
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Мы осуществляем техническую поддержку наших пользователей и заказчиков через любые удобные для вас формы связи: сайт, электронная почта, телефон, WatsUp, Viber, Telegram, Skype и т. д.</p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Обработка поступившего сообщения занимает не более десяти минут. Наши сотрудники с удовольствием ответят на все ваши вопросы, а также проконсультируют по стоимости и срокам реализации вашего проекта.</p>
+          </div>
+        </div>
+      </div>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block bottom-20">
+      <h1 class="title-page center">Наш блог</h1>
+      <div class="box-image">
+        <img class="auto" src="eworks.jpg" alt="">
+      </div>
+      <p class="lead center">В нашем блоге <a style="color:#28d" href="//electromicrolab.com" target="_blank">electromicrolab.com</a><br>вы можете найти много полезной информации<br>о наших разработках, IT бизнесе и новостях индустрии</p>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+  
+  <div class="level" style="background-color:#E99B05; color:#fff;">
+    <div class="block spaces-20">
+      <div class="cell-2">
+        <div class="box-info" style="padding-bottom:5px;">
+          <h2 class="text-big alt2" style="line-height:50px;">Техзадание</h2>
+        </div> 
+      </div>
+      <div class="cell-2">
+      
+      </div>
+      <div style="clear:both"></div>
+      <div class="cell-1">
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Если вы пока имеете только идею нового электронного устройства или системы, но не умеете составлять техническое задание, то наши специалисты помогут вам составить ТЗ на ваш проект.</p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box-info">
+            <p style="margin-top:0;">Мы ценим ваше время и работаем быстро и профессионально. Например, среднее время разработки печатной платы после согласования ТЗ составляет всего две недели.</p>
+          </div>
+        </div>
+      </div>
+      <div style="clear:both"></div>   
+    </div>
+  </div> <!-- level -->
+  
+  <div class="level">
+    <div class="block top-40 bottom-10">
+      <div class="cell-2 auto">
+        <a href="//electromicrolab.ru/" target="_blank">
+          <div class="box">
+            <br>
+            <h1 class="center" style="color:#E99B05;">Заказать разработку проекта</h1>
+            <br>
+            <img class="auto" src="logo-p4.png" alt="">
+            <p class="center" style="color:#444;">Вы всего в одном клике мышкой от реализации ваших самых смелых технологических проектов. Просто пришлите нам техническое задание или описание вашей идеи и наша команда профессионалов в кратчайшие сроки воплотит ваш проект в реальность!</p>
+            <br>
+            <img class="auto" src="click.png" alt="">
+            <br>
+          </div>
+        </a>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+  
+%4 <!-- footer -->
+</body>
+</html>

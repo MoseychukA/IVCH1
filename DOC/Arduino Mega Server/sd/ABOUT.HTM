@@ -1,0 +1,94 @@
+<!DOCTYPE html>   
+
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>О системе - Arduino Mega Server</title>
+
+<script>
+  function start() {
+    document.getElementById("hider-2").style.display = "none";
+    logoRotator();
+    getDashData();
+  }
+
+  var hideInfo1 = false;
+  var hideInfo2 = true;
+  
+  function showHide1() {
+    if (hideInfo1) {document.getElementById("hider-1").style.display = "block"; hideInfo1 = false;}
+              else {document.getElementById("hider-1").style.display = "none";  hideInfo1 = true;}
+  }
+  function showHide2() {
+    if (hideInfo2) {document.getElementById("hider-2").style.display = "block"; hideInfo2 = false;}
+              else {document.getElementById("hider-2").style.display = "none";  hideInfo2 = true;}
+  }
+
+%# // scripts.js
+</script>
+</head>
+
+<body onload="start()">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">О СИСТЕМЕ</h1>
+      <div class="level-title clickable" onclick="showHide1()">
+        <h2>Arduino Mega Server</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-1">
+        <div class="cell-2">
+          <div class="box">
+            <h3>Система</h3>
+            <p>Arduino Mega Server <span class="value">0.17</span></p>
+            <p><span class="value">©Hi-Lab.ru, 2018</span></p>
+            <p>Почта: <span class="value"><a href="mailto:info@hi-lab.ru">info@hi-lab.ru</a></span></p>
+            <p>Домашняя страница: <span class="value"><a href="//hi-lab.ru/arduino-mega-server" target="_blank">hi-lab.ru/arduino-mega-server</a></span></p>
+            <p><strong>AMS <em><span style="color:red;">Pro</span></em></strong>: <span class="value"><a href="//hi-lab.ru/arduino-mega-server/ams-pro" target="_blank">hi-lab.ru/arduino-mega-server/ams-pro</a></span></p>
+            <h3>Оборудование</h3>
+            <p>Микроконтроллер: <span class="value">Arduino Mega 2560</span></p>
+            <p>Сетевая плата: <span class="value">Ethernet Shield</span></p>
+            <h3>Документация</h3>
+            <p>Документация: <span class="value"><a href="//hi-lab.ru/arduino-mega-server/documentation" target="_blank">hi-lab.ru/arduino-mega-server/documentation</a></span></p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box">
+            <h3>Лицензия</h3>
+            <p style="margin-top:16px;"><strong>Arduino Mega Server</strong>. <span class="value">Свободное программное обеспечение только для личного использования. Поставляется «как есть» и без каких-либо гарантий. Права на сторонние библиотеки принадлежат их владельцам.</span></p>
+            <p style="margin-top:16px;"><strong>Коммерческое использование</strong>. <span style="color:#c00;">Запрещается использование этого программного обеспечения, а также его частей и производных от него, в коммерческих целях, на производстве, в составе тиражируемых проектов и для любого, прямого или косвенного, извлечения выгоды. Для коммерческого использования и проектов существует специально для этого предназначенная версия <strong>AMS <em>Pro</em></strong> с соответствующим лицензированием.</span></p>
+            <br>
+          </div>
+        </div>
+      </div> <!-- hider -->
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block">
+      <div class="level-title clickable" onclick="showHide2()">
+        <h2>Версии</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-2">
+        <div class="cell-1">
+          <div class="box">
+            <h3>Изменения в 0.17 версии</h3>
+            <p>Главное изменение в 0.17 версии <strong>Arduino Mega Server</strong> — это переход с устаревшей базовой версии Arduino IDE 1.6.5 на новую версию среды разработки <strong>1.8.5</strong>. Кроме этого, код системы значительно доработан и улучшен, устранены найденные ошибки и недочёты.</p>
+          </div>
+        </div>
+        <div style="clear:both"></div>
+      </div>
+    </div>
+  </div> <!-- level -->
+
+%5
+  
+%4 <!-- footer -->
+</body>
+</html>

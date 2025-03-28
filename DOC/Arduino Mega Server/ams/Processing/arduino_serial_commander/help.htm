@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>Помощь - Arduino Mega Server</title>
+
+<script>
+  function start() {
+    document.getElementById("hider-2").style.display = "none";
+    logoRotator();
+    getDashData();
+  }
+
+  var hideInfo1 = false;
+  var hideInfo2 = true;
+  
+  function showHide1() {
+    if (hideInfo1) {document.getElementById("hider-1").style.display = "block"; hideInfo1 = false;}
+              else {document.getElementById("hider-1").style.display = "none";  hideInfo1 = true;}
+  }
+  function showHide2() {
+    if (hideInfo2) {document.getElementById("hider-2").style.display = "block"; hideInfo2 = false;}
+              else {document.getElementById("hider-2").style.display = "none";  hideInfo2 = true;}
+  }
+
+%# // scripts.js
+</script>
+</head>
+
+<body onload="start()">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">Помощь</h1>
+      <div class="level-title clickable" onclick="showHide1()">
+        <h2>Быстрый старт</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-1">
+        <div class="cell-2">
+          <div class="box">
+            <h3>Скетч и файлы</h3>
+            <p>Скетч: <span class="value">заливается в контроллер Arduino Mega</span></p>
+            <p>Файлы: <span class="value">записываются на microSD карту памяти</span></p>
+            <h3>Сетевые настройки</h3>
+            <p>IP адрес: <span class="value">192.168.1.37</span></p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box">
+            <h3>Среды разработки</h3>
+            <p>Arduino: <span class="value">1.8.5</span></p>
+            <p>Processing: <span class="value">1.5.1</span></p>
+            <h3>Онлайн документация</h3>
+            <p>Документация: <span class="value"><a href="//hi-lab.ru/arduino-mega-server/documentation" target="_blank">hi-lab.ru/arduino-mega-server/documentation</a></span></p>
+          </div>
+        </div>
+        <div style="clear:both"></div>
+      </div> <!-- hider -->
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block">
+      <div class="level-title clickable" onclick="showHide2()">
+        <h2>Встроенный язык программирования</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-2">
+        <div class="cell-2">
+          <div class="box">
+            <h3>Макросы</h3>
+            <p><span class="code">% (0x25)</span> — базовый префикс макросов</p>
+            <p><span class="code">& (0x26)</span> — подключение ссылок <strong>_one*.htm</strong></p>
+            <p><span class="code"># (0x23)</span> — вставка всех <strong>*.js</strong> файлов</p>
+            <p><span class="code">1 (0x31)</span> — вставка хедера <strong>_header.htm</strong></p>
+            <p><span class="code">2 (0x32)</span> — вставка dash-панели <strong>_dash.htm</strong></p>
+            <p><span class="code">3 (0x33)</span> — вставка меню <strong>_menu.htm</strong></p>
+            <p><span class="code">4 (0x34)</span> — вставка футера <strong>_footer.htm</strong></p>
+            <p><span class="code">6 (0x36)</span> — вставка плиточного меню <strong>_alt.htm</strong></p>
+            <p><span class="code">7 (0x37)</span> — вставка плиточного CSS <strong>style_a*.css</strong></p>
+            <p><span class="code">! (0x21)</span> — вставка <strong>IP адреса</strong></p>
+            <p><span class="code">? (0x3F)</span> — вставка библиотеки <strong>Flotr2</strong></p>
+            <p><span class="code">+ (0x2B)</span> — вставка библиотеки <strong>Processing</strong></p>
+            <p><span class="code">@ (0x40)</span> — вставка библиотеки <strong>Three</strong></p>
+            <p><span class="code">= (0x3D)</span> — вставка библиотеки <strong>jQuery</strong></p>
+          </div>
+        </div>
+        <div class="cell-2">
+          <div class="box">
+            <h3>Пояснения</h3>
+            <p>Макрос состоит из двух символов — базового префикса ( % ) и идентификатора (без пробела между ними). Идентификатор определяет операцию, которую нужно произвести в том месте файла, где он встречается. Это может быть вставка IP адреса системы, вставка кода библиотеки или любое другое заранее определённое действие.</p>
+            <p>Здесь представлены макросы, которые уже имеются в системе. Вы можете дополнить этот список любыми необходимыми вам действиями по вставке информации в передаваемые сервером файлы.</p>
+            <br>
+          </div>
+        </div>
+        <div style="clear:both"></div>
+      </div>
+    </div>
+  </div> <!-- level -->
+
+%5
+  
+%4 <!-- footer -->
+</body>
+</html>

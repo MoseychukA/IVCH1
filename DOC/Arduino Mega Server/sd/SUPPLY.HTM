@@ -1,0 +1,122 @@
+<!DOCTYPE html>   
+
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>Электросеть - Arduino Mega Server</title>
+  
+<script>
+function start() {
+  logoRotator();
+  getElectroForm();
+  getDashData();    
+}
+
+var bufferU = [];
+var bufferI = [];
+
+function getElectroForm() {
+  var request = new XMLHttpRequest();
+  request.onreadystatechange = function() {
+    if (this.readyState == 4) {
+      if (this.status == 200) {
+        if (this.responseXML != null) {
+          // net activ
+          insertTick(30, bufferCpuLoad2);
+
+          var numU = this.responseXML.getElementsByTagName('u').length;
+          for (count = 0; count < numU; count++) {
+            var tmpU = this.responseXML.getElementsByTagName('u')[count].childNodes[0].nodeValue;
+            bufferU[numU - count] = tmpU;
+          }
+
+          var numI = this.responseXML.getElementsByTagName('i').length;
+          for (count = 0; count < numI; count++) {
+            var tmpI = this.responseXML.getElementsByTagName('i')[count].childNodes[0].nodeValue;
+            bufferI[numI - count] = tmpI;
+          }
+          var backg = 'rgba(255, 255, 255, 1)';
+          if (theme()) {
+            backg = 'rgba(37, 37, 37, 1)';
+          }
+          form('freq-1', 3, bufferU, bufferI, 2, 'rgba(4, 169, 174, 1)', 'rgba(204,9,51, 1)', 'rgba(44, 140, 255, 1)', backg);
+        } // if
+      } // if
+    } // if
+  } // request
+
+  request.open("GET", "req_el_freq" + randomNoCache(), true);
+  request.send(null);
+  setTimeout('getElectroForm()', 5000);
+} // getElectroForm()
+  
+%# // scripts.js
+var currentPage = 'supply-page';
+</script>
+</head>
+
+<body onload="start();">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">ЭЛЕКТРОСЕТЬ</h1>
+      <div class="level-title">
+        <h2>Качество электропитания</h2>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Общая мощность</h3>
+          <p>Мощность: <span class="value" id="p1">...</span> Вт</p>
+          <canvas id="graph-power" width="210" height="190"></canvas>
+        </div>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Напряжение</h3>
+          <p>Напряжение сети: <span class="value" id="volt">...</span> В</p>
+          <canvas id="graph-voltage" width="210" height="190"></canvas>
+        </div>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Частота сети</h3>
+          <p>Частота: <span class="value" id="freq">...</span> Гц</p>
+          <canvas id="graph-freq" width="210" height="190"></canvas>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block">
+      <div class="level-title">
+        <h2>Форма напряжения и тока</h2>
+      </div>
+      <div class="cell-2">
+        <div class="box">
+          <h3>График напряжения и тока</h3>
+          <p>Анализ формы сетевого напряжения и тока.</p>
+          <br>
+          <br>
+        </div>
+      </div>
+      <div class="cell-2">
+        <div class="box">
+          <h3>Форма сетевого напряжения и тока</h3>
+          <p>Красный — напряжение, синий - ток</p>
+          <canvas id="freq-1" width="360" height="190"></canvas>
+         </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+%5
+  
+%4 <!-- footer -->
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!DOCTYPE html>   
+
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>Reference - Arduino Mega Server</title>
+
+<script>
+  function start() {
+    logoRotator();
+    getDashData();
+  }
+
+%# // scripts.js
+</script>
+</head>
+
+<body onload="start()">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">REFERENCE</h1>
+      <div class="level-title">
+        <h2>Quick Start</h2>
+      </div>
+      <div class="cell-2">
+        <div class="box">            
+          <h3>Hardware</h3>
+          <table class="table-generic">
+            <tr class="tr-title"> <td class="td-first"><p>SD Card</p></td> <td><p>ESP32</p></td></tr>
+            <tr class="tr-color2"><td class="td-first"><p>D3</p></td>      <td><p>SS</p></td></tr>
+            <tr class="tr-color1"><td class="td-first"><p>CMD</p></td>     <td><p>MOSI</p></td></tr>
+            <tr class="tr-color2"><td class="td-first"><p>VSS</p></td>     <td><p>GND</p></td></tr>
+            <tr class="tr-color1"><td class="td-first"><p>VDD</p></td>     <td><p>3.3V</p></td></tr>
+            <tr class="tr-color2"><td class="td-first"><p>CLK</p></td>     <td><p>SCK</p></td></tr>
+            <tr class="tr-color1"><td class="td-first"><p>VSS</p></td>     <td><p>GND</p></td></tr>
+            <tr class="tr-color2"><td class="td-first"><p>D0</p></td>      <td><p>MISO</p></td></tr>
+          </table>            
+        </div>
+      </div>
+      <div class="cell-2">
+        <div class="box">
+          <h3>Arduino IDE</h3>
+          <p>Arduino: <span class="value">1.6.5 r2</span></p>
+          <h3>Sketch and files</h3>
+          <p>In Sketch (tab Wi-Fi): <span class="value">SSID and PASSWORD of your Wi-Fi network</span></p>
+          <p>Sketch: <span class="value">upload to ESP32 module</span></p>
+          <p>Files HTM, CSS, JS, PDE, images: <span class="value">upload to SD card</span></p>
+          <h3>Network settings</h3>
+          <p>IP address Arduino Mega Server for ESP32 SD: <span class="value">192.168.1.70</span></p>
+          <br>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block">
+      <div class="level-title">
+        <h2>Built-in server programming language</h2>
+      </div>
+      <div class="cell-2">
+        <div class="box">
+          <h3>Macro</h3>
+          <p><span class="code">% (0x25)</span> — basic prefix of macroes</p>
+          <p><span class="code">& (0x26)</span> — connect links <strong>_one*.htm</strong></p>
+          <p><span class="code"># (0x23)</span> — insert <strong>scripts.js</strong></p>
+          <p><span class="code">1 (0x31)</span> — insert <strong>_header.htm</strong></p>
+          <p><span class="code">2 (0x32)</span> — insert dash panel <strong>_dash.htm</strong></p>
+          <p><span class="code">3 (0x33)</span> — insert <strong>_menu.htm</strong></p>
+          <p><span class="code">4 (0x34)</span> — insert <strong>_footer.htm</strong></p>
+          <p><span class="code">! (0x21)</span> — insert <strong>IP address</strong></p>
+          <p><span class="code">? (0x3F)</span> — insert library <strong>Flotr2</strong></p>
+          <p><span class="code">+ (0x2B)</span> — insert library <strong>Processing</strong></p>
+          <p><span class="code">@ (0x40)</span> — insert library <strong>Three</strong></p>
+          <p><span class="code">= (0x3D)</span> — insert library <strong>jQuery</strong></p>
+        </div>
+      </div>
+      <div class="cell-2">
+        <div class="box">
+          <h3>Info</h3>
+          <p>Макрос состоит из двух символов — базового префикса ( % ) и уникального идентификатора (без пробела между ними). Идентификатор определяет операцию, которую нужно произвести в том месте файла, где он встречается. Это может быть вставка IP адреса системы, вставка кода библиотеки или любое другое заранее определённое действие.</p>
+          <p>Здесь представлены макросы, которые уже имеются в системе. Вы можете дополнить этот список любыми необходимыми вам действиями по вставке информации в передаваемые сервером файлы.</p>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+%5
+  
+%4 <!-- footer -->
+</body>
+</html>

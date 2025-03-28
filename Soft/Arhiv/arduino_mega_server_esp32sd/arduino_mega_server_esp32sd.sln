@@ -1,0 +1,35 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.35731.53
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "arduino_mega_server_esp32sd", "arduino_mega_server_esp32sd.vcxproj", "{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|ARM = Debug|ARM
+		Debug|ARM64 = Debug|ARM64
+		Release|ARM = Release|ARM
+		Release|ARM64 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Debug|ARM.ActiveCfg = Debug|ARM
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Debug|ARM.Build.0 = Debug|ARM
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Debug|ARM.Deploy.0 = Debug|ARM
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Debug|ARM64.Build.0 = Debug|ARM64
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Debug|ARM64.Deploy.0 = Debug|ARM64
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Release|ARM.ActiveCfg = Release|ARM
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Release|ARM.Build.0 = Release|ARM
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Release|ARM.Deploy.0 = Release|ARM
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Release|ARM64.ActiveCfg = Release|ARM64
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Release|ARM64.Build.0 = Release|ARM64
+		{86026BC0-C2A2-40A6-A9F4-84FE31E9F403}.Release|ARM64.Deploy.0 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {C658082F-6A36-45DD-9560-F120FCAAF3AE}
+	EndGlobalSection
+EndGlobal

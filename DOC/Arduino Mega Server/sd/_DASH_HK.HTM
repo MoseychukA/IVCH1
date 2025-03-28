@@ -1,0 +1,95 @@
+  <div class="dash">   
+
+    <div class="block spaces-10">
+      <div class="lev-hide show">
+        <div class="cell-2-fixed">
+          <div class="box-dash">
+            <p>На улице: <span class="value" id="dash-temp-hide">...</span>°C</p>
+            <p>Мощность: <span class="value" id="dash-power-hide">...</span> Вт</p>
+          </div>
+        </div>
+        <div class="cell-2-fixed">
+          <div class="box-dash text-right">
+            <p><span class="value" id="time-hide">...</span></p>
+            <p><span class="value" id="day-hide">...</span> <span class="value" id="month-hide">...</span>, <span class="value" id="week-day-hide">...</span></p>
+          </div>
+        </div>
+        <div style="clear:both"></div>
+      </div>
+
+      <div class="lev">
+        <div class="cell-4">
+          <div class="box-dash">
+            <div class="box-dash-sketch">
+              <canvas id="logo" width="180" height="160"></canvas>
+            </div>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash">
+            <p title="Модули системы"><span class="modul-value" id="module-sd-info">...</span> <span class="modul-value" id="module-sd-files">...</span> <span class="modul-value" id="module-ntp">...</span> <span class="modul-value" id="module-send">...</span> <span class="modul-value" id="module-major">...</span> <span class="modul-value" id="module-laurent">...</span> <span class="modul-value" id="module-upload">...</span> <span class="modul-value" id="module-pirs">...</span> <span class="modul-value" id="module-contacts">...</span> <span class="modul-value" id="module-ds18b20">...</span> <span class="modul-value" id="dash-module-pm">...</span> <span class="modul-value" id="module-leds">...</span> <span class="modul-value" id="module-keys">...</span></p>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash">
+            <p><span class="modul-value" id="time-sync" title="Синхронизация времени через сеть/модуль RTC">...</span> <span class="modul-value" id="auth" title="Авторизация логин/пароль">...</span></p>
+            <p title="Беспроводные модули"><span class="modul-value" id="module-mt1132">...</span> <span class="modul-value" id="module-mr1132">...</span> <span class="modul-value" id="module-nrf24">...</span> <span class="value" id="laurent">.</span></p>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash text-right hide">
+            <p><span class="value" id="time">...</span></p>
+            <p><span id="day">...</span> <span id="month">...</span>, <span id="week-day">...</span></p>
+          </div>
+        </div>
+        <div style="clear:both"></div>
+      </div>
+      <div class="lev">
+        <div class="cell-4">
+          <div class="box-dash">
+            
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash">
+            <p title="PIR датчики"><span class="button-value" id="dash-pir1">...</span> <span class="button-value" id="dash-pir2">...</span> <span class="button-value" id="dash-pir3">...</span> <span class="button-value" id="dash-pir4">...</span> <span class="button-value" id="dash-pir5">...</span></p>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash">
+            <p title="Контактные датчики"><span class="button-value" id="dash-cont1">...</span> <span class="button-value" id="dash-cont2">...</span></p>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash text-right hide">
+            <p>На улице: <span class="value" id="dash-temp">...</span>°C</p>
+            <p>Мощность: <span class="value" id="dash-power">...</span> Вт</p>
+          </div>
+        </div>
+        <div style="clear:both"></div>
+      </div>
+      <div class="lev">
+        <div class="cell-4">
+          <div class="box-dash center hide">
+            <canvas id="cpu-load" width="120" height="33" title="Свободная память"></canvas>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash center hide">
+            <canvas id="cpu-load2" width="120" height="33" title="Сетевая активность интерфейса"></canvas>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash center hide">
+            <canvas id="cpu-load3" width="120" height="33" title="Загрузка системы"></canvas>
+          </div>
+        </div>
+        <div class="cell-4">
+          <div class="box-dash center hide">
+            <canvas id="cpu-load4" width="120" height="33" title="Загрузка системы"></canvas>
+          </div>
+        </div>
+        <div style="clear:both"></div>
+      </div>
+    </div>
+  </div> <!-- dash -->

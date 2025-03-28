@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>Плиточный интерфейс - Arduino Mega Server</title>
+
+<style>
+  body   {color: #aaa; background: #4587DD url(//%!/fog1.jpg);}
+  .glass {color: #aaa; background: url(//%!/glass.png);}
+  
+%7 /* alt style */
+</style>
+  
+<script>
+function start() {
+  getDashData();
+}
+  
+%# // scripts.js
+</script>
+</head>
+
+<body onload="start();">
+  <div class="top-panel">
+    <div class="action-top-panel">
+      <p>.</p>
+    </div>
+    <div class="hidden-top-panel">
+      %6
+    </div>
+  </div> <!-- panel -->
+
+  <div class="level-full">
+    <div class="block top-70">
+      <!-- row 1 -->
+      <div class="cell-4">
+        <div class="box-info blacks_ height-180">
+          <div class="height-70"></div>
+          <canvas class="auto" id="cpu-load4" width="120" height="33"></canvas>
+        </div>
+      </div>
+      <div class="cell-4">
+        <div class="box-info glass center height-180">
+          <div class="height-50"></div>
+          <p><span id="time" style="font-size:58px;">...</span></p>
+          <p style="color:#fff;"><span id="day" style="font-size:18px;">...</span> <span id="month">...</span>, <span id="week-day">...</span></p>
+        </div>
+      </div>
+      <div class="cell-4">
+        <div class="box-info darks_ height-180">
+          <h2>Модули</h2>
+          <p><span class="modul-value" id="module-sd-info">...</span> <span class="modul-value" id="module-sd-files">...</span> <span class="modul-value" id="module-ntp">...</span> <span class="modul-value" id="module-send">...</span> <span class="modul-value" id="module-major">...</span> <span class="modul-value" id="module-laurent">...</span> <span class="modul-value" id="module-upload">...</span> <span class="modul-value" id="module-pirs">...</span> <span class="modul-value" id="module-contacts">...</span> <span class="modul-value" id="module-ds18b20">...</span> <span class="modul-value" id="dash-module-pm">...</span> <span class="modul-value" id="module-leds">...</span> <span class="modul-value" id="module-keys">...</span> <span class="modul-value" id="module-mt1132">...</span> <span class="modul-value" id="module-mr1132">...</span> <span class="modul-value" id="module-nrf24">...</span> <span class="value" id="laurent">.</span></p>
+        </div>
+      </div>
+      <div class="cell-4">
+        <div class="box-info oranges_ height-180">
+          <h2 style="color:white;">↑ Всплывающее меню</h2>
+          <p>Наверху находится область, при наведении на которую стрелки мыши, появляется всплывающее меню</p>
+        </div>
+      </div>
+      
+      <!-- row 2 -->
+      <div class="cell-4">
+        <div class="box-info lites_ center height-180">
+          <br><br><br>
+          <p><span class="font-tile" id="dash-voltage">...</span> C</p>
+        </div>
+      </div>
+      <div class="cell-2">
+        <div class="box-info blues_ height-180">
+          <h2 style="color:white;">Новый интерфейс</h2>
+          <p>Это прототип нового, так называемого плиточного интерфейса. Пока это только концепт, но на его основе вы уже можете создавать нужный вам дизайн сайтов AMS</p>
+        </div>
+      </div>
+      <div class="cell-4">
+        <a href="//geegrow.ru/" title="Перейти на сайт Geegrow" target="_blank">
+          <div class="box-img whites_ height-180">
+            <div class="height-50"></div>
+            <img src="logo-p3.png" alt="">
+          </div>
+        </a>
+      </div>
+      
+      <!-- row 3 -->
+      <div class="cell-4">
+        <div class="box-empty height-180" style="text-align:center;">
+          <div class="height-80"></div>
+          <p style="color:white;">Пустой блок</p>
+        </div>
+      </div>
+      <div class="cell-4">
+        <a href="//hi-lab.ru/shop/offers/geegrow" title="Скидка 10% на продукцию Geegrow" target="_blank">
+          <div class="box-img whites_ height-180">
+            <div class="height-10"></div>
+            <img src="gg-2.jpg" alt="">
+          </div>
+        </a>
+      </div>
+      <div class="cell-4">
+        <div class="box-info oranges_ height-180">
+          <h2 style="color:white;">← Плитки-ссылки</h2>
+          <p>Анимированные плитки-ссылки. При наведении мыши, плитка меняет форму, при клике — открывает ссылку</p>
+        </div>
+      </div>
+      <div class="cell-4">
+        <div class="box-info greens_ height-180">
+          <h2 style="color:white;">Адаптивный интерфейс</h2>
+          <p>Плитки сами подстраиваются под размер вашего устройства. От настольного компьютера до смартфона</p>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div> <!-- block -->
+  </div> <!-- level -->
+ 
+</body>
+</html>

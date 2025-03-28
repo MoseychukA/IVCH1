@@ -1,0 +1,144 @@
+<!DOCTYPE html>   
+
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>nRF24 - Arduino Mega Server</title>
+
+<script>
+function start() {
+  document.getElementById("hider-1").style.display = "block";
+  logoRotator();
+  getDashData();
+  getNrf24();
+}
+
+var hideInfo1 = false;
+
+function showHide1() {
+  if (hideInfo1) {document.getElementById("hider-1").style.display = "block"; hideInfo1 = false;}
+            else {document.getElementById("hider-1").style.display = "none"; hideInfo1 = true;}
+}
+
+function getNrf24() {
+  var request = new XMLHttpRequest();
+  request.onreadystatechange = function() {
+    if (this.readyState == 4) {
+      if (this.status == 200) {
+        if (this.responseXML != null) {
+          // net activ
+          insertTick(30, bufferCpuLoad2);
+        
+          // name
+          try {var c1Name = this.responseXML.getElementsByTagName('c1Name')[0].childNodes[0].nodeValue;} catch (err) {c1Name = "";}
+          try {document.getElementById("c1-name").innerHTML = c1Name;} catch (err) { }
+          // id
+          try {
+            var c1Id = this.responseXML.getElementsByTagName('c1Id')[0].childNodes[0].nodeValue;
+            var c1IdA =  c1Id[0] +  c1Id[1] +  c1Id[2] +  c1Id[3] +  c1Id[4]; 
+            var c1IdB =  c1Id[5] +  c1Id[6] +  c1Id[7] +  c1Id[8] +  c1Id[9]; 
+            var c1IdC = c1Id[10] + c1Id[11] + c1Id[12] + c1Id[13] + c1Id[14];
+          } catch (err) {
+              c1IdA = "";
+              c1IdB = "";
+              c1IdC = "";
+            }
+          try {
+            document.getElementById("c1-id-a").innerHTML = c1IdA;
+            document.getElementById("c1-id-b").innerHTML = c1IdB;
+            document.getElementById("c1-id-c").innerHTML = c1IdC;
+          } catch (err) { }
+          // address
+          try {var c1Addr = this.responseXML.getElementsByTagName('c1Addr')[0].childNodes[0].nodeValue;} catch (err) {c1Addr = "";}
+          try {document.getElementById("c1-addr").innerHTML = c1Addr;} catch (err) { }
+          // battery
+          try {var c1Battery = this.responseXML.getElementsByTagName('c1Batt')[0].childNodes[0].nodeValue;} catch (err) {c1Battery = "";}
+          try {document.getElementById("c1-battery").innerHTML = c1Battery;} catch (err) { }
+          // health
+          try {var c1Health = this.responseXML.getElementsByTagName('c1Health')[0].childNodes[0].nodeValue;} catch (err) {c1Healthh = "";}
+          try {document.getElementById("c1-health").innerHTML = c1Health;} catch (err) { }
+          // free mem
+          try {var c1FreeMem = this.responseXML.getElementsByTagName('c1FreeMem')[0].childNodes[0].nodeValue;} catch (err) {c1FreeMem = "";}
+          try {document.getElementById("c1-free-mem").innerHTML = c1FreeMem;} catch (err) { }
+          // self temp
+          try {
+            var c1SelfTempStr = this.responseXML.getElementsByTagName('c1SelfTemp')[0].childNodes[0].nodeValue;
+            c1SelfTempFloat = parseFloat(c1SelfTempStr)
+          } catch (err) {
+              c1SelfTempFloat = "";
+            }
+          try {document.getElementById("c1-self-temp").innerHTML = c1SelfTempFloat.toFixed(1);} catch (err) { }
+          // temp 1
+          try {
+            var c1Temp1Str = this.responseXML.getElementsByTagName('c1Temp1')[0].childNodes[0].nodeValue;
+            c1Temp1Float = parseFloat(c1Temp1Str)
+          } catch (err) {
+              c1Temp1Float = "";
+            }
+          try {document.getElementById("c1-temp1").innerHTML     = c1Temp1Float.toFixed(1);} catch (err) { }
+          try {document.getElementById("c1-temp1-big").innerHTML = c1Temp1Float.toFixed(1);} catch (err) { }
+        } // if
+      } // if
+    } // if
+  } // request
+
+  request.open("GET", "request_nrf24" + randomNoCache(), true);
+  request.send(null);
+  setTimeout('getNrf24()', 2100);
+} // getNrf24()
+  
+%# // scripts.js
+</script>
+</head>
+
+<body onload="start();">
+
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">NRF24</h1>
+      <div class="level-title clickable" onclick="showHide1()">
+        <h2>AMS nRF24 controller / sensor</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-1">
+        <div class="cell-3">
+          <div class="box">
+            <h3>Контроллер 1</h3>
+            <p>Имя: <span class="value" id="c1-name">...</span></p>
+            <p>ID: <span class="value" id="c1-id-a">...</span> - <span class="value" id="c1-id-b">...</span> - <span class="value" id="c1-id-c">...</span></p>
+            <p>Адрес: <span class="value" id="c1-addr">...</span></p>
+            <br>
+          </div>
+        </div>
+        <div class="cell-3">
+          <div class="box">
+            <h3>Параметры</h3>
+            <p>Здоровье: <span class="value" id="c1-health">...</span> %</p>
+            <p>Питание: <span class="value" id="c1-battery">...</span> %</p>
+            <p>Свободная память: <span class="value" id="c1-free-mem">...</span> %</p>
+            <p>Температура 0: <span class="value" id="c1-self-temp">...</span> °C</p>
+            <p>Температура 1: <span class="value" id="c1-temp1">...</span> °C</p>
+          </div>
+        </div>
+         <div class="cell-3">
+          <div class="box">
+            <h3>Температура дома</h3>
+            <br>
+            <p><span class="text-big" id="c1-temp1-big">...</span> °C</p>
+            <br>
+          </div>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+%5
+
+%4 <!-- footer -->
+</body>
+</html>

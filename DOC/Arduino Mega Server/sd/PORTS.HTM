@@ -1,0 +1,128 @@
+<!DOCTYPE html>   
+
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>Порты и подключения - Arduino Mega Server</title>
+  
+<script>
+  function start() {
+    logoRotator();
+    getDashData();    
+  }
+
+%# // scripts.js
+var currentPage = 'ports-page';
+</script>
+</head>
+
+<body onload="start();">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">ПОРТЫ И ПОДКЛЮЧЕНИЯ</h1>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block">
+      <div class="level-title">
+        <h2>Состояние портов</h2>
+      </div>
+      <div class="cell-1">
+        <div class="box">
+          <div class="cell-2 auto">
+            <h3>Схема подключений и состояние портов в реальном времени</h3>
+            <p>Все подключения к плате микроконтроллера с пояснениями и состояние всех портов в реальном времени. Указаны тип порта, назначение, состояние, номер внешнего контакта и связанный с портом логический объект. Обновление раз в секунду.</p>
+          </div>
+          <div style="clear:both"></div>
+          <div class="cell-3 top-160 bottom-10">
+            <table class="table-pins">
+              <tr><td><p class="pin channel">V1</p></td>  <td><p class="pin connect">X1</p></td> <td><p class="pin analog1" id="A0">...</p></td>  <td><p class="pin voltage">VOLTAGE</p></td>   <td><p class="pin analog1">A0</p></td></tr>
+              <tr><td><p class="pin channel">P1</p></td>  <td><p class="pin connect">N1</p></td> <td><p class="pin analog1" id="A1">...</p></td>  <td><p class="pin power">POWER ALL</p></td>   <td><p class="pin analog1">A1</p></td></tr>
+              <tr><td><p class="pin channel">P2</p></td>  <td><p class="pin connect">N2</p></td> <td><p class="pin analog1" id="A2">...</p></td>  <td><p class="pin power">POWER PLT</p></td>   <td><p class="pin analog1">A2</p></td></tr>
+              <tr><td><p class="pin channel">P3</p></td>  <td><p class="pin connect">N3</p></td> <td><p class="pin analog1" id="A3">...</p></td>  <td><p class="pin power">POWER STR</p></td>   <td><p class="pin analog1">A3</p></td></tr>
+              <tr><td><p class="pin channel">P4</p></td>  <td><p class="pin connect">N4</p></td> <td><p class="pin analog1" id="A4">...</p></td>  <td><p class="pin power">POWER CND</p></td>   <td><p class="pin analog1">A4</p></td></tr>
+              <tr><td><p class="pin channel">P5</p></td>  <td><p class="pin connect">N5</p></td> <td><p class="pin analog1" id="A5">...</p></td>  <td><p class="pin power">POWER 3BG</p></td>   <td><p class="pin analog1">A5</p></td></tr>
+              <tr><td><p class="pin empty">-</p></td>     <td><p class="pin empty">-</p></td>    <td><p class="pin analog1" id="A6">...</p></td>  <td><p class="pin empty">-</p></td>           <td><p class="pin analog1">A6</p></td></tr>
+              <tr><td><p class="pin empty">-</p></td>     <td><p class="pin empty">-</p></td>    <td><p class="pin analog1" id="A7">...</p></td>  <td><p class="pin empty">-</p></td>           <td><p class="pin analog1">A7</p></td></tr>
+              <tr><td><p> </p></td>                       <td><p> </p></td>                      <td><p> </p></td>                        <td><p> </p></td>                             <td><p> </p></td></tr>
+              <tr><td><p class="pin channel">P6</p></td>  <td><p class="pin connect">M1</p></td> <td><p class="pin analog1" id="A8">...</p></td>  <td><p class="pin power">POWER L_STD</p></td> <td><p class="pin analog1">A8</p></td></tr>
+              <tr><td><p class="pin channel">P7</p></td>  <td><p class="pin connect">M2</p></td> <td><p class="pin analog1" id="A9">...</p></td>  <td><p class="pin power">POWER L_SNU</p></td> <td><p class="pin analog1">A9</p></td></tr>
+              <tr><td><p class="pin channel">P8</p></td>  <td><p class="pin connect">M3</p></td> <td><p class="pin analog1" id="A10">...</p></td> <td><p class="pin power">POWER L_KID</p></td> <td><p class="pin analog1">A10</p></td></tr>
+              <tr><td><p class="pin channel">P9</p></td>  <td><p class="pin connect">M4</p></td> <td><p class="pin analog1" id="A11">...</p></td> <td><p class="pin power">POWER L_KUH</p></td> <td><p class="pin analog1">A11</p></td></tr>
+              <tr><td><p class="pin channel">P10</p></td> <td><p class="pin connect">M5</p></td> <td><p class="pin analog1" id="A12">...</p></td> <td><p class="pin power">POWER LN2</p></td>   <td><p class="pin analog1">A12</p></td></tr>
+              <tr><td><p class="pin channel">P11</p></td> <td><p class="pin connect">M6</p></td> <td><p class="pin analog1" id="A13">...</p></td> <td><p class="pin power">POWER LN3</p></td>   <td><p class="pin analog1">A13</p></td></tr>
+              <tr><td><p class="pin channel">P12</p></td> <td><p class="pin connect">M7</p></td> <td><p class="pin analog1" id="A14">...</p></td> <td><p class="pin power">POWER KUH</p></td>   <td><p class="pin analog1">A14</p></td></tr>
+              <tr><td><p class="pin channel">P13</p></td> <td><p class="pin connect">M8</p></td> <td><p class="pin analog1" id="A15">...</p></td> <td><p class="pin power">POWER SRV</p></td>   <td><p class="pin analog1">A15</p></td></tr>
+            </table>
+          </div>
+          <div class="cell-3">
+            <div class="box-image">
+              <img class="auto" src="mega.png" alt="">
+            </div>
+          </div>
+          <div class="cell-3 top-150 bottom-10">
+            <table class="table-pins">
+              <tr><td><p class="pin digital">D13</p></td>  <td><p class="pin ethernet">ETH SCK</p></td>  <td><p class="pin ethernet">!</p></td>          <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D12</p></td>  <td><p class="pin ethernet">ETH MISO</p></td> <td><p class="pin ethernet">!</p></td>          <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D11</p></td>  <td><p class="pin ethernet">ETH MOSI</p></td> <td><p class="pin ethernet">!</p></td>          <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D10</p></td>  <td><p class="pin ethernet">ETH SS</p></td>   <td><p class="pin result" id="D10">!</p></td> <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D9</p></td>   <td><p class="pin empty">CSN</p></td>         <td><p class="pin result" id="D9">-</p></td>  <td><p class="pin channel">NRF</p></td>   <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D8</p></td>   <td><p class="pin empty">CE</p></td>          <td><p class="pin result" id="D8">-</p></td>    <td><p class="pin channel">NRF</p></td>   <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p> </p></td>                        <td><p> </p></td>                             <td><p> </p></td>                               <td><p> </p></td>                         <td><p> </p></td> </tr>
+              <tr><td><p class="pin digital">D7</p></td>   <td><p class="pin led">LED1 G</p></td>        <td><p class="pin result" id="D7">...</p></td>  <td><p class="pin connect">G17</p></td>   <td><p class="pin channel">T4</p></td></tr>
+              <tr><td><p class="pin digital">D6</p></td>   <td><p class="pin led">LED1 R</p></td>        <td><p class="pin result" id="D6">...</p></td>  <td><p class="pin connect">G17</p></td>   <td><p class="pin channel">T3</p></td></tr>
+              <tr><td><p class="pin digital">D5</p></td>   <td><p class="pin led">LED1 B</p></td>        <td><p class="pin result" id="D5">...</p></td>  <td><p class="pin connect">G17</p></td>   <td><p class="pin channel">T5</p></td></tr>
+              <tr><td><p class="pin digital">D4</p></td>   <td><p class="pin ethernet">ETH SD</p></td>   <td><p class="pin result" id="D4">!</p></td>    <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D3</p></td>   <td><p class="pin key">KEY1</p></td>          <td><p class="pin result" id="D3">...</p></td>  <td><p class="pin connect">-</p></td>     <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p class="pin digital">D2</p></td>   <td><p class="pin one-wire">1-WIRE</p></td>   <td><p class="pin result" id="D2">...</p></td>  <td><p class="pin connect">-</p></td>     <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p class="pin digital">D1</p></td>   <td><p class="pin serial">SERIAL TX</p></td>  <td><p class="pin serial">!</p></td>            <td><p class="pin serial">SELF</p></td>   <td><p class="pin serial">USB</p></td></tr>
+              <tr><td><p class="pin digital">D0</p></td>   <td><p class="pin serial">SERIAL RX</p></td>  <td><p class="pin serial">!</p></td>            <td><p class="pin serial">SELF</p></td>   <td><p class="pin serial">USB</p></td></tr>
+              <tr><td><p> </p></td>                        <td><p> </p></td>                             <td><p> </p></td>                               <td><p> </p></td>                         <td><p> </p></td> </tr>
+              <tr><td><p class="pin digital">D14</p></td>  <td><p class="pin empty">TX3</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin channel">NRF</p></td>   <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D15</p></td>  <td><p class="pin empty">RX3</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin channel">NRF</p></td>   <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D16</p></td>  <td><p class="pin empty">TX2</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin led">NMR</p></td>       <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D17</p></td>  <td><p class="pin empty">RX2</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin led">NMR</p></td>       <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D18</p></td>  <td><p class="pin empty">TX1</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin led">NOO</p></td>       <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D19</p></td>  <td><p class="pin empty">RX1</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin led">NOO</p></td>       <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D20</p></td>  <td><p class="pin empty">SDA</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin channel">RTC</p></td>   <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D21</p></td>  <td><p class="pin empty">SCL</p></td>         <td><p class="pin empty">-</p></td>             <td><p class="pin channel">RTC</p></td>   <td><p class="pin empty">-</p></td></tr>
+            </table>
+          </div>
+          <div style="clear:both"></div>
+          <div class="cell-3 auto">
+            <table class="table-pins">
+              <tr><td><p class="pin digital">D22</p></td>  <td><p class="pin pir">PIR 1</p></td>         <td><p class="pin result" id="D22">...</p></td> <td><p class="pin connect">G17</p></td>   <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p class="pin digital">D23</p></td>  <td><p class="pin pir">PIR 2</p></td>         <td><p class="pin result" id="D23">...</p></td> <td><p class="pin connect">R16</p></td>   <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p class="pin digital">D24</p></td>  <td><p class="pin pir">PIR 3</p></td>         <td><p class="pin result" id="D24">...</p></td> <td><p class="pin connect">O15</p></td>   <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p class="pin digital">D25</p></td>  <td><p class="pin pir">PIR 4</p></td>         <td><p class="pin result" id="D25">...</p></td> <td><p class="pin connect">Y14</p></td>   <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p class="pin digital">D26</p></td>  <td><p class="pin pir">PIR 5</p></td>         <td><p class="pin result" id="D26">...</p></td> <td><p class="pin connect">G13</p></td>   <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p class="pin digital">D27</p></td>  <td><p class="pin contact">CONT 1</p></td>    <td><p class="pin result" id="D27">...</p></td> <td><p class="pin connect">G13</p>        <td><p class="pin channel">-</p></td></td></tr>
+              <tr><td><p class="pin digital">D28</p></td>  <td><p class="pin empty">-</p></td>           <td><p class="pin empty">-</p></td>             <td><p class="pin empty">-</p></td>       <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D29</p></td>  <td><p class="pin empty">-</p></td>           <td><p class="pin empty">-</p></td>             <td><p class="pin empty">-</p></td>       <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D30</p></td>  <td><p class="pin empty">-</p></td>           <td><p class="pin empty">-</p></td>             <td><p class="pin empty">-</p></td>       <td><p class="pin empty">-</p></td></tr>
+              <tr><td><p class="pin digital">D31</p></td>  <td><p class="pin contact">CONT 2</p></td>    <td><p class="pin result" id="D31">...</p></td> <td><p class="pin connect">B18</p></td>   <td><p class="pin channel">-</p></td></tr>
+              <tr><td><p> </p></td>                        <td><p> </p></td>                             <td><p> </p></td>                               <td><p> </p></td>                         <td><p> </p></td> </tr>
+              <tr><td><p class="pin digital">D50</p></td>  <td><p class="pin ethernet">ETH MISO</p></td> <td><p class="pin ethernet">!</p></td>          <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D51</p></td>  <td><p class="pin ethernet">ETH MOSI</p></td> <td><p class="pin ethernet">!</p></td>          <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D52</p></td>  <td><p class="pin ethernet">ETH SCK</p></td>  <td><p class="pin ethernet">!</p></td>          <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              <tr><td><p class="pin digital">D53</p></td>  <td><p class="pin ethernet">ETH SS</p></td>   <td><p class="pin ethernet">!</p></td>          <td><p class="pin ethernet">SELF</p></td> <td><p class="pin ethernet">W5100</p></td></tr>
+              </table>
+          </div>
+          <div style="clear:both"></div>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+%5
+  
+%4 <!-- footer -->
+</body>
+</html>

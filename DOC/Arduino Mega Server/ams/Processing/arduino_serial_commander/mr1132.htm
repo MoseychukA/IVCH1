@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>nooLite MR1132 - Arduino Mega Server</title>
+
+<script>
+function start() {
+  document.getElementById("hider-1").style.display = "block";
+  document.getElementById("hider-2").style.display = "none";
+  logoRotator();
+  getDashData();
+  getNoo();
+}
+
+var hideInfo1 = false;
+var hideInfo2 = true;
+
+function showHide1() {
+  if (hideInfo1) {document.getElementById("hider-1").style.display = "block"; hideInfo1 = false;}
+            else {document.getElementById("hider-1").style.display = "none"; hideInfo1 = true;}
+}
+function showHide2() {
+  if (hideInfo2) {document.getElementById("hider-2").style.display = "block"; hideInfo2 = false;}
+            else {document.getElementById("hider-2").style.display = "none"; hideInfo2 = true;}
+}
+
+var nooChannel = "";
+var nooBind    = "";
+
+function getNoo() {
+  var request = new XMLHttpRequest();
+
+  request.onreadystatechange = function() {
+    if (this.readyState == 4) {
+      if (this.status == 200) {
+        if (this.responseXML != null) {
+          // net activ
+          insertTick(30, bufferCpuLoad2);
+        
+          // Sensor 1
+          try {
+            var ns1t = this.responseXML.getElementsByTagName('ns1Temp')[0].childNodes[0].nodeValue;
+          } catch (err) {
+              ns1t = '-1';
+            }
+          var ns1t_ = parseFloat(ns1t);
+          if (ns1t_ == -1) {ns1t_ = "—";}
+          label(ns1t_, 'ns1-temp', '', 'PT112', 'rgba(100, 150, 220, 1)');
+          
+          // Sensor 2
+          try {
+            var ns2t = this.responseXML.getElementsByTagName('ns2Temp')[0].childNodes[0].nodeValue;
+          } catch (err) {
+              ns2t = '-1';
+            }
+          var ns2t_ = parseFloat(ns2t);
+          if (ns2t_ == -1) {ns2t_ = "—";}
+          label(ns2t_, 'ns2-temp', '', 'PT111', 'rgba(100, 160, 220, 1)');
+          
+          try {
+            var ns2h = this.responseXML.getElementsByTagName('ns2Humidity')[0].childNodes[0].nodeValue;
+          } catch (err) {
+              ns2h = '-1';
+            }
+          ns2hm = '%';
+          if (ns2h == -1) {
+            ns2h = "—";
+            ns2hm = '';
+          }
+          label(ns2h, 'ns2-hum', ns2hm, 'PT111', 'rgba(80, 220, 120, 1)');
+
+          // Sensor PIR
+          try {
+            var np1s = this.responseXML.getElementsByTagName('np1State')[0].childNodes[0].nodeValue;
+          } catch (err) {
+              np1s = '-1';
+            }
+            
+          switch(np1s) {
+            case '0': np1s_ = "OFF"; np1c = 'rgba(160,  70,  20, 1)'; break;
+            case '2': np1s_ = "ON";  np1c = 'rgba(220, 180, 100, 1)'; break;
+             default: np1s_ = "—";   np1c = 'rgba(100, 100, 100, 1)';
+          }
+          label(np1s_, 'np1-state', '', 'PM111', np1c);
+          
+        } // if
+      } // if
+    } // if
+  } // request
+
+  request.open("GET", "request_mr1132" + nooChannel + nooBind + randomNoCache(), true);
+  request.send(null);
+  setTimeout('getNoo()', 2100);
+  
+  nooChannel = "";
+  nooBind    = "";
+} // getNoo()
+
+// Actions
+
+function nooBindAction() {
+  nooChannel = "&nooChannel=" + document.getElementById("channel").value;
+  nooBind    = "&nooBind="    + nooBindForm.bindUnbind.value;
+}
+  
+%# // scripts.js
+</script>
+</head>
+
+<body onload="start();">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">NOOLITE MR1132</h1>
+      <div class="level-title clickable" onclick="showHide1()">
+        <h2>Датчики</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-1">
+        <div class="cell-3">
+          <div class="box">
+            <h3>PT112</h3>
+            <p>Беспроводной датчик температуры nooLite PT112 (канал 0)</p>
+            <br>
+            <canvas id="ns1-temp" width="60" height="60"></canvas>
+          </div>
+        </div>
+        <div class="cell-3">
+          <div class="box">
+            <h3>PT111</h3>
+            <p>Беспроводной датчик температуры и влажности nooLite PT111 (канал 1)</p>
+            <br>
+            <canvas id="ns2-temp" width="60" height="60"></canvas>
+            <canvas id="ns2-hum" width="60" height="60"></canvas>
+          </div>
+        </div>
+        <div class="cell-3">
+          <div class="box">
+            <h3>PM111</h3>
+            <p>Беспроводной датчик движения nooLite PM111 (канал 2)</p>
+            <br>
+            <canvas id="np1-state" width="60" height="60"></canvas>
+          </div>
+        </div>
+        <div style="clear:both"></div>        
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+  
+  <div class="level">
+    <div class="block">
+      <div class="level-title clickable" onclick="showHide2()">
+        <h2>Привязка</h2>
+        <i class="icono-caretDownCircle"></i>
+      </div>
+      <div id="hider-2">
+        <div class="cell-3">
+          <div class="box">
+            <h3>Привязка блока</h3>
+            <form id="nooBindFormId" name="nooBindForm">
+              <select size="1" id="channel" name="channels1">
+                <option value="0">0 канал</option>
+                <option value="1">1 канал</option>
+                <option value="2">2 канал</option>
+                <option value="3">3 канал</option>
+                <option value="4">4 канал</option>
+                <option value="5">5 канал</option>
+                <option value="6">6 канал</option>
+                <option value="7">7 канал</option>
+                <option value="8">8 канал</option>
+                <option value="9">9 канал</option>
+                <option value="10">10 канал</option>
+                <option value="11">11 канал</option>
+                <option value="12">12 канал</option>
+                <option value="13">13 канал</option>
+                <option value="14">14 канал</option>
+                <option value="15">15 канал</option>
+                <option value="16">16 канал</option>
+                <option value="17">17 канал</option>
+                <option value="18">18 канал</option>
+                <option value="19">19 канал</option>
+                <option value="20">20 канал</option>
+                <option value="21">21 канал</option>
+                <option value="22">22 канал</option>
+                <option value="23">23 канал</option>
+                <option value="24">24 канал</option>
+                <option value="25">25 канал</option>
+                <option value="26">26 канал</option>
+                <option value="27">27 канал</option>
+                <option value="28">28 канал</option>
+                <option value="29">29 канал</option>
+                <option value="30">30 канал</option>
+                <option value="31">31 канал</option>
+              </select>
+
+              <div class="input-radio">
+                <p><input type="radio" name="bindUnbind" id="nooBind" value="1" checked="checked"/> Привязать</p>
+                <p><input type="radio" name="bindUnbind" id="nooUnbind" value="0" /> Отвязать</p>
+              </div>
+
+              <input type="button" value="Отправить" onclick="nooBindAction()">
+            </form>
+          </div>
+        </div>
+        <div class="cell-3">
+          <div class="box">
+            <h3>Привязка</h3>
+            <p>1. Выберите номер канала и команду «Привязать» и нажмите на кнопку «Отправить».</p>
+            <p>2. Нажмите кнопку на нужном блоке (датчике) и подтвердите привязку.</p>
+          </div>
+        </div>
+         <div class="cell-3">
+          <div class="box">
+            <h3>Отвязка</h3>
+            <p>1. Выберите номер канала и команду «Отвязать» и нажмите на кнопку «Отправить».</p>
+          </div>
+        </div>       
+        <script>
+          function selectAlert() {
+            alert("Канал: " + document.getElementById("channel").value +
+             "\nКоманда: " + nooBindForm.bindUnbind.value);
+          }
+        </script>
+      </div> <!-- hider-2 -->
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+%5
+
+%4 <!-- footer -->
+</body>
+</html>

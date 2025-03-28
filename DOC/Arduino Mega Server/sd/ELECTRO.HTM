@@ -1,0 +1,137 @@
+<!DOCTYPE html>   
+
+<html>
+<head>
+  <meta charset="utf-8">
+%& <!-- links -->
+  <title>Power Monitor - Arduino Mega Server</title>
+  
+<script>  
+function start() {
+  logoRotator();
+  getDashData();
+  printTheme();
+}
+         
+%# // scripts.js
+var currentPage = 'electro-page';
+</script>
+</head>
+
+<body onload="start();">
+%1 <!-- header -->
+%2 <!-- dash -->
+%3 <!-- menu -->
+  <div class="level">
+    <div class="block">
+      <h1 class="title-page">POWER MONITOR</h1>
+      <div class="level-title">
+        <h2>Электросеть</h2>
+      </div>
+      <div class="cell-2">
+        <div class="box">
+          <h3>Общая мощность</h3>
+          <p>Вт</p>
+          <canvas id="graph-test" width="210" height="190"></canvas>
+        </div>
+      </div> 
+      <div class="cell-2">
+        <div class="box">
+          <h3>Текущее состояние</h3>
+          <p>Мощность: <span class="value" id="p1">...</span> Вт</p>
+          <p>Напряжение: <span class="value" id="volt">...</span> В</p>
+          <br>
+          <p><strong>Внимание!</strong> Для работы этого раздела к системе должен быть подключён физический модуль <a href="//hi-lab.ru/arduino-mega-server/documentation/equipment/sensors/voltage-sensors" target="_blank">Power Monitor</a>.</p>
+          <br>
+          <br>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block">
+      <div class="level-title">
+        <h2>Электропотребители</h2>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Свет</h3>
+          <p>Свет студия: <span class="value" id="p6">...</span> Вт</p>
+          <p>Свет санузел: <span class="value" id="p7">...</span> Вт</p>
+          <p>Свет детская: <span class="value" id="p8">...</span> Вт</p>
+          <p>Свет кухня: <span class="value" id="p9">...</span> Вт</p>
+        </div>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Электроприборы</h3>
+          <p>Плита: <span class="value" id="p2">...</span> Вт</p>
+          <p>Стиральная машина: <span class="value" id="p3">...</span> Вт</p>
+          <p>Кондиционер: <span class="value" id="p4">...</span> Вт</p>
+          <p>3BG: <span class="value" id="p5">...</span> Вт</p>
+         </div>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Линии</h3>
+          <p>Линия L2: <span class="value" id="p10">...</span> Вт</p>
+          <p>Линия L3: <span class="value" id="p11">...</span> Вт</p>
+          <p>Кухня: <span class="value" id="p12">...</span> Вт</p>
+          <p>Серверная: <span class="value" id="p13">...</span> Вт</p>
+        </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+  <div class="level">
+    <div class="block">
+      <div class="level-title">
+        <h2>Электроустройства</h2>
+      </div>
+      <div class="cell-1">
+        <canvas class="canvas-device" id="device-plita" width="210" height="190"></canvas>
+        <canvas class="canvas-device" id="device-str" width="210" height="190"></canvas>
+        <canvas class="canvas-device" id="device-cond" width="210" height="190"></canvas>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+  
+  <div class="level">
+    <div class="block">
+      <div class="level-title">
+        <h2>Графики</h2>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Плита</h3>
+          <p>Вт</p>
+          <canvas id="graph-plita" width="210" height="190"></canvas>
+        </div>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Стиральная машина</h3>
+          <p>Вт</p>
+          <canvas id="graph-str" width="210" height="190"></canvas>
+        </div>
+      </div>
+      <div class="cell-3">
+        <div class="box">
+          <h3>Кондиционер</h3>
+          <p>Вт</p>
+          <canvas id="graph-cond" width="210" height="190"></canvas>
+         </div>
+      </div>
+      <div style="clear:both"></div>
+    </div>
+  </div> <!-- level -->
+
+%5
+
+%4 <!-- footer -->
+</body>
+</html>

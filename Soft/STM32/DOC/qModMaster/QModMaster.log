@@ -1,0 +1,5 @@
+ERROR 2025-02-25T13:46:48.240 ..\..\qModMaster\src\modbusadapter.cpp @ 136 Connection to IP :  "127.000.000.001" : 502 ...failed. Could not connect to TCP port 
+ERROR 2025-02-25T13:47:52.817 ..\..\qModMaster\src\modbusadapter.cpp @ 136 Connection to IP :  "192.168.1.177" : 502 ...failed. Could not connect to TCP port 
+ WARN 2025-02-25T13:48:13.451 ..\..\qModMaster\src\mainwindow.cpp @ 164 RTU settings changes rejected  
+ WARN 2025-02-25T13:48:22.436 ..\..\qModMaster\src\mainwindow.cpp @ 198 Settings changes rejected  
+ERROR 2025-03-08T19:54:43.283 ..\..\qModMaster\src\modbusadapter.cpp @ 136 Connection to IP :  "192.168.001.177" : 502 ...failed. Could not connect to TCP port 
