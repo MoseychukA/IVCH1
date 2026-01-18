@@ -1,0 +1,308 @@
+Микроконтроллер STM32F103VGT6
+Среда программирования Arduino IDE с STM32GENERIC  https://github.com/danieleff/STM32GENERIC
+
+Составить программу тестирования встроенных часов в STM32F103VGT6 и микросжемы DS3231SN.
+Эталонный источник времени GPS.
+Подключение по USART2
+Всторенные часы в STM32F103VGT6
+Микросхема часов DS3231SN
+Информацию тестирования выводить в USB PA11 и PA12
+//-------------------------------------------------------------------------------------------
+
+Вот пример программы на Arduino IDE (STM32GENERIC) для тестирования встроенных RTC STM32F103VGT6 и 
+внешних часов DS3231SN, а также сравнения их с GPS-эталоном по USART2.
+
+Особенности:
+
+Встроенные часы вызываются через HAL или через библиотеку RTClock (зависит от сборки STM32GENERIC).
+DS3231 подключён через I2C (SCL/SDA).
+GPS-приёмник читает данные по USART2.
+Результаты теста и сравнения отправляются на виртуальный COM-порт USB (PA11 — USB_DM, PA12 — USB_DP).
+Используются библиотеки STM32GENERIC, Wire, RTClock, DS3231 и парсер NMEA.
+Вам потребуется:
+
+Установить STM32GENERIC для Arduino IDE.
+Установить библиотеку для DS3231 (например,
+GitHub - NorthernWidget/DS3231: Communicates between Arduino-programmed 
+AVR and Maxim DS3231 RTC: splice of Ayars’ (http://hacks.ayars.org/2011/04/ds3231-real-time-clock.html)
+ and Jeelabs/Ladyada’s (https://github.com/adafruit/RTClib) libraries github.com
+
+).
+Установить парсер NMEA (например, TinyGPS++).
+Установить библиотеку RTClock или использовать HAL напрямую.
+#include <Wire.h>
+#include <DS3231.h>
+#include <RTClock.h> // STM32GENERIC
+#include <TinyGPS++.h>
+
+#define GPS_SERIAL Serial2      // USART2 для GPS
+#define GPS_BAUD 9600
+
+DS3231 ds3231;                 // для I2C DS3231
+RTClock rtclock(RTCSEL_LSE);   // аппаратный RTC
+TinyGPSPlus gps;
+
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);      // USB CDC: результаты теста
+  GPS_SERIAL.begin(GPS_BAUD); // GPS
+
+  // Ожидаем инициализации USB
+  while (!Serial) ;
+
+  Serial.println("STM32 RTC / DS3231 / GPS TIME TEST");
+}
+
+void loop() {
+  // 1. Считывание времени с STM32 RTC
+  tm_t rtcTime;
+  rtclock.getTime(&rtcTime);
+
+  // 2. Считывание времени с DS3231
+  bool ds3231Valid = ds3231.update();
+  DateTime dsTime = ds3231.now();
+
+  // 3. Считывание времени с GPS (по NMEA)
+  while (GPS_SERIAL.available()) 
+  {
+    gps.encode(GPS_SERIAL.read());
+  }
+  bool gpsValid = gps.time.isValid() && gps.date.isValid();
+
+  // 4. Вывод информации по USB
+  Serial.print("RTC: ");
+  Serial.printf("%04d-%02d-%02d %02d:%02d:%02d   ",
+                rtcTime.year + 1900, rtcTime.month + 1, rtcTime.day,
+                rtcTime.hour, rtcTime.minute, rtcTime.second);
+
+  Serial.print("DS3231: ");
+  Serial.printf("%04d-%02d-%02d %02d:%02d:%02d   ",
+                dsTime.year(), dsTime.month(), dsTime.day(),
+                dsTime.hour(), dsTime.minute(), dsTime.second());
+
+  Serial.print("GPS: ");
+  if (gpsValid) 
+  {
+    Serial.printf("%04d-%02d-%02d %02d:%02d:%02d   ",
+                  gps.date.year(), gps.date.month(), gps.date.day(),
+                  gps.time.hour(), gps.time.minute(), gps.time.second());
+  }
+  else 
+  {
+    Serial.print("No signal   ");
+  }
+
+  // 5. Сравнение
+  if (gpsValid) 
+  {
+    char buf[64];
+    int diffRTC = abs((rtcTime.hour * 3600 + rtcTime.minute * 60 + rtcTime.second) -
+                      (gps.time.hour() * 3600 + gps.time.minute() * 60 + gps.time.second()));
+    int diffDS  = abs((dsTime.hour() * 3600 + dsTime.minute() * 60 + dsTime.second()) -
+                      (gps.time.hour() * 3600 + gps.time.minute() * 60 + gps.time.second()));
+
+    sprintf(buf, " | ΔRTC= %ds, ΔDS3231= %ds", diffRTC, diffDS);
+    Serial.print(buf);
+  }
+  Serial.println();
+
+  delay(1000); // Пауза между чтениями
+}
+Подключения:
+
+DS3231: SDA/SCL к I2C портам микроконтроллера.
+GPS TX к RX2 (STM32F103VGT6), RX к TX2 (можно не подключать).
+USB: PA11/12 на USB коннектор (или microUSB-разъём платы).
+Примечания:
+
+Код работает только при установленной STM32GENERIC.
+Для настройки времени RTC и DS3231 — используйте отдельный скетч/функцию.
+В зависимости от используемой библиотеки DS3231 и RTClock синтаксис может незначительно отличаться.
+Вывод по USB-CDC открывайте через Serial терминал (115200 бод).
+Если требуется схема подключения, поясню отдельно.
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже пример простой программы тестирования PCF8575 для Arduino STM32 (STM32F407VGT6, Arduino IDE, STM32GENERIC), без внешних библиотек для PCF8575.
+Для работы используйте ранее созданные файлы PCF8575_simple.h/PCF8575_simple.cpp.
+
+Что делает программа:
+Последовательно включает каждый выход PCF8575 (P00…P15) на некоторое время
+Все выводы гасит, потом новый загорается
+"Бегущий огонь" по разрядам
+Можно легко проверить подключение, индикаторы/светодиоды
+PCF8575_simple.h
+(Как выше, если еще не создали)
+
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class PCF8575_simple {
+public:
+    PCF8575_simple(uint8_t address);
+    void begin();
+    void write16(uint16_t data);
+private:
+    uint8_t _address;
+};
+PCF8575_simple.cpp
+#include "PCF8575_simple.h"
+
+PCF8575_simple::PCF8575_simple(uint8_t address) : _address(address) {}
+
+void PCF8575_simple::begin() {
+    Wire.begin();
+}
+
+void PCF8575_simple::write16(uint16_t data) {
+    Wire.beginTransmission(_address);
+    Wire.write(data & 0xFF);
+    Wire.write((data >> 8) & 0xFF);
+    Wire.endTransmission();
+}
+Тестовый скетч test_pcf8575.ino
+#include "PCF8575_simple.h"
+#include <Wire.h>
+
+// Замените на нужный адрес вашего расширителя:
+#define PCF_ADDR 0x21
+
+PCF8575_simple pcf(PCF_ADDR);
+
+void setup() {
+    pcf.begin();
+}
+
+void loop() {
+    // Последовательно включаем по одному выходу
+    for(uint8_t i=0; i<16; ++i) {
+        uint16_t val = 1 << i;
+        pcf.write16(val);
+        delay(200); // 200 мс для глаза
+    }
+    // Все гасим, пауза
+    pcf.write16(0x0000);
+    delay(500);
+    // Включаем все разряды (тестовый кадр)
+    pcf.write16(0xFFFF);
+    delay(1000);
+    // Гасим всё, пауза
+    pcf.write16(0x0000);
+    delay(500);
+}
+Примечания:
+
+Если индикаторы не горят или загораются только частично — проверьте логический уровень сигнала, адрес, подтяжку I2C, схему.
+Для общего анода инвертируйте: pcf.write16(~val);
+Можно запускать сразу на любом PCF8575 по нужному I2C-адресу.
+
+//--------------------------------------------------------------------------------
+
+Вот тестовая программа для последовательного вывода на каждый разряд всех цифр от 0 до 9 (пошагово) с задержкой 100 мс, 
+с инверсной логикой для общих анодов (или для вашего случая, где «инверсный сигнал»). 
+Файлы PCF8575_simple.h и PCF8575_simple.cpp используются ― как в предыдущем ответе.
+
+Скетч test_pcf8575.ino
+#include "PCF8575_simple.h"
+
+// Можно вынести сегменты как константный массив
+const uint8_t segTable[10] = {
+  0b00111111, // 0
+  0b00000110, // 1
+  0b01011011, // 2
+  0b01001111, // 3
+  0b01100110, // 4
+  0b01101101, // 5
+  0b01111101, // 6
+  0b00000111, // 7
+  0b01111111, // 8
+  0b01101111  // 9
+};
+
+#define PCF_HOUR   0x21
+#define PCF_MIN    0x22
+#define PCF_SEC    0x23
+
+PCF8575_simple pcfHour(PCF_HOUR);
+PCF8575_simple pcfMin(PCF_MIN);
+PCF8575_simple pcfSec(PCF_SEC);
+
+// Число разрядов на каждом PCF8575: 2
+const int DIGITS_PER_PCF = 2;
+
+void setup() {
+  pcfHour.begin();
+  pcfMin.begin();
+  pcfSec.begin();
+}
+
+void loop() {
+  // Для каждого индикатора (0..5) по очереди выводим счет от 0 до 9
+  for (int digitIndex = 0; digitIndex < 6; digitIndex++) {
+    for (int num = 0; num < 10; num++) {
+      uint8_t left = 0, right = 0;
+      if (digitIndex % 2 == 0) {
+        // первый индикатор (левый) у данного PCF
+        left = ~segTable[num];   // инверсия ― инверсное управление!
+        right = 0xFF;            // погашен (все сегменты отрицательного логического уровня)
+      } else {
+        // второй индикатор (правый) у данного PCF
+        left = 0xFF;             // погашен
+        right = ~segTable[num];  // инверсия
+      }
+      switch (digitIndex/2) {
+        case 0: pcfHour.write16(left | (right << 8)); break;
+        case 1: pcfMin.write16(left | (right << 8)); break;
+        case 2: pcfSec.write16(left | (right << 8)); break;
+      }
+      delay(100);
+    }
+    // По окончании цикла гасим оба разряда
+    switch (digitIndex/2) {
+      case 0: pcfHour.write16(0xFFFF); break;
+      case 1: pcfMin.write16(0xFFFF); break;
+      case 2: pcfSec.write16(0xFFFF); break;
+    }
+    delay(200); // пауза между разрядами
+  }
+}
+Кратко о работе алгоритма:
+Каждый из 6 разрядов индикаторов по очереди зажигает числа от 0 до 9, прочие разряды при этом гаснут (в рамках одного PCF ― сосед гаснет всегда).
+Для инверсного управления: ~segTable[num], для погашенного индикатора — все единицы (0xFF).
+После каждого полного сканирования разряда оба индикатора этого PCF гаснут, перед переходом к следующей позиции добавлена пауза 200 мс.
+Соответствие разрядов:
+0,1 — часы (PCF_HOUR)
+2,3 — минуты (PCF_MIN)
+4,5 — секунды (PCF_SEC)
+PCF8575_simple.h и PCF8575_simple.cpp — те файлы, что приведены выше.
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Чтобы реализовать инверсный вывод (например, для управления индикатором с общим анодом), необходимо передавать на PCF8575 инвертированные коды сегментов — то есть, использовать побитовое отрицание: ~segTable[цифра].
+
+Изменённые функции:
+
+void displayTime(uint8_t hours, uint8_t minutes, uint8_t seconds) 
+{
+    setPCF(pcfHour, ~segTable[hours / 10], ~segTable[hours % 10]);
+    setPCF(pcfMin,  ~segTable[minutes / 10], ~segTable[minutes % 10]);
+    setPCF(pcfSec,  ~segTable[seconds / 10], ~segTable[seconds % 10]);
+}
+void setPCF(PCF8575_simple& pcf, uint8_t first, uint8_t second) 
+{
+    uint16_t word = 0;
+    word |= (first & 0xFF);          // первый индикатор
+    word |= ((uint16_t)second) << 8; // второй индикатор
+    pcf.write16(word);
+}
+Пояснения:
+
+Используем ~ перед segTable[...] — инверсный код для каждого разряда.
+Если потребуется отдельная точка (DP), в коде также инвертируйте в той же логике:
+Например: ~(segTable[digit] | 0b1000'0000) — если хотите зажечь точку.
+Все остальные части кода (таблица сегментов, работа с PCF8575_simple) остаются без изменений.
+
+Если нужно добавить мигание точки или другой стиль, сообщите!

@@ -1,0 +1,119 @@
+#include <Wire.h>
+#include <PCF8575.h>
+
+// Адреса PCF8575
+#define PCF1_ADDR 0x21
+#define PCF2_ADDR 0x22
+#define PCF3_ADDR 0x23
+
+PCF8575 pcf1(PCF1_ADDR);
+PCF8575 pcf2(PCF2_ADDR);
+PCF8575 pcf3(PCF3_ADDR);
+
+#define INPUT_PIN PA1
+
+// Настройка - диапазон 45...65 Гц, точность в низкой и высокой поддиапазонах
+const int MEASUREMENTS = 10000; // число измеряемых переходов (увеличивать для точности)
+volatile uint32_t last_capture = 0;
+volatile uint32_t diff_sum = 0;
+volatile uint16_t diff_count = 0;
+
+float frequency = 0.0;
+
+// Семисег. коды для индикаторов (общий катод)
+const uint8_t segTable[10] = {
+  //gfedcba
+  0b00111111, //0
+  0b00000110, //1
+  0b01011011, //2
+  0b01001111, //3
+  0b01100110, //4
+  0b01101101, //5
+  0b01111101, //6
+  0b00000111, //7
+  0b01111111, //8
+  0b01101111  //9
+};
+2. Прерывание и обработка
+void freqInterrupt() {
+  static uint32_t prev = 0;
+  uint32_t now = micros();
+  if (prev > 0) {
+    uint32_t diff = now - prev;
+    diff_sum += diff;
+    diff_count++;
+  }
+  prev = now;
+}
+
+void setup() {
+  pinMode(INPUT_PIN, INPUT); 
+  attachInterrupt(digitalPinToInterrupt(INPUT_PIN), freqInterrupt, RISING);
+
+  Wire.begin();
+  pcf1.begin();
+  pcf2.begin();
+  pcf3.begin();
+}
+
+void loop() {
+  // Каждые ~секунда, вычислять частоту
+  static uint32_t lastTime = millis();
+  if (millis() - lastTime > 1000) { // раз в секунду
+    noInterrupts();
+    uint16_t n = diff_count;
+    uint32_t sum = diff_sum;
+    diff_count = 0;
+    diff_sum = 0;
+    interrupts();
+
+    if (n > 0) {
+      float Tavg = (float)sum / n; // ср. период, мкс
+      frequency = 1e6f / Tavg;
+    }
+    // вывод на индикаторы
+    displayFrequency(frequency);
+    lastTime = millis();
+  }
+}
+3. Вывод на шесть семисегментных индикаторов
+void displayFrequency(float freq) {
+  // Формируем строку "XX.YYYY", 6 разрядов
+  char buf[8];
+  dtostrf(freq, 6, 4, buf); // гарантируем длину 6, 4 знака после запятой
+  // buf[0] - десятки, buf[1] - единицы, buf[2] - точка, buf[3,4,5,6] - десятичные
+
+  uint8_t dig[6] = {0}; // коды для 6 индикаторов
+  for (int i = 0, j = 0; i < 6 && buf[j]; ++i) {
+    if (buf[j] == ' ') { j++; i--; continue; }
+    if (buf[j] == '.') { 
+      if (i > 0) dig[i-1] |= 0b10000000; // dot
+      j++;
+      i--;
+      continue;
+    }
+    if (buf[j] >= '0' && buf[j] <= '9')
+      dig[i] = segTable[buf[j] - '0'];
+    j++;
+  }
+  // отправка в PCF: 2 индикатора на один PCF8575
+  setPCF(pcf1, dig[0], dig[1]);
+  setPCF(pcf2, dig[2], dig[3]);
+  setPCF(pcf3, dig[4], dig[5]);
+}
+
+void setPCF(PCF8575 &pcf, uint8_t first, uint8_t second) {
+  // A=bit0 ... G=bit6, DP=bit7.
+  uint16_t word = 0;
+  // первый индикатор: P00-P07 (A,B,C,D,E,F,G,DP)
+  word |= (first & 0xFF);
+  // второй индикатор: P08-P15
+  word |= ((uint16_t)second) << 8;
+  pcf.write16(word);
+}
+Важные моменты
+Для заявленной точности, возможно, потребуется увеличить окно измерения (больше периодов, дольше интеграция, чем каждую секунду).
+Семисегментник может быть общим анодом; тогда инвертируйте коды.
+Не забудьте разместить pull-up'ы на линиях I2C.
+Для температурной компенсации кварца — используйте sensor/correction при необходимости (для экстремальных точностей).
+Проверяйте правильность подключения индикаторов к выводам PCF8575 (P00–P07 и P08–P15).

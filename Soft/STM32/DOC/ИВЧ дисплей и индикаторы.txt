@@ -1,0 +1,676 @@
+
+
+Добавить измерение и отображение текущего времени.
+Микроконтроллер STM32F407VGT6
+Среда программирования Arduino IDE с STM32GENERIC  https://github.com/danieleff/STM32GENERIC
+
+Составить программу индикации часов.
+Микросхема часов DS3231SN
+
+Индикаторы семисегментные SA08-11GWA 6 штук
+Управление индикаторами через расширитель PCF8575
+Один расширитель управляет двумя индикаторами.
+Управление расширителем через SCL SDA.
+Адрес часов 0x21
+Адрес минут 0x22
+Адрес секунд 0x23
+Выходы PCF8575 подключенные к индикаторам.
+Десятки часов
+P00 A
+P01 B
+P02 C
+P03 D
+P04 E
+P05 F
+P06 G
+P07 DP
+Единицы часов
+P08 A
+P09 B
+P10 C
+P11 D
+P12 E
+P13 F
+P14 G
+P15 DP
+
+Распиновка минут и секунд аналогичная.
+
+
+//=====================================================================
+
+Ниже — пример скетча для STM32F407VGT6 + Arduino IDE (STM32GENERIC),который:
+
+читает время с DS3231 по I2C (адрес DS3231 = 0x68);
+выводит HH:MM:SS на 6 семисегментных индикаторов SA08-11GWA;
+управляет индикаторами через 3× PCF8575,где каждый PCF8575 обслуживает 2 индикатора (16 линий = 2×8 сегментов);
+распиновка сегментов соответствует вашему описанию (P00..P07 — десятки,P08..P15 — единицы).
+Важно:у SA08-11GWA встречаются варианты с разной полярностью (общий анод/общий катод) и схемой включения.
+В скетче это сделано переключаемым флагом SEGMENTS_ACTIVE_LOW. Если сегменты у вас зажигаются при “0” на 
+выводе PCF — ставьте true. Если при “1” — false.
+
+Скетч (Arduino / STM32GENERIC)
+cpp Копировать
+#include <Arduino.h>
+#include <Wire.h>
+
+// ====================== НАСТРОЙКИ I2C ======================
+// Пины I2C (поставьте те,которые реально используете в вашей плате/варианте)
+// Для STM32F407 часто I2C1:PB6=SCL,PB7=SDA
+#ifndef SDA
+ #define SDA PB7
+#endif
+#ifndef SCL
+ #define SCL PB6
+#endif
+
+// Адрес DS3231 (7-bit)
+static const uint8_t DS3231_ADDR = 0x68;
+
+// Адреса PCF8575 (7-bit). PCF8575 обычно 0x20..0x27 (зависит от A0..A2).
+// Вы написали "Адрес часов 01,минут 02,секунд 03" — чаще это означает,
+// что A0..A2 выставлены так,что адреса будут,например,0x21/0x22/0x23.
+// ВАЖНО:УКАЖИТЕ РЕАЛЬНЫЕ 7-бит адреса вашего железа.
+static const uint8_t PCF_HOURS_ADDR = 0x21; // <-- изменить при необходимости
+static const uint8_t PCF_MINUTES_ADDR = 0x22; // <-- изменить при необходимости
+static const uint8_t PCF_SECONDS_ADDR = 0x23; // <-- изменить при необходимости
+
+// ====================== ПОЛЯРНОСТЬ СЕГМЕНТОВ ======================
+// true -> сегмент ВКЛ при 0 (активный низкий уровень,часто при "общем аноде" через ключи)
+// false -> сегмент ВКЛ при 1 (активный высокий уровень,часто при "общем катоде")
+static const bool SEGMENTS_ACTIVE_LOW = true;
+
+// Показывать ведущий ноль в десятках часов (08:..). Если false — будет пробел (8:..)
+static const bool SHOW_LEADING_ZERO_HOURS = true;
+
+// Моргание "двоеточия" через DP (DP на единицах часов и единицах минут)
+static const bool BLINK_COLON_ON_DP = true;
+
+// ====================== УТИЛИТЫ ======================
+static uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+static uint8_t bin2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+struct TimeHMS {
+ uint8_t hh;
+ uint8_t mm;
+ uint8_t ss;
+};
+
+// ====================== DS3231 (минимум) ======================
+static bool ds3231ReadTime(TimeHMS &t) 
+{
+ Wire.beginTransmission(DS3231_ADDR);
+ Wire.write(0x00); // seconds register
+ if (Wire.endTransmission(false) != 0) return false;
+
+ if (Wire.requestFrom((int)DS3231_ADDR,3) != 3) return false;
+
+ uint8_t rawS = Wire.read();
+ uint8_t rawM = Wire.read();
+ uint8_t rawH = Wire.read();
+
+ // DS3231:секунды/минуты BCD,часы:может быть 12/24. Предположим 24ч.
+ t.ss = bcd2bin(rawS & 0x7F);
+ t.mm = bcd2bin(rawM & 0x7F);
+
+ if (rawH & 0x40) {
+ // 12-hour mode
+ uint8_t hour12 = bcd2bin(rawH & 0x1F);
+ bool pm = rawH & 0x20;
+ t.hh = (hour12 % 12) + (pm ? 12 :0);
+ } else {
+ // 24-hour mode
+ t.hh = bcd2bin(rawH & 0x3F);
+ }
+ return true;
+}
+
+// Опционально:установить время один раз при старте (раскомментируйте)
+//#define SET_TIME_ON_BOOT
+#ifdef SET_TIME_ON_BOOT
+static void ds3231SetTime(uint8_t hh,uint8_t mm,uint8_t ss) 
+{
+ Wire.beginTransmission(DS3231_ADDR);
+ Wire.write(0x00);
+ Wire.write(bin2bcd(ss));
+ Wire.write(bin2bcd(mm));
+ Wire.write(bin2bcd(hh)); // 24h mode
+ Wire.endTransmission();
+}
+#endif
+
+// ====================== PCF8575 ======================
+class PCF8575 
+{
+public:
+ explicit PCF8575(uint8_t addr) :_addr(addr) {}
+
+ void write16(uint16_t value) {
+ Wire.beginTransmission(_addr);
+ Wire.write((uint8_t)(value & 0xFF)); // P00..P07
+ Wire.write((uint8_t)((value >> 8) & 0xFF)); // P08..P15
+ Wire.endTransmission();
+ }
+
+private:
+ uint8_t _addr;
+};
+
+// ====================== СЕМИСЕГМЕНТНЫЕ КОДЫ ======================
+// Биты внутри 1 цифры:A=bit0 ... G=bit6,DP=bit7
+enum SegBits :uint8_t {
+ SEG_A = 1 << 0,
+ SEG_B = 1 << 1,
+ SEG_C = 1 << 2,
+ SEG_D = 1 << 3,
+ SEG_E = 1 << 4,
+ SEG_F = 1 << 5,
+ SEG_G = 1 << 6,
+ SEG_DP = 1 << 7
+};
+
+// Таблица для "активный высокий" (common-cathode логика):1 = сегмент горит.
+// Если у вас наоборот — мы инвертируем ниже.
+static const uint8_t DIGIT_TO_SEG[10] = {
+ /*0*/ SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,
+ /*1*/ SEG_B | SEG_C,
+ /*2*/ SEG_A | SEG_B | SEG_D | SEG_E | SEG_G,
+ /*3*/ SEG_A | SEG_B | SEG_C | SEG_D | SEG_G,
+ /*4*/ SEG_B | SEG_C | SEG_F | SEG_G,
+ /*5*/ SEG_A | SEG_C | SEG_D | SEG_F | SEG_G,
+ /*6*/ SEG_A | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,
+ /*7*/ SEG_A | SEG_B | SEG_C,
+ /*8*/ SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,
+ /*9*/ SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G
+};
+
+static uint8_t encodeDigit(int d,bool dp) 
+{
+ uint8_t seg = 0;
+ if (d >= 0 && d <= 9) seg = DIGIT_TO_SEG[d];
+ else seg = 0; // "пусто"
+
+ if (dp) seg |= SEG_DP;
+
+ if (SEGMENTS_ACTIVE_LOW) seg = ~seg; // инверсия для активного низкого уровня
+ return seg;
+}
+
+// Собрать 16-битное слово для PCF8575:младший байт = десятки (P00..P07),старший = единицы (P08..P15)
+static uint16_t packTwoDigits(uint8_t tensSeg,uint8_t onesSeg) 
+{
+ return (uint16_t)tensSeg | ((uint16_t)onesSeg << 8);
+}
+
+// ====================== ГЛОБАЛЫ ======================
+PCF8575 pcfHours(PCF_HOURS_ADDR);
+PCF8575 pcfMinutes(PCF_MINUTES_ADDR);
+PCF8575 pcfSeconds(PCF_SECONDS_ADDR);
+
+static void displayHHMMSS(const TimeHMS &t) 
+{
+ int hT = t.hh / 10;
+ int hU = t.hh % 10;
+ int mT = t.mm / 10;
+ int mU = t.mm % 10;
+ int sT = t.ss / 10;
+ int sU = t.ss % 10;
+
+ // Ведущий ноль часов
+ int hT_forDisplay = hT;
+ if (!SHOW_LEADING_ZERO_HOURS && hT == 0) hT_forDisplay = -1; // пусто
+
+ bool colonOn = true;
+ if (BLINK_COLON_ON_DP) colonOn = (t.ss % 2) == 0;
+
+ // DP используем как "двоеточие" между HH и MM,а также между MM и SS:
+ // - DP на единицах часов (U) = ":" (между HH и MM)
+ // - DP на единицах минут (U) = ":" (между MM и SS)
+ uint8_t hh_tens = encodeDigit(hT_forDisplay,false);
+ uint8_t hh_ones = encodeDigit(hU,colonOn);
+
+ uint8_t mm_tens = encodeDigit(mT,false);
+ uint8_t mm_ones = encodeDigit(mU,colonOn);
+
+ uint8_t ss_tens = encodeDigit(sT,false);
+ uint8_t ss_ones = encodeDigit(sU,false);
+
+ pcfHours.write16(packTwoDigits(hh_tens,hh_ones));
+ pcfMinutes.write16(packTwoDigits(mm_tens,mm_ones));
+ pcfSeconds.write16(packTwoDigits(ss_tens,ss_ones));
+}
+
+void setup() 
+{
+ // I2C
+ Wire.setSDA(SDA);
+ Wire.setSCL(SCL);
+ Wire.begin();
+ Wire.setClock(100000); // можно 400000,если линии короткие и всё стабильно
+
+#ifdef SET_TIME_ON_BOOT
+ // Пример:установить время 12:34:56
+ ds3231SetTime(12,34,56);
+#endif
+
+ // При желании можно очистить индикаторы:
+ // "погасить всё" = либо 0x0000 (если active-high),либо 0xFFFF (если active-low)
+ uint16_t offWord = SEGMENTS_ACTIVE_LOW ? 0xFFFF :0x0000;
+ pcfHours.write16(offWord);
+ pcfMinutes.write16(offWord);
+ pcfSeconds.write16(offWord);
+}
+
+void loop() 
+{
+ static uint8_t lastShownSecond = 255;
+
+ TimeHMS t;
+ if (ds3231ReadTime(t)) 
+ {
+ // обновляем индикацию при смене секунды или при моргании DP
+ if (t.ss != lastShownSecond) 
+ {
+ lastShownSecond = t.ss;
+ displayHHMMSS(t);
+ } else if (BLINK_COLON_ON_DP) {
+ // если нужно моргание,DP меняется внутри одной и той же секунды редко,
+ // но у нас привязано к ss%2,так что тут можно ничего не делать.
+ }
+ }
+
+ delay(50);
+}
+Что нужно уточнить/проверить,чтобы “завелось” сразу
+Реальные I2C-адреса PCF8575 PCF8575 не бывает с адресами 0x01/0x02/0x03 как 7-bit I2C. 
+Обычно это 0x20..0x27. Если вы имели в виду “01/02/03” как номера,то
+поставьте фактические адреса,например 0x21/0x22/0x23.
+
+Полярность включения сегментов (SEGMENTS_ACTIVE_LOW) Если вместо цифр всё
+ “инверсно” (горит не то) — поменяйте true/false.
+
+Токоограничение и драйверы PCF8575 не рассчитан на прямое питание больших 
+семисегментных индикаторов без правильной схемы (резисторы/ключи). Но это уже про железо.
+
+Если скажете:
+
+какие именно I2C-адреса у ваших трёх PCF8575 (можно просто результат I2C-сканера),
+индикатор общий анод или общий катод и как именно подключены “общие” выводы,
+я подстрою скетч под вашу конкретную схему (включая корректную полярность “погасить/зажечь”
+и варианты отображения двоеточий).
+
+
+//---------------------------------------------------------------------------
+
+Микроконтроллер STM32F407VGT6. Частота кварца 8.0 мгц.
+Среда программирования Arduino IDE с STM32GENERIC  https://github.com/danieleff/STM32GENERIC
+
+Составить программу измерения текущих значений частоты электросети.
+Диапазон измерения частоты  от 45 до 65 Гц. 
+
+Точность измерения частоты при температуре от +15ОС до +35ОС в диапазоне от 45 до 55 Гц * 0,0005 Гц,
+в диапазоне от 55 до 65 Гц * 0,001Гц. 
+
+Индикаторы семисегментные SA08-11GWA 6 штук.
+Управление индикаторами через расширитель PCF8575
+Один расширитель управляет двумя индикаторами.
+Управление расширителем через SCL SDA.
+Адрес герц 0x21
+Отображение десятичных значений герц после запятой - 4 индикатора.
+Адрес   0x22
+Адрес   0x23
+Выходы PCF8575 подключенные к индикаторам.
+Десятки герц
+P00 A
+P01 B
+P02 C
+P03 D
+P04 E
+P05 F
+P06 G
+P07 DP
+Единицы герц
+P08 A
+P09 B
+P10 C
+P11 D
+P12 E
+P13 F
+P14 G
+P15 DP
+
+Входной сигнал частоты питающей сети PA1
+
+//============================================================================
+
+Ваше задание — типичная инженерная задача, требующая знания низкоуровневого программирования для STM32, а также принципов работы с I2C-расширителями и семисегментными индикаторами. Я приведу готовую Arduino IDE-программу, учитывающую ваши требования.
+
+Основные этапы работы:
+Измерение частоты: Используем таймер и прерывание по фронту на пине PA1 — считаем периоды.
+Вычисление и фильтрация частоты: Расчёт частоты за окно времени, доп. фильтрация для высокой точности.
+Отображение на индикаторах: Преобразуем частоту в массив семисегментных кодов, отправляем по I2C на три PCF8575.
+Сопоставление разрядов, управление точками.
+Высокая точность: Период измеряемого окна и обработка (длительность, усреднение) подбираются для требуемой точности.
+Библиотеки (добавьте через Library Manager или вручную):
+
+Wire | Arduino Documentation
+
+docs.arduino.cc
+
+PCF8575
+
+github.com
+
+1. Определения и подключения
+#include <Wire.h>
+#include <PCF8575.h>
+
+// Адреса PCF8575
+#define PCF1_ADDR 0x21
+#define PCF2_ADDR 0x22
+#define PCF3_ADDR 0x23
+
+PCF8575 pcf1(PCF1_ADDR);
+PCF8575 pcf2(PCF2_ADDR);
+PCF8575 pcf3(PCF3_ADDR);
+
+#define INPUT_PIN PA1
+
+// Настройка - диапазон 45...65 Гц, точность в низкой и высокой поддиапазонах
+const int MEASUREMENTS = 10000; // число измеряемых переходов (увеличивать для точности)
+volatile uint32_t last_capture = 0;
+volatile uint32_t diff_sum = 0;
+volatile uint16_t diff_count = 0;
+
+float frequency = 0.0;
+
+// Семисег. коды для индикаторов (общий катод)
+const uint8_t segTable[10] = {
+  //gfedcba
+  0b00111111, //0
+  0b00000110, //1
+  0b01011011, //2
+  0b01001111, //3
+  0b01100110, //4
+  0b01101101, //5
+  0b01111101, //6
+  0b00000111, //7
+  0b01111111, //8
+  0b01101111  //9
+};
+2. Прерывание и обработка
+void freqInterrupt() {
+  static uint32_t prev = 0;
+  uint32_t now = micros();
+  if (prev > 0) {
+    uint32_t diff = now - prev;
+    diff_sum += diff;
+    diff_count++;
+  }
+  prev = now;
+}
+
+void setup() {
+  pinMode(INPUT_PIN, INPUT); 
+  attachInterrupt(digitalPinToInterrupt(INPUT_PIN), freqInterrupt, RISING);
+
+  Wire.begin();
+  pcf1.begin();
+  pcf2.begin();
+  pcf3.begin();
+}
+
+void loop() {
+  // Каждые ~секунда, вычислять частоту
+  static uint32_t lastTime = millis();
+  if (millis() - lastTime > 1000) { // раз в секунду
+    noInterrupts();
+    uint16_t n = diff_count;
+    uint32_t sum = diff_sum;
+    diff_count = 0;
+    diff_sum = 0;
+    interrupts();
+
+    if (n > 0) {
+      float Tavg = (float)sum / n; // ср. период, мкс
+      frequency = 1e6f / Tavg;
+    }
+    // вывод на индикаторы
+    displayFrequency(frequency);
+    lastTime = millis();
+  }
+}
+3. Вывод на шесть семисегментных индикаторов
+void displayFrequency(float freq) {
+  // Формируем строку "XX.YYYY", 6 разрядов
+  char buf[8];
+  dtostrf(freq, 6, 4, buf); // гарантируем длину 6, 4 знака после запятой
+  // buf[0] - десятки, buf[1] - единицы, buf[2] - точка, buf[3,4,5,6] - десятичные
+
+  uint8_t dig[6] = {0}; // коды для 6 индикаторов
+  for (int i = 0, j = 0; i < 6 && buf[j]; ++i) {
+    if (buf[j] == ' ') { j++; i--; continue; }
+    if (buf[j] == '.') { 
+      if (i > 0) dig[i-1] |= 0b10000000; // dot
+      j++;
+      i--;
+      continue;
+    }
+    if (buf[j] >= '0' && buf[j] <= '9')
+      dig[i] = segTable[buf[j] - '0'];
+    j++;
+  }
+  // отправка в PCF: 2 индикатора на один PCF8575
+  setPCF(pcf1, dig[0], dig[1]);
+  setPCF(pcf2, dig[2], dig[3]);
+  setPCF(pcf3, dig[4], dig[5]);
+}
+
+void setPCF(PCF8575 &pcf, uint8_t first, uint8_t second) {
+  // A=bit0 ... G=bit6, DP=bit7.
+  uint16_t word = 0;
+  // первый индикатор: P00-P07 (A,B,C,D,E,F,G,DP)
+  word |= (first & 0xFF);
+  // второй индикатор: P08-P15
+  word |= ((uint16_t)second) << 8;
+  pcf.write16(word);
+}
+Важные моменты
+Для заявленной точности, возможно, потребуется увеличить окно измерения (больше периодов, дольше интеграция, чем каждую секунду).
+Семисегментник может быть общим анодом; тогда инвертируйте коды.
+Не забудьте разместить pull-up'ы на линиях I2C.
+Для температурной компенсации кварца — используйте sensor/correction при необходимости (для экстремальных точностей).
+Проверяйте правильность подключения индикаторов к выводам PCF8575 (P00–P07 и P08–P15).
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Вот пример программы для отображения времени с микросхемы DS3231SN на шести семисегментных индикаторах, управляемых тремя PCF8575 через I2C, в среде Arduino IDE со стеком STM32GENERIC. Время отображается в формате ЧЧ:ММ:СС.
+
+Необходимые библиотеки
+
+Wire | Arduino Documentation
+
+docs.arduino.cc
+
+PCF8575
+
+github.com
+
+GitHub - adafruit/RTClib: A fork of Jeelab’s fantastic RTC Arduino library
+
+github.com
+
+(или любую другую совместимую с DS3231, адаптируйте имена методов, если используете другую)
+1. Подключения, адреса и таблица сегментов
+#include <Wire.h>
+#include <PCF8575.h>
+#include <RTClib.h>
+
+// Адреса PCF8575 (часы, минуты, секунды)
+#define PCF_HOUR   0x21
+#define PCF_MIN    0x22
+#define PCF_SEC    0x23
+
+PCF8575 pcf_hour(PCF_HOUR);
+PCF8575 pcf_min(PCF_MIN);
+PCF8575 pcf_sec(PCF_SEC);
+
+RTC_DS3231 rtc;
+
+// Семисегментная таблица (общий катод)
+const uint8_t segTable[10] = {
+  //gfedcba
+  0b00111111, //0
+  0b00000110, //1
+  0b01011011, //2
+  0b01001111, //3
+  0b01100110, //4
+  0b01101101, //5
+  0b01111101, //6
+  0b00000111, //7
+  0b01111111, //8
+  0b01101111  //9
+};
+2. Настройка и основной цикл
+void setup() {
+  Wire.begin();
+  rtc.begin();
+  pcf_hour.begin();
+  pcf_min.begin();
+  pcf_sec.begin();
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); // раскомментировать для установки времени из компиляции
+}
+
+void loop() {
+  DateTime now = rtc.now();
+  displayTime(now.hour(), now.minute(), now.second());
+  delay(100); // плавное обновление
+}
+3. Функция отображения времени на индикаторах
+void displayTime(uint8_t hours, uint8_t minutes, uint8_t seconds) {
+  // Разряды: десятки и единицы
+  uint8_t h1 = hours / 10;
+  uint8_t h2 = hours % 10;
+  uint8_t m1 = minutes / 10;
+  uint8_t m2 = minutes % 10;
+  uint8_t s1 = seconds / 10;
+  uint8_t s2 = seconds % 10;
+
+  // Отправка в PCF: два индикатора на один PCF8575
+  setPCF(pcf_hour, segTable[h1], segTable[h2]);
+  setPCF(pcf_min, segTable[m1], segTable[m2]);
+  setPCF(pcf_sec, segTable[s1], segTable[s2]);
+}
+
+// Универсальная функция отправки (распиновка стандартная)
+void setPCF(PCF8575 &pcf, uint8_t first, uint8_t second) {
+  // первый индикатор: P00-P07
+  // второй индикатор: P08-P15
+  uint16_t word = 0;
+  word |= (first & 0xFF);          // первый индикатор
+  word |= ((uint16_t)second) << 8; // второй индикатор
+  pcf.write16(word);
+}
+Особенности:
+Точки (DP) можно выводить, если добавить | 0b10000000 к байту нужного индикатора.
+Для инверсной логики (общий анод) используйте ~segTable[digit].
+Для частоты обновления 10 Гц выставлен delay(100).
+Время беретcя с DS3231 по I2C, точность секундная.
+Если нужно поставить точки между часами-минутами или минутами-секундами (например, чтобы мигали точки), сообщите — добавлю логику для этого.
+
+//**************************************************************************************
+
+Отлично! Ниже приведён пример реализации управления PCF8575 напрямую по I2C для Arduino 
+STM32GENERIC без сторонних библиотек, с созданием своего заголовочного и исходного файлов для управления PCF8575.
+Вам потребуется два файла:
+
+PCF8575_simple.h
+PCF8575_simple.cpp
+Содержимое PCF8575_simple.h
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class PCF8575_simple {
+public:
+    PCF8575_simple(uint8_t address);
+    void begin();
+    void write16(uint16_t data); // отправить 16 бит на расширитель
+
+private:
+    uint8_t _address;
+};
+Содержимое PCF8575_simple.cpp
+#include "PCF8575_simple.h"
+
+PCF8575_simple::PCF8575_simple(uint8_t address) : _address(address) {}
+
+void PCF8575_simple::begin() {
+    Wire.begin();
+}
+
+void PCF8575_simple::write16(uint16_t data) {
+    Wire.beginTransmission(_address);
+    Wire.write(data & 0xFF);        // младший байт (P00...P07)
+    Wire.write((data >> 8) & 0xFF); // старший байт (P08...P15)
+    Wire.endTransmission();
+}
+Пример использования в основном скетче
+#include "PCF8575_simple.h"
+#include <Wire.h>
+#include <RTClib.h>
+
+// Адреса устройств
+#define PCF_HOUR   0x21
+#define PCF_MIN    0x22
+#define PCF_SEC    0x23
+
+PCF8575_simple pcfHour(PCF_HOUR);
+PCF8575_simple pcfMin(PCF_MIN);
+PCF8575_simple pcfSec(PCF_SEC);
+
+RTC_DS3231 rtc;
+
+const uint8_t segTable[10] = {
+  0b00111111, //0
+  0b00000110, //1
+  0b01011011, //2
+  0b01001111, //3
+  0b01100110, //4
+  0b01101101, //5
+  0b01111101, //6
+  0b00000111, //7
+  0b01111111, //8
+  0b01101111  //9
+};
+
+void setup() {
+  pcfHour.begin();
+  pcfMin.begin();
+  pcfSec.begin();
+  rtc.begin();
+}
+
+void loop() {
+  DateTime now = rtc.now();
+  displayTime(now.hour(), now.minute(), now.second());
+  delay(100);
+}
+
+void displayTime(uint8_t hours, uint8_t minutes, uint8_t seconds) {
+  setPCF(pcfHour, segTable[hours/10], segTable[hours%10]);
+  setPCF(pcfMin,  segTable[minutes/10], segTable[minutes%10]);
+  setPCF(pcfSec,  segTable[seconds/10], segTable[seconds%10]);
+}
+
+void setPCF(PCF8575_simple &pcf, uint8_t first, uint8_t second) {
+  uint16_t word = 0;
+  word |= (first & 0xFF);          // первый индикатор
+  word |= ((uint16_t)second) << 8; // второй индикатор
+  pcf.write16(word);
+}
+Как использовать:
+Сохраните PCF8575_simple.h и PCF8575_simple.cpp в папку с вашим проектом Arduino.
+Включите заголовочный файл в скетче: #include "PCF8575_simple.h"
+Используйте объект PCF8575_simple, как показано выше.
+Если потребуется добавить функции чтения портов или перевода портов в INPUT (для других задач), дайте знать — доработаю!

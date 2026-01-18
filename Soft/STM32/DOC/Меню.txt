@@ -1,0 +1,203 @@
+Составить программу меню в отдельной подпрограмме.
+Микроконтроллер STM32F103VGT6
+Среда программирования Arduino IDE
+Дисплей ST7789
+#include <TFT_eSPI.h>
+#include <SPI.h>
+
+Страниц меню 5
+Пунктов меню в каждой странице 5
+
+Кнопки управления меню:
+
+SW1 PC3  Длительное нажатие - вызов меню. Повторное короткое нажатие - выход из меню.
+SW2 PC2  Навигация по страницам и пунктам меню.
+SW3 PC1  Навигация по страницам и пунктам меню.
+SW4 PC0  Фиксация, запись действия пункта меню и выход из пункта меню .
+
+//=================================================================================
+
+Ниже приведён пример архитектуры для реализации многостраничного меню (5 страниц × 5 пунктов) для STM32F103VGT6 с экраном ST7789 в Arduino IDE с использованием библиотеки TFT_eSPI. Программа разбита на модули: главное меню реализовано отдельной подпрограммой, управление — по четырём кнопкам на линиях PC0–PC3.
+
+Минимальная логика, обработка нажатий и отрисовка меню (без фактических действий по пунктам — только структура). Дополнительную реализацию можно расширить для запоминания состояний и обработки функций.
+
+#include <TFT_eSPI.h>
+#include <SPI.h>
+
+// Определяем пины кнопок
+#define SW1_PIN PC3 // Вызов/выход меню (длинное/короткое)
+#define SW2_PIN PC2 // Навигация вверх/стр.
+#define SW3_PIN PC1 // Навигация вниз/стр.
+#define SW4_PIN PC0 // ОК/Запись/выход из пункта
+
+TFT_eSPI tft = TFT_eSPI();
+
+#define MENU_PAGES 5
+#define MENU_ITEMS 5
+
+// Структура меню
+const char* menu[MENU_PAGES][MENU_ITEMS] = {
+  {"Page1-Item1", "Page1-Item2", "Page1-Item3", "Page1-Item4", "Page1-Item5"},
+  {"Page2-Item1", "Page2-Item2", "Page2-Item3", "Page2-Item4", "Page2-Item5"},
+  {"Page3-Item1", "Page3-Item2", "Page3-Item3", "Page3-Item4", "Page3-Item5"},
+  {"Page4-Item1", "Page4-Item2", "Page4-Item3", "Page4-Item4", "Page4-Item5"},
+  {"Page5-Item1", "Page5-Item2", "Page5-Item3", "Page5-Item4", "Page5-Item5"},
+};
+
+int currPage = 0;
+int currItem = 0;
+bool menuActive = false;
+
+void setup() {
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  pinMode(SW1_PIN, INPUT_PULLUP);
+  pinMode(SW2_PIN, INPUT_PULLUP);
+  pinMode(SW3_PIN, INPUT_PULLUP);
+  pinMode(SW4_PIN, INPUT_PULLUP);
+
+  // Приветствие/стартовый экран
+  tft.setTextColor(TFT_GREEN); tft.setTextSize(2);
+  tft.drawString("STM32F103 Menu Demo", 20, 40);
+}
+
+void loop() {
+  if (checkLongPress(SW1_PIN)) { // Длинное нажатие
+    menuMode(true);
+  }
+  if (menuActive) {
+    menuHandler();
+  }
+}
+
+void menuMode(bool active) {
+  menuActive = active;
+  currPage = 0;
+  currItem = 0;
+  if (menuActive) {
+    drawMenu();
+  } else {
+    tft.fillScreen(TFT_BLACK); // Стереть меню
+  }
+}
+
+// Функция отрисовки меню
+void drawMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE); tft.setTextSize(2);
+  char pageStr[16];
+  sprintf(pageStr, "Page %d/5", currPage+1);
+  tft.drawString(pageStr, 10, 10);
+  for (int i = 0; i < MENU_ITEMS; i++) {
+    if (i == currItem) {
+      tft.setTextColor(TFT_YELLOW, TFT_BLUE);
+    } else {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+    tft.drawString(menu[currPage][i], 30, 40 + i*30);
+  }
+}
+
+// Функция обработки меню
+void menuHandler() {
+  // Навигация страниц/пунктов
+  if (buttonPressed(SW2_PIN)) {
+    currItem--;
+    if (currItem < 0) {
+      currItem = MENU_ITEMS-1;
+    }
+    drawMenu();
+    delay(150);
+  }
+  if (buttonPressed(SW3_PIN)) {
+    currItem++;
+    if (currItem >= MENU_ITEMS) {
+      currItem = 0;
+    }
+    drawMenu();
+    delay(150);
+  }
+
+  // Короткое нажатие SW1 — выход из меню
+  if (buttonPressed(SW1_PIN)) {
+    menuActive = false;
+    tft.fillScreen(TFT_BLACK);
+    delay(200);
+  }
+  // ОК — фиксируем выбор (SW4)
+  if (buttonPressed(SW4_PIN)) {
+    handleMenuSelect(currPage, currItem);
+    menuActive = false;
+    tft.fillScreen(TFT_BLACK);
+    delay(200);
+  }
+}
+
+// Реакция на выбор пункта меню (можно расширять своё действие)
+void handleMenuSelect(int page, int item) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN); tft.setTextSize(2);
+  tft.drawString("Selected:", 10, 40);
+  tft.drawString(menu[page][item], 10, 80);
+  delay(1000);
+}
+
+// Проверка длинного нажатия (пример)
+bool checkLongPress(uint8_t pin) {
+  if (digitalRead(pin) == LOW) {
+    unsigned long t0 = millis();
+    while(digitalRead(pin) == LOW) {
+      if (millis() - t0 > 700) // 700 мс — длинное нажатие
+        return true;
+    }
+  }
+  return false;
+}
+
+// Проверка короткого нажатия
+bool buttonPressed(uint8_t pin) {
+  static uint32_t last_press[4] = {0,0,0,0}; // для SW1-4
+  int idx = 3-(pin-PC0); // PC0->3, PC1->2, PC2->1, ...
+  if (digitalRead(pin) == LOW && (millis()-last_press[idx]>250)) {
+    last_press[idx] = millis();
+    while(digitalRead(pin)==LOW);
+    return true;
+  }
+  return false;
+}
+
+
+
+Кратко по основным функциям:
+menuMode() — активация меню, возврат к главному экрану.
+drawMenu() — отображение текущей страницы/пункта меню.
+menuHandler() — обработка навигации и выхода.
+handleMenuSelect() — выполнение действия по выбранному пункту (пример).
+checkLongPress() — определение длительного нажатия.
+buttonPressed() — определение короткого нажатия кнопки с антидребезгом.
+Схема логики управления меню (mermaid)
+Длинное нажатие SW1
+SW2/SW3
+SW2
+SW3
+Короткое нажатие SW1
+SW4
+Обычный режим работы
+Активировано меню
+Навигация
+Следующий пункт/страница
+Предыдущий пункт/страница
+Выход из меню
+Фиксация/запись действия и выход из меню
+Примечания
+Пины PCx: В STM32F103 прописывайте «PCx» как цифровые номера, если используете Arduino Core for STM32 (см.
+API
+
+github.com
+
+) — например, PC3 (иначе используйте цифровое значение, если не работает).
+Меню легко масштабируется: просто правьте массив menu.
+Задержки в обработке кнопок и антидребезг минимальны для работы меню.
+Реальные действия замените в функции handleMenuSelect.
+Если потребуется расширить (например, добавлять данные из памяти, изменять цвета, делать вложенные уровни меню), просто спрашивайте!
