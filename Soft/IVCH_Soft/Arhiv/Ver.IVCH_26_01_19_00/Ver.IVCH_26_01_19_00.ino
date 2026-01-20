@@ -1,0 +1,554 @@
+/*
+
+
+
+
+
+*/
+
+
+#include "Arduino.h"
+#include "PCF8575_simple.h"
+#include <Wire.h>
+#include <stdint.h>
+#include <math.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <SD.h>
+
+#include "Menu.h"
+#include "Buttons.h"
+#include "SIM800TimeAsync.h"
+#include "AT24C128Settings.h"
+#include "TimeFeed.h"
+#include "RTCSupport.h"
+
+HardwareSerial MODEM(PC11, PC10); // RX, TX
+
+static const uint8_t PWRKEY_PIN = PE0; // через NPN на землю
+static const bool PWRKEY_ACTIVE_HIGH = true; // "нажать"=HIGH
+
+SIM800TimeAsync sim(MODEM, PWRKEY_PIN, PWRKEY_ACTIVE_HIGH);
+
+AT24C128Settings ee(Wire, 0x50);
+AT24C128Settings::Config cfg;
+SIM800TimeAsync::NtpConfig ntp;
+
+RealtimeClock rtc;
+
+// --- DOW для вашего DS3231/RTCSupport:dayOfWeek 1..7 (Mon..Sun)
+static uint8_t dow0_sun(int y, int m, int d) {
+    static int t[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+    if (m < 3) y -= 1;
+    return (uint8_t)((y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7); // 0=Sun..6=Sat
+}
+static uint8_t ds3231DowFromDow0(uint8_t dow0) {
+    return (dow0 == 0) ? 7 : dow0; // Sun->7,Mon..Sat->1..6
+}
+
+static void applyCfgToSim(const AT24C128Settings::Config& c) 
+{
+    SIM800TimeAsync::NtpConfig ntp;
+    ntp.apn = c.apn;
+    ntp.user = c.user;
+    ntp.pass = c.pass;
+    ntp.server = c.server;
+    ntp.tzHours = c.tzNtpHours; // для AT+CNTP (обычно 0)
+    ntp.enableFallback = c.enableFallback;
+
+    sim.setNtpConfig(ntp);
+    sim.setPeriodMs(c.periodMs);
+}
+
+// Вызывать,когда настройки изменились (из меню/по UART и т.п.)
+static bool saveCfgAndApply(const AT24C128Settings::Config& c) {
+    if (!ee.save(c, true)) return false;
+    applyCfgToSim(c);
+    return true;
+}
+
+// --- Local(+tzq) -> UTC conversion (с переносом даты) ---
+static int32_t daysFromCivil(int y, int m, int d) 
+{
+    y -= (m <= 2);
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + (unsigned)d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int32_t)(era * 146097 + (int)doe - 719468); // days to 1970-01-01
+}
+
+static void civilFromDays(int32_t z, int& y, int& m, int& d) {
+    z += 719468;
+    const int era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    y = (int)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    m = (int)(mp + (mp < 10 ? 3 : -9));
+    y += (m <= 2);
+}
+
+static int64_t toEpochSeconds(int y, int mo, int d, int h, int mi, int s) 
+{
+    int32_t days = daysFromCivil(y, mo, d);
+    return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+static void fromEpochSeconds(int64_t t, int& y, int& mo, int& d, int& h, int& mi, int& s) 
+{
+    int64_t days = t / 86400LL;
+    int64_t rem = t % 86400LL;
+    if (rem < 0) { rem += 86400LL; days -= 1; }
+    civilFromDays((int32_t)days, y, mo, d);
+    h = (int)(rem / 3600LL); rem %= 3600LL;
+    mi = (int)(rem / 60LL);
+    s = (int)(rem % 60LL);
+}
+
+// tzq:четверти часа,local = utc + tz => utc = local - tz
+static void localToUTC(int& y, int& mo, int& d, int& h, int& mi, int& s, int tzQuarterHours) 
+{
+    const int offsetMin = tzQuarterHours * 15;
+    int64_t epochLocal = toEpochSeconds(y, mo, d, h, mi, s);
+    int64_t epochUTC = epochLocal - (int64_t)offsetMin * 60LL;
+    fromEpochSeconds(epochUTC, y, mo, d, h, mi, s);
+}
+
+// UTC -> Local по tzq (четверти часа):local = utc + tz
+static void utcToLocal(int& y, int& mo, int& d, int& h, int& mi, int& s, int tzQuarterHours)
+{
+    const int offsetMin = tzQuarterHours * 15;
+    int64_t epochUTC = toEpochSeconds(y, mo, d, h, mi, s);
+    int64_t epochLocal = epochUTC + (int64_t)offsetMin * 60LL;
+    fromEpochSeconds(epochLocal, y, mo, d, h, mi, s);
+}
+
+#define SW1_PIN PC3 // Вызов меню/выход
+#define SW2_PIN PC2 // Навигация (выбор страницы или пункта) вниз
+#define SW3_PIN PC1 // Навигация вверх
+#define SW4_PIN PC0 // Фиксация
+
+TFT_eSPI tft = TFT_eSPI();
+Menu menu_start(&tft);
+
+Button btnSW1(SW1_PIN);
+Button btnSW2(SW2_PIN);
+Button btnSW3(SW3_PIN);
+Button btnSW4(SW4_PIN);
+
+#define PCF_HOUR   0x21
+#define PCF_MIN    0x22
+#define PCF_SEC    0x23
+#define BUTTON_PIN PC0    // КНОПКА для отображения частоты
+
+PCF8575_simple pcfHour(PCF_HOUR);
+PCF8575_simple pcfMin(PCF_MIN);
+PCF8575_simple pcfSec(PCF_SEC);
+
+
+const uint8_t segTable[10] = {
+  0b00111111, //0
+  0b00000110, //1
+  0b01011011, //2
+  0b01001111, //3
+  0b01100110, //4
+  0b01101101, //5
+  0b01111101, //6
+  0b00000111, //7
+  0b01111111, //8
+  0b01101111  //9
+};
+
+
+#define INPUT_PIN PA1
+
+volatile uint32_t last_capture = 0;
+volatile uint32_t diff_sum = 0;
+volatile uint16_t diff_count = 0;
+volatile bool skip = false;
+
+float frequency = 0.0f;
+
+
+#ifndef dtostrf
+char* dtostrf(double val, signed char width, unsigned char prec, char* sout) {
+    sprintf(sout, "%*.*f", width, prec, val);
+    return sout;
+}
+#endif
+
+// --- Делитель частоты на 2 ---
+void freqInterrupt() {
+    static uint32_t prev = 0;
+    if (skip) { skip = false; return; }
+    skip = true;
+    uint32_t now = micros();
+    if (prev > 0) {
+        uint32_t diff = now - prev;
+        diff_sum += diff;
+        diff_count++;
+    }
+    prev = now;
+}
+
+void setPCF(PCF8575_simple& pcf, uint8_t first, uint8_t second) {
+    uint16_t word = 0;
+    word |= (first & 0xFF);
+    word |= ((uint16_t)second) << 8;
+    pcf.write16(word);
+}
+
+
+void displayFrequency(float freq)
+{
+    // Ограничение диапазона. Только 2 целых разряда!
+
+    if (isnan(freq) || freq < 0 || freq > 99.9999) {
+        setPCF(pcfHour, 0xFF, 0xFF);
+        setPCF(pcfMin, 0xFF, 0xFF);
+        setPCF(pcfSec, 0xFF, 0xFF);
+        return;
+    }
+
+
+    if (freq > 99.9999) freq = 99.9999;
+    if (freq < 0) freq = 0.0;
+
+    // Разбиваем на целую и дробную часть
+    uint8_t d1 = (uint8_t)(freq / 10);              // десятки Гц
+    uint8_t d2 = (uint8_t)(fmod(freq, 10));         // единицы Гц
+    uint16_t fract = (uint16_t)(fmod(freq, 1) * 10000); // 4 знака после точки
+
+    // Дробная часть разряды:
+    uint8_t f1 = (fract / 1000) % 10;
+    uint8_t f2 = (fract / 100) % 10;
+    uint8_t f3 = (fract / 10) % 10;
+    uint8_t f4 = (fract / 1) % 10;
+
+    uint8_t dig[6];
+    dig[0] = ~segTable[d1];
+    dig[1] = ~segTable[d2] & ~(0b10000000); // Включить точку
+    dig[2] = ~segTable[f1];
+    dig[3] = ~segTable[f2];
+    dig[4] = ~segTable[f3];
+    dig[5] = ~segTable[f4];
+
+    setPCF(pcfHour, dig[0], dig[1]);
+    setPCF(pcfMin, dig[2], dig[3]);
+    setPCF(pcfSec, dig[4], dig[5]);
+}
+
+
+void displayTime(uint8_t hours, uint8_t minutes, uint8_t seconds) {
+    setPCF(pcfHour, ~segTable[hours / 10], ~segTable[hours % 10]);
+    setPCF(pcfMin, ~segTable[minutes / 10], ~segTable[minutes % 10]);
+    setPCF(pcfSec, ~segTable[seconds / 10], ~segTable[seconds % 10]);
+}
+
+
+Sd2Card card;
+SdVolume volume;
+SdFile root;
+const int chipSelect = PA8;
+
+
+void setup() 
+{
+    // ВАЖНО:отпустить PWRKEY сразу (чтобы не держать "кнопку" при старте)
+    pinMode(PE0, OUTPUT);
+    digitalWrite(PE0, LOW);
+
+    Serial.begin(115200);
+
+    delay(1500);
+    Serial.println("Start system");
+    Wire.begin();
+    rtc.begin();
+
+    const bool FORCE_EEPROM_INIT = false; // <- на один запуск поставьте true
+    if (ee.begin()) 
+    {
+        if (FORCE_EEPROM_INIT) 
+        {
+            Serial.println(F("FORCE EEPROM INIT"));
+
+            AT24C128Settings::defaults(cfg);
+            //cfg.tzTargetHours = 3;
+            //cfg.tzNtpHours = 0;
+            //cfg.periodMs = 60000;
+            //cfg.enableFallback = false;
+
+            ee.save(cfg, true);
+        }
+
+        ee.load(cfg, false);
+        Serial.print("cfg.tzTargetHours="); Serial.println((int)cfg.tzTargetHours);
+        Serial.print("cfg.tzNtpHours="); Serial.println((int)cfg.tzNtpHours);
+        Serial.print("cfg.periodMs="); Serial.println(cfg.periodMs);
+        Serial.print("cfg.enableFallback="); Serial.println(cfg.enableFallback ? 1 : 0);
+    }
+    else 
+    {
+        Serial.println(F("EEPROM AT24C128 not found"));
+        AT24C128Settings::defaults(cfg);
+    }
+
+    pcfHour.begin();
+    pcfMin.begin();
+    pcfSec.begin();
+    pinMode(INPUT_PIN, INPUT);
+    attachInterrupt(INPUT_PIN, freqInterrupt, RISING);
+  
+    String ver_soft = __FILE__;
+    int val_srt = ver_soft.lastIndexOf('\\');
+    ver_soft.remove(0, val_srt + 1);
+    val_srt = ver_soft.lastIndexOf('.');
+    ver_soft.remove(val_srt);
+    Serial.println(ver_soft);
+    menu_start.setup(ver_soft);
+    menu_start.drawStartPage();
+
+    //==============================================================================
+
+    sim.setDebug(&Serial, true);
+
+    sim.begin(9600);
+
+    // AT ping раз в 60 секунд
+    sim.setHealthPingMs(60000);
+    sim.setMaxRecoveryAttempts(5);
+
+    applyCfgToSim(cfg);
+
+    sim.start();
+    sim.requestTimeNow(); // первый запрос времени сразу,не ждать periodMs
+
+}
+
+void loop() 
+{
+    // “Фоновое” обслуживание SIM800
+    sim.tick();
+    static uint32_t lastFreqUpdate = 0;
+    static float lastMeasuredFreq = 0.0f;
+
+    static uint8_t prev_hour = 255, prev_min = 255, prev_sec = 255;
+    static uint32_t prevFreqInt = 0, prevFreqFrac = 0;
+
+    // --- 1. Расчет частоты раз в секунду ---
+    if (millis() - lastFreqUpdate > 1000) 
+    {
+        noInterrupts();
+        uint16_t n = diff_count;
+        uint32_t sum = diff_sum;
+        diff_count = 0; diff_sum = 0;
+        interrupts();
+        if (n > 0)
+        {
+            float Tavg = (float)sum / n;
+            frequency = (1e6f / Tavg);
+            lastMeasuredFreq = frequency;
+        }
+        lastFreqUpdate = millis();
+    }
+
+    // --- 2. Чтение кнопки с антидребезгом ---
+    static bool lastBtnState = HIGH;
+    static uint32_t lastDebounce = 0;
+    bool btnState = digitalRead(BUTTON_PIN);
+
+    if (btnState != lastBtnState) 
+    {
+        lastDebounce = millis();
+        lastBtnState = btnState;
+    }
+    bool btnStableState = lastBtnState;
+    if ((millis() - lastDebounce) > 25) 
+    {
+        btnStableState = btnState;
+    }
+
+    // --- 3. Вывод либо частоты, либо времени ТОЛЬКО при изменении ---
+    if (btnStableState == LOW) 
+    {
+        // Кнопка нажата: ЧАСТОТА
+        uint32_t curFreqInt = (uint32_t)lastMeasuredFreq;
+        uint32_t curFreqFrac = (uint32_t)((lastMeasuredFreq - curFreqInt) * 10000.0);
+        if (curFreqInt != prevFreqInt || curFreqFrac != prevFreqFrac) 
+        {
+            displayFrequency(lastMeasuredFreq);
+            prevFreqInt = curFreqInt;
+            prevFreqFrac = curFreqFrac;
+            Serial.print(F("frequency:"));
+            Serial.println(frequency, 4);
+
+        }
+    }
+    else 
+    {
+        // Кнопка не нажата: ВРЕМЯ
+        RTCTime now = rtc.getTime();
+        if (now.hour != prev_hour || now.minute != prev_min || now.second != prev_sec) 
+        {
+            displayTime(now.hour, now.minute, now.second);
+            prev_hour = now.hour;
+            prev_min = now.minute;
+            prev_sec = now.second;
+ 
+            //Serial.print(rtc.getDayOfWeekStr(now));
+            //Serial.print(F(" "));
+            //Serial.print(rtc.getDateStr(now));
+            //Serial.print(F(" - "));
+            //Serial.print(rtc.getTimeStr(now));
+            //Serial.println();
+
+        }
+    }
+    btnSW1.update();
+    btnSW2.update();
+    btnSW3.update();
+    btnSW4.update();
+
+    if (!menu_start.isActive())
+    {
+        if (btnSW1.getEvent() == BTN_LONG)
+        {
+            menu_start.activate(); // Вход в меню (выбор страницы)
+        }
+    }
+    else
+    {
+        switch (menu_start.getState()) {
+        case MENU_PAGE_SELECT:
+            if (btnSW2.getEvent() == BTN_SHORT) menu_start.prevPage();
+            if (btnSW3.getEvent() == BTN_SHORT) menu_start.nextPage();
+            if (btnSW1.getEvent() == BTN_SHORT) menu_start.fixPage(); // Фиксация страницы (переход к пунктам)
+            break;
+        case MENU_ITEM_SELECT:
+            if (btnSW2.getEvent() == BTN_SHORT) menu_start.prevItem();
+            if (btnSW3.getEvent() == BTN_SHORT) menu_start.nextItem();
+            if (btnSW4.getEvent() == BTN_SHORT) menu_start.fixItem(); // Фиксация пункта, запуск теста
+            if (btnSW1.getEvent() == BTN_SHORT) menu_start.backToStart(); // Возврат на стартовую страницу
+            break;
+        case MENU_TEST:
+            if (btnSW1.getEvent() == BTN_SHORT) menu_start.backToStart(); // Возврат на стартовую при тесте
+            break;
+        default: break;
+        }
+    }
+
+    if (sim.hasNewTime())
+    {
+        String raw = sim.lastCCLKRaw();
+
+        int y, mo, d, h, mi, s, tzq_net;
+        if (SIM800TimeAsync::parseCCLK(raw, y, mo, d, h, mi, s, tzq_net))
+        {
+            // 1) local(net) -> UTC
+            localToUTC(y, mo, d, h, mi, s, tzq_net);
+
+            // 2) UTC -> local(target TZ from cfg)
+            int tzq_target = (int)cfg.tzTargetHours * 4;
+            utcToLocal(y, mo, d, h, mi, s, tzq_target);
+
+            // DOW по целевому локальному времени
+            uint8_t dow0 = dow0_sun(y, mo, d);
+            uint8_t dsDow = ds3231DowFromDow0(dow0);
+
+            // Пишем в RTC уже В ЦЕЛЕВОМ часовом поясе
+            rtc.setTime((uint8_t)s, (uint8_t)mi, (uint8_t)h, dsDow, (uint8_t)d, (uint8_t)mo, (uint16_t)y);
+
+            // Строки для TFT — тоже в целевом TZ
+            snprintf(gDateStr, sizeof(gDateStr), "%02d.%02d.%04d", d, mo, y);
+            snprintf(gTimeStr, sizeof(gTimeStr), "%02d:%02d:%02d", h, mi, s);
+            gTimeUpdated = true;
+
+            Serial.print("TZ net(qhr)="); Serial.print(tzq_net);
+            Serial.print(" targetHours="); Serial.println((int)cfg.tzTargetHours);
+        }
+    }
+ //   delay(10);
+}
+
+
+void SD_setup()
+{
+    Serial.print("\nInitializing SD card...");
+
+     // we'll use the initialization code from the utility libraries
+     // since we're just testing if the card is working!
+     if (!card.init(SPI_HALF_SPEED, chipSelect)) 
+     {
+         Serial.println("initialization failed. Things to check:");
+         Serial.println("* is a card inserted?");
+         Serial.println("* is your wiring correct?");
+         Serial.println("* did you change the chipSelect pin to match your shield or module?");
+         while (1);
+     }
+     else
+     {
+         Serial.println("Wiring is correct and a card is present.");
+         // }
+
+          // print the type of card
+         Serial.println();
+         Serial.print("Card type:         ");
+         switch (card.type()) {
+         case SD_CARD_TYPE_SD1:
+             Serial.println("SD1");
+             break;
+         case SD_CARD_TYPE_SD2:
+             Serial.println("SD2");
+             break;
+         case SD_CARD_TYPE_SDHC:
+             Serial.println("SDHC");
+             break;
+         default:
+             Serial.println("Unknown");
+         }
+
+         // Now we will try to open the 'volume'/'partition' - it should be FAT16 or FAT32
+         if (!volume.init(card)) {
+             Serial.println("Could not find FAT16/FAT32 partition.\nMake sure you've formatted the card");
+             while (1);
+         }
+
+         Serial.print("Clusters:          ");
+         Serial.println(volume.clusterCount());
+         Serial.print("Blocks x Cluster:  ");
+         Serial.println(volume.blocksPerCluster());
+
+         Serial.print("Total Blocks:      ");
+         Serial.println(volume.blocksPerCluster() * volume.clusterCount());
+         Serial.println();
+
+         // print the type and size of the first FAT-type volume
+         uint32_t volumesize;
+         Serial.print("Volume type is:    FAT");
+         Serial.println(volume.fatType(), DEC);
+
+         volumesize = volume.blocksPerCluster();    // clusters are collections of blocks
+         volumesize *= volume.clusterCount();       // we'll have a lot of clusters
+         volumesize /= 2;                           // SD card blocks are always 512 bytes (2 blocks are 1KB)
+         Serial.print("Volume size (Kb):  ");
+         Serial.println(volumesize);
+         Serial.print("Volume size (Mb):  ");
+         volumesize /= 1024;
+         Serial.println(volumesize);
+         Serial.print("Volume size (Gb):  ");
+         Serial.println((float)volumesize / 1024.0);
+
+         Serial.println("\nFiles found on the card (name, date and size in bytes): ");
+         root.openRoot(volume);
+
+         // list all files in the card with date and size
+         root.ls(LS_R | LS_DATE | LS_SIZE);
+     }
+
+     //==============================================================================
+
+}
+

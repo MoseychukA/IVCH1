@@ -1,0 +1,3168 @@
+Создать программу получения текущего времени с применением модуля SIM800C.
+Микроконтроллер STM32F103VGT6
+Среда программирования Arduino IDE
+Подключение по USART4
+Управление входом PWRKEY PE0 через транзистор NPN 
+Оператор MTS
+UART4 PWRKEY подключен через транзистор. 
+Создать отдельные файлы .h и .cpp. 
+Запрашивать время периодически через 1 минуту.
+управление питанием VBAT постоянное.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — обновлённая версия “мини‑библиотеки” SIM800Time (раздельные .h/.cpp) с:
+
+автоопределением включён/выключен по URC строкам RDY / Call Ready / SMS Ready 
+(и всё равно с контрольным AT,чтобы не зависеть от потери URC);
+fallback на NTP по GPRS,если NITZ не пришёл (время из AT+CCLK? невалидно).
+Питание на модеме постоянно,PWRKEY через NPN на землю ⇒ “нажатие” = подать HIGH на PE0 (как и задано).
+
+1) SIM800Time.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class SIM800TimeClient 
+{
+public:
+ // pwrkeyActiveHigh=true для вашей схемы:PE0=HIGH открывает NPN -> PWRKEY тянется к GND
+ SIM800TimeClient(HardwareSerial& serial,uint8_t pwrkeyPin,bool pwrkeyActiveHigh = true);
+
+ void begin(uint32_t baud);
+
+ // Безопасно обеспечить,что модем включен:
+ // 1) пробуем AT
+ // 2) если нет ответа -> жмем PWRKEY и ждём URC (RDY/Call Ready),затем AT
+ bool ensureOnSmart(uint32_t atProbeTimeoutMs = 1500,
+ uint16_t pwrkeyPressMs = 1200,
+ uint32_t urcWaitMs = 8000,
+ uint32_t atReadyTimeoutMs = 12000);
+
+ // Инициализация (echo off,ошибки,CLTS=1)
+ bool init(uint32_t atReadyTimeoutMs = 12000);
+
+ // Сеть
+ bool waitForNetwork(uint32_t timeoutMs = 60000);
+
+ // Прочитать время модема
+ bool getCCLK(String& rawResp,uint32_t timeoutMs = 1500);
+ static bool parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours);
+
+ // Проверка "похоже ли на реальное время"
+ static bool isCCLKValid(const String& resp,int minYear = 2020);
+
+ // --- NTP по GPRS (fallback) ---
+ // Настроить контекст и синхронизировать время через NTP.
+ // tzHours:часовой пояс в часах для AT+CNTP (обычно -11..+12)
+ bool syncTimeWithNTP(const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ uint32_t bearerOpenTimeoutMs = 45000,
+ uint32_t ntpTimeoutMs = 20000);
+
+ // "Умное" получение времени:
+ // 1) ждём сеть
+ // 2) пробуем NITZ (AT+CCLK?)
+ // 3) если время невалидно -> NTP -> снова AT+CCLK?
+ bool getTimeSmart(String& rawResp,
+ const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ bool forceNtpIfInvalid = true);
+
+private:
+ HardwareSerial& _sim;
+ uint8_t _pwrkeyPin;
+ bool _pwrkeyActiveHigh;
+
+ // URC состояние (может помочь понять,что модем загрузился)
+ bool _seenRDY = false;
+ bool _seenCallReady = false;
+ bool _seenSMSReady = false;
+
+ void _setPWRKEYIdle();
+ void _setPWRKEYPressed();
+ void _pulsePWRKEY(uint16_t pressMs,uint16_t preDelayMs);
+
+ // Чтение и обработка URC строк
+ void _resetURCFlags();
+ void _drainInput(uint32_t ms);
+ void _pollURC(uint32_t ms);
+
+ String _readAll(uint32_t timeoutMs);
+ bool _sendAT(const char* cmd,const char* expect,uint32_t timeoutMs,String* out = nullptr);
+ bool _waitATReady(uint32_t timeoutMs);
+
+ // GPRS bearer (SAPBR) для NTP
+ bool _bearerClose();
+ bool _bearerOpen(const char* apn,const char* user,const char* pass,uint32_t timeoutMs);
+ bool _waitCGATT(uint32_t timeoutMs = 30000);
+ bool _ntpRequest(const char* server,int tzHours,uint32_t timeoutMs);
+};
+2) SIM800Time.cpp
+cpp Копировать
+#include "SIM800Time.h"
+
+SIM800TimeClient::SIM800TimeClient(HardwareSerial& serial,uint8_t pwrkeyPin,bool pwrkeyActiveHigh)
+:_sim(serial),_pwrkeyPin(pwrkeyPin),_pwrkeyActiveHigh(pwrkeyActiveHigh) {}
+
+void SIM800TimeClient::begin(uint32_t baud) {
+ pinMode(_pwrkeyPin,OUTPUT);
+ _setPWRKEYIdle(); // для NPN:idle обычно LOW (транзистор закрыт)
+ _sim.begin(baud);
+}
+
+void SIM800TimeClient::_setPWRKEYIdle() {
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? LOW :HIGH);
+}
+
+void SIM800TimeClient::_setPWRKEYPressed() {
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? HIGH :LOW);
+}
+
+void SIM800TimeClient::_pulsePWRKEY(uint16_t pressMs,uint16_t preDelayMs) {
+ _setPWRKEYIdle();
+ delay(preDelayMs);
+ _setPWRKEYPressed();
+ delay(pressMs);
+ _setPWRKEYIdle();
+}
+
+String SIM800TimeClient::_readAll(uint32_t timeoutMs) {
+ String s;
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ while (_sim.available()) s += (char)_sim.read();
+ delay(2);
+ }
+ return s;
+}
+
+bool SIM800TimeClient::_sendAT(const char* cmd,const char* expect,uint32_t timeoutMs,String* out) {
+ while (_sim.available()) _sim.read();
+
+ _sim.print(cmd);
+ _sim.print("\r");
+
+ String resp = _readAll(timeoutMs);
+ if (out) *out = resp;
+
+ if (!expect) return true;
+ return resp.indexOf(expect) >= 0;
+}
+
+bool SIM800TimeClient::_waitATReady(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ if (_sendAT("AT","OK",700)) return true;
+ delay(300);
+ }
+ return false;
+}
+
+// ---------- URC handling ----------
+void SIM800TimeClient::_resetURCFlags() {
+ _seenRDY = _seenCallReady = _seenSMSReady = false;
+}
+
+void SIM800TimeClient::_drainInput(uint32_t ms) {
+ uint32_t t0 = millis();
+ while (millis() - t0 < ms) {
+ while (_sim.available()) (void)_sim.read();
+ delay(2);
+ }
+}
+
+// Простейший line-scanner:ловим RDY/Call Ready/SMS Ready в потоке
+void SIM800TimeClient::_pollURC(uint32_t ms) {
+ String line;
+ uint32_t t0 = millis();
+ while (millis() - t0 < ms) {
+ while (_sim.available()) {
+ char c = (char)_sim.read();
+ if (c == '\r') continue;
+ if (c == '\n') {
+ if (line.length()) {
+ if (line.indexOf("RDY") >= 0) _seenRDY = true;
+ if (line.indexOf("Call Ready") >= 0) _seenCallReady = true;
+ if (line.indexOf("SMS Ready") >= 0) _seenSMSReady = true;
+ line = "";
+ }
+ } else {
+ // ограничим рост строки
+ if (line.length() < 96) line += c;
+ }
+ }
+ delay(2);
+ }
+}
+
+bool SIM800TimeClient::ensureOnSmart(uint32_t atProbeTimeoutMs,
+ uint16_t pwrkeyPressMs,
+ uint32_t urcWaitMs,
+ uint32_t atReadyTimeoutMs) {
+ // Если уже отвечает на AT — не трогаем PWRKEY (чтобы случайно не выключить)
+ if (_sendAT("AT","OK",atProbeTimeoutMs)) return true;
+
+ _resetURCFlags();
+ _drainInput(200);
+
+ // Пытаемся включить
+ _pulsePWRKEY(pwrkeyPressMs,200);
+
+ // Подождать URC загрузки
+ _pollURC(urcWaitMs);
+
+ // Независимо от URC — финальная проверка AT
+ return _waitATReady(atReadyTimeoutMs);
+}
+
+bool SIM800TimeClient::init(uint32_t atReadyTimeoutMs) {
+ if (!_waitATReady(atReadyTimeoutMs)) return false;
+
+ _sendAT("ATE0","OK",800);
+ _sendAT("AT+CMEE=2","OK",800);
+
+ // NITZ
+ _sendAT("AT+CLTS=1","OK",1200);
+ _sendAT("AT&W","OK",1200);
+
+ return true;
+}
+
+bool SIM800TimeClient::waitForNetwork(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ String r;
+ if (_sendAT("AT+CREG?","+CREG:",1200,&r)) {
+ int idx = r.indexOf("+CREG:");
+ if (idx >= 0) {
+ if (r.indexOf(",1",idx) >= 0 || r.indexOf(",5",idx) >= 0) return true;
+ }
+ }
+ delay(1000);
+ }
+ return false;
+}
+
+bool SIM800TimeClient::getCCLK(String& rawResp,uint32_t timeoutMs) {
+ return _sendAT("AT+CCLK?","+CCLK:",timeoutMs,&rawResp);
+}
+
+bool SIM800TimeClient::parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours) {
+ int q1 = resp.indexOf('\"');
+ int q2 = resp.indexOf('\"',q1 + 1);
+ if (q1 < 0 || q2 < 0) return false;
+
+ String v = resp.substring(q1 + 1,q2); // yy/MM/dd,hh:mm:ss±zz
+ if (v.length() < 17) return false;
+
+ int yy = v.substring(0,2).toInt();
+ month = v.substring(3,5).toInt();
+ day = v.substring(6,8).toInt();
+ hour = v.substring(9,11).toInt();
+ minute = v.substring(12,14).toInt();
+ second = v.substring(15,17).toInt();
+ year = 2000 + yy;
+
+ tzQuarterHours = 0;
+ if (v.length() >= 20) {
+ char sign = v.charAt(17);
+ int zz = v.substring(18).toInt(); // четверти часа
+ tzQuarterHours = (sign == '-') ? -zz :zz;
+ }
+ return true;
+}
+
+bool SIM800TimeClient::isCCLKValid(const String& resp,int minYear) {
+ int y,mo,d,h,mi,s,tzq;
+ if (!parseCCLK(resp,y,mo,d,h,mi,s,tzq)) return false;
+ if (y < minYear) return false;
+ if (mo < 1 || mo > 12) return false;
+ if (d < 1 || d > 31) return false;
+ if (h < 0 || h > 23) return false;
+ if (mi < 0 || mi > 59) return false;
+ if (s < 0 || s > 59) return false;
+ return true;
+}
+
+// ---------- GPRS / NTP ----------
+bool SIM800TimeClient::_waitCGATT(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ String r;
+ if (_sendAT("AT+CGATT?","+CGATT:",1200,&r)) {
+ // +CGATT:1
+ if (r.indexOf("+CGATT:1") >= 0) return true;
+ }
+ // пробуем приаттачиться
+ _sendAT("AT+CGATT=1","OK",3000);
+ delay(1000);
+ }
+ return false;
+}
+
+bool SIM800TimeClient::_bearerClose() {
+ // Закрыть,если был открыт (OK/ERROR не критично)
+ _sendAT("AT+SAPBR=0,1","OK",5000);
+ return true;
+}
+
+bool SIM800TimeClient::_bearerOpen(const char* apn,const char* user,const char* pass,uint32_t timeoutMs) {
+ _bearerClose();
+
+ if (!_sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"","OK",2000)) return false;
+
+ // APN обязателен
+ {
+ String cmd = String("AT+SAPBR=3,1,\"APN\",\"") + apn + "\"";
+ if (!_sendAT(cmd.c_str(),"OK",2000)) return false;
+ }
+
+ // user/pass опциональны
+ if (user && user[0]) {
+ String cmd = String("AT+SAPBR=3,1,\"USER\",\"") + user + "\"";
+ _sendAT(cmd.c_str(),"OK",2000);
+ }
+ if (pass && pass[0]) {
+ String cmd = String("AT+SAPBR=3,1,\"PWD\",\"") + pass + "\"";
+ _sendAT(cmd.c_str(),"OK",2000);
+ }
+
+ // Открыть bearer
+ if (!_sendAT("AT+SAPBR=1,1","OK",timeoutMs)) return false;
+
+ // Проверить IP
+ String r;
+ if (!_sendAT("AT+SAPBR=2,1","+SAPBR:",3000,&r)) return false;
+ // Обычно:+SAPBR:1,1,"10.160.57.123"
+ if (r.indexOf(",1,") < 0 && r.indexOf(",1,\"") < 0) {
+ // не всегда строго,но попытка проверки
+ }
+ return true;
+}
+
+bool SIM800TimeClient::_ntpRequest(const char* server,int tzHours,uint32_t timeoutMs) {
+ // Привязать NTP к bearer profile 1
+ if (!_sendAT("AT+CNTPCID=1","OK",2000)) return false;
+
+ // AT+CNTP="pool.ntp.org",<tz>
+ {
+ String cmd = String("AT+CNTP=\"") + server + "\"," + String(tzHours);
+ if (!_sendAT(cmd.c_str(),"OK",3000)) return false;
+ }
+
+ // Запуск NTP:ответ приходит как OK и потом +CNTP:<result>
+ // result:1=успех (часто),другие значения — ошибка (DNS/timeout/etc)
+ while (_sim.available()) _sim.read();
+ _sim.print("AT+CNTP\r");
+
+ String resp = _readAll(timeoutMs);
+ // Ищем +CNTP:1
+ int p = resp.indexOf("+CNTP:");
+ if (p < 0) return false;
+
+ // вытащим число после +CNTP:
+ int comma = resp.indexOf(':',p);
+ if (comma < 0) return false;
+ int end = resp.indexOf('\n',comma);
+ if (end < 0) end = resp.length();
+ String tail = resp.substring(comma + 1,end);
+ tail.trim();
+ int code = tail.toInt();
+
+ return (code == 1);
+}
+
+bool SIM800TimeClient::syncTimeWithNTP(const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ uint32_t bearerOpenTimeoutMs,
+ uint32_t ntpTimeoutMs) {
+ // Должны быть в сети,и желательно attached
+ if (!_waitCGATT(30000)) return false;
+
+ if (!_bearerOpen(apn,user,pass,bearerOpenTimeoutMs)) {
+ _bearerClose();
+ return false;
+ }
+
+ bool ok = _ntpRequest(ntpServer,tzHours,ntpTimeoutMs);
+
+ // Можно закрыть bearer,чтобы не держать сессию
+ _bearerClose();
+
+ return ok;
+}
+
+bool SIM800TimeClient::getTimeSmart(String& rawResp,
+ const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ bool forceNtpIfInvalid) {
+ if (!waitForNetwork(60000)) {
+ rawResp = "No network registration (+CREG)";
+ return false;
+ }
+
+ // Попробовать NITZ/RTC
+ delay(1500);
+ if (!getCCLK(rawResp,1500)) return false;
+
+ if (isCCLKValid(rawResp)) return true;
+ if (!forceNtpIfInvalid) return true; // вернули как есть (невалидное),если так нужно
+
+ // Fallback NTP
+ if (!syncTimeWithNTP(apn,user,pass,ntpServer,tzHours)) {
+ // не смогли синхронизировать — вернем исходный rawResp
+ return true;
+ }
+
+ // После NTP модем обновляет RTC,читаем снова
+ delay(500);
+ return getCCLK(rawResp,1500);
+}
+3) Пример .ino (опрос раз в минуту + NTP fallback)
+cpp Копировать
+#include <Arduino.h>
+#include "SIM800Time.h"
+
+// UART4 на STM32F103VGT6:PC10(TX),PC11(RX)
+static const PinName SIM_TX = PC10;
+static const PinName SIM_RX = PC11;
+
+static const uint32_t SIM_BAUD = 9600;
+
+// PWRKEY через NPN на землю:"нажать" = PE0 HIGH
+static const uint8_t SIM_PWRKEY_PIN = PE0;
+static const bool PWRKEY_ACTIVE_HIGH = true;
+
+HardwareSerial simSerial(SIM_RX,SIM_TX); // RX,TX
+SIM800TimeClient sim(simSerial,SIM_PWRKEY_PIN,PWRKEY_ACTIVE_HIGH);
+
+// Настройки оператора (заполните!)
+static const char* APN = "internet"; // пример
+static const char* USER = ""; // часто пусто
+static const char* PASS = ""; // часто пусто
+
+// NTP сервер
+static const char* NTP_SERVER = "pool.ntp.org";
+
+// Таймзона для AT+CNTP в ЧАСАХ (не четверти часа)
+static const int TZ_HOURS = 3; // например MSK = +3
+
+static uint32_t tLast = 0;
+static const uint32_t PERIOD_MS = 60000;
+
+static void printTime(const String& resp) {
+ int y,mo,d,h,mi,s,tzq;
+ if (SIM800TimeClient::parseCCLK(resp,y,mo,d,h,mi,s,tzq)) {
+ Serial.print("CCLK:");
+ Serial.print(y); Serial.print("-");
+ if (mo < 10) Serial.print("0"); Serial.print(mo); Serial.print("-");
+ if (d < 10) Serial.print("0"); Serial.print(d); Serial.print(" ");
+ if (h < 10) Serial.print("0"); Serial.print(h); Serial.print(":");
+ if (mi < 10) Serial.print("0"); Serial.print(mi); Serial.print(":");
+ if (s < 10) Serial.print("0"); Serial.print(s);
+ Serial.print(" TZ(qhr)=");
+ Serial.print(tzq);
+
+ Serial.print(" valid=");
+ Serial.println(SIM800TimeClient::isCCLKValid(resp) ? "yes" :"no");
+ } else {
+ Serial.print("Raw:");
+ Serial.println(resp);
+ }
+}
+
+void setup() {
+ Serial.begin(115200);
+ delay(200);
+
+ Serial.println("SIM800C time (NITZ -> NTP fallback),UART4 + PWRKEY PE0(NPN)");
+
+ sim.begin(SIM_BAUD);
+
+ // Включение без риска "выключить",если уже включен
+ if (!sim.ensureOnSmart(1500,1200,8000,12000)) {
+ Serial.println("Modem not ready (AT/URC). Check wiring/power/baud.");
+ return;
+ }
+
+ if (!sim.init(12000)) {
+ Serial.println("SIM init failed.");
+ return;
+ }
+
+ Serial.println("SIM ready.");
+
+ tLast = millis() - PERIOD_MS; // первый запрос сразу
+}
+
+void loop() {
+ if (millis() - tLast >= PERIOD_MS) {
+ tLast += PERIOD_MS;
+
+ String resp;
+ bool ok = sim.getTimeSmart(resp,APN,USER,PASS,NTP_SERVER,TZ_HOURS,true);
+ if (!ok) {
+ Serial.print("Get time failed:");
+ Serial.println(resp);
+ } else {
+ printTime(resp);
+ }
+ }
+}
+Примечания по NTP на SIM800C
+AT+CNTP не возвращает само время в ответе,а обновляет RTC модема,после чего время читается через AT+CCLK?.
+Параметр timezone в AT+CNTP="server",<tz> у SIM800 обычно в часах. А в AT+CCLK timezone показывается в четвертях часа (±zz).
+Что нужно уточнить/подстроить при необходимости
+Ваш APN (и нужны ли USER/PASS).
+Реальная скорость UART на модеме (часто 9600,но бывает 115200).
+Хотите ли вы держать bearer открытым постоянно (быстрее NTP,но расход/состояние сети) или как сейчас — открывать/закрывать на синхронизацию.
+Если скажете оператора/регион и APN — подставлю корректные значения и добавлю более точную диагностику кодов +CNTP: (DNS/таймаут/нет PDP и т.п.).
+
+//=================================================================
+
+Вариант 2
+
+Вот пример структуры и кода для вашей задачи на STM32F103VGT6 с модемом SIM800C, используя Arduino IDE (STM32duino), подключение по UART4 и управление PWRKEY через PE0 (используем digitalWrite на STM32duino).
+
+Структура файлов
+sim800c_time.h
+sim800c_time.cpp
+main.ino
+Файл: sim800c_time.h
+#ifndef SIM800C_TIME_H
+#define SIM800C_TIME_H
+
+#include <Arduino.h>
+
+class SIM800C_Time {
+public:
+    SIM800C_Time(HardwareSerial& serial, uint8_t pwrKeyPin);
+    void begin(unsigned long baud);
+    void powerOn();
+    void powerOff();
+    bool getTime(String& outTime);
+    void handle();
+
+private:
+    HardwareSerial& _serial;
+    uint8_t _pwrKeyPin;
+    unsigned long _lastRequest;
+    void sendAT(const char* command);
+    bool waitForResponse(const char* expected, unsigned long timeout);
+};
+
+#endif
+Файл: sim800c_time.cpp
+#include "sim800c_time.h"
+
+SIM800C_Time::SIM800C_Time(HardwareSerial &serial, uint8_t pwrKeyPin)
+    : _serial(serial), _pwrKeyPin(pwrKeyPin), _lastRequest(0) {}
+
+void SIM800C_Time::begin(unsigned long baud) {
+    pinMode(_pwrKeyPin, OUTPUT);
+    digitalWrite(_pwrKeyPin, LOW);
+    _serial.begin(baud);
+}
+
+void SIM800C_Time::powerOn() {
+    // Имитация нажатия кнопки
+    digitalWrite(_pwrKeyPin, HIGH);
+    delay(1500);
+    digitalWrite(_pwrKeyPin, LOW);
+    delay(5000); // ждем загрузки модуля
+}
+
+void SIM800C_Time::powerOff() {
+    digitalWrite(_pwrKeyPin, HIGH);
+    delay(1500);
+    digitalWrite(_pwrKeyPin, LOW);
+    delay(2000);
+}
+
+void SIM800C_Time::sendAT(const char* command) {
+    _serial.println(command);
+}
+
+bool SIM800C_Time::waitForResponse(const char* expected, unsigned long timeout) {
+    unsigned long start = millis();
+    String response = "";
+    while ((millis() - start) < timeout) {
+        while (_serial.available()) {
+            char c = _serial.read();
+            response += c;
+            if (response.indexOf(expected) != -1) return true;
+        }
+    }
+    return false;
+}
+
+bool SIM800C_Time::getTime(String &outTime) {
+    sendAT("AT+CCLK?");
+    unsigned long start = millis();
+    String response = "";
+    while ((millis() - start) < 2000) {
+        while (_serial.available()) {
+            char c = _serial.read();
+            response += c;
+            if (response.indexOf("CCLK:") != -1) {
+                int idx1 = response.indexOf('"');
+                int idx2 = response.indexOf('"', idx1+1);
+                if (idx1 != -1 && idx2 != -1) {
+                    outTime = response.substring(idx1 + 1, idx2);
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void SIM800C_Time::handle() {
+    if (millis() - _lastRequest >= 60000 || _lastRequest == 0) {
+        String timeStr;
+        if (getTime(timeStr)) {
+            Serial.print("Текущее время (SIM800C): ");
+            Serial.println(timeStr);
+        } else {
+            Serial.println("Не удалось получить время от SIM800C");
+        }
+        _lastRequest = millis();
+    }
+}
+Файл: main.ino
+#include "sim800c_time.h"
+
+#define PWRKEY_PIN PE0
+
+// STM32F103VGT6: USART4 — это Serial4 на STM32duino (STM32GENERIC core)
+SIM800C_Time sim800c(Serial4, PWRKEY_PIN);
+
+void setup() {
+    Serial.begin(115200);
+    sim800c.begin(9600);
+    sim800c.powerOn();
+    Serial.println("Модуль SIM800C включен");
+}
+
+void loop() {
+    sim800c.handle();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+Вариант1 расширенный
+
+Ниже — обновление вашей “мини‑библиотеки” так,чтобы в Serial выводился весь 
+процесс:включение (PWRKEY),ожидание RDY/Call Ready/SMS Ready,все AT-команды и 
+ответы,регистрация в сети,GPRS-bearer и NTP,итоговое время.
+
+Сделано через подключаемый debug Stream (обычно Serial). Можно включать/выключать лог AT‑трафика.
+
+Я не привязываюсь к PinName,чтобы не упираться в различия STM32 core. Для UART4 на F103 часто проще использовать Serial4.
+
+1) SIM800Time.h (с логированием)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class SIM800TimeClient {
+public:
+ SIM800TimeClient(HardwareSerial& serial,uint8_t pwrkeyPin,bool pwrkeyActiveHigh = true);
+
+ void begin(uint32_t baud);
+
+ // Включить вывод логов:
+ // dbg = &Serial (или другой Stream)
+ // logAT=true печатает все AT и ответы
+ void setDebug(Stream* dbg,bool logAT = true);
+
+ bool ensureOnSmart(uint32_t atProbeTimeoutMs = 1500,
+ uint16_t pwrkeyPressMs = 1200,
+ uint32_t urcWaitMs = 8000,
+ uint32_t atReadyTimeoutMs = 12000);
+
+ bool init(uint32_t atReadyTimeoutMs = 12000);
+ bool waitForNetwork(uint32_t timeoutMs = 60000);
+
+ bool getCCLK(String& rawResp,uint32_t timeoutMs = 1500);
+
+ static bool parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours);
+
+ static bool isCCLKValid(const String& resp,int minYear = 2020);
+
+ bool syncTimeWithNTP(const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ uint32_t bearerOpenTimeoutMs = 45000,
+ uint32_t ntpTimeoutMs = 20000);
+
+ bool getTimeSmart(String& rawResp,
+ const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ bool forceNtpIfInvalid = true);
+
+private:
+ HardwareSerial& _sim;
+ uint8_t _pwrkeyPin;
+ bool _pwrkeyActiveHigh;
+
+ Stream* _dbg = nullptr;
+ bool _logAT = true;
+
+ bool _seenRDY = false;
+ bool _seenCallReady = false;
+ bool _seenSMSReady = false;
+
+ void _dbgln(const String& s);
+ void _dbgln(const __FlashStringHelper* s);
+ void _dbgKV(const __FlashStringHelper* k,const String& v);
+
+ void _setPWRKEYIdle();
+ void _setPWRKEYPressed();
+ void _pulsePWRKEY(uint16_t pressMs,uint16_t preDelayMs);
+
+ void _resetURCFlags();
+ void _drainInput(uint32_t ms);
+ void _pollURC(uint32_t ms);
+
+ String _readAll(uint32_t timeoutMs);
+ bool _sendAT(const char* cmd,const char* expect,uint32_t timeoutMs,String* out = nullptr);
+ bool _waitATReady(uint32_t timeoutMs);
+
+ bool _bearerClose();
+ bool _bearerOpen(const char* apn,const char* user,const char* pass,uint32_t timeoutMs);
+ bool _waitCGATT(uint32_t timeoutMs = 30000);
+ bool _ntpRequest(const char* server,int tzHours,uint32_t timeoutMs);
+};
+2) SIM800Time.cpp (печатаем весь процесс)
+cpp Копировать
+#include "SIM800Time.h"
+
+SIM800TimeClient::SIM800TimeClient(HardwareSerial& serial,uint8_t pwrkeyPin,bool pwrkeyActiveHigh)
+:_sim(serial),_pwrkeyPin(pwrkeyPin),_pwrkeyActiveHigh(pwrkeyActiveHigh) {}
+
+void SIM800TimeClient::setDebug(Stream* dbg,bool logAT) {
+ _dbg = dbg;
+ _logAT = logAT;
+}
+
+void SIM800TimeClient::_dbgln(const String& s) {
+ if (_dbg) { _dbg->print('['); _dbg->print(millis()); _dbg->print("] "); _dbg->println(s); }
+}
+void SIM800TimeClient::_dbgln(const __FlashStringHelper* s) {
+ if (_dbg) { _dbg->print('['); _dbg->print(millis()); _dbg->print("] "); _dbg->println(s); }
+}
+void SIM800TimeClient::_dbgKV(const __FlashStringHelper* k,const String& v) {
+ if (_dbg) { _dbg->print('['); _dbg->print(millis()); _dbg->print("] "); _dbg->print(k); _dbg->println(v); }
+}
+
+void SIM800TimeClient::begin(uint32_t baud) {
+ pinMode(_pwrkeyPin,OUTPUT);
+ _setPWRKEYIdle();
+ _sim.begin(baud);
+
+ _dbgln(F("SIM800:begin()"));
+ _dbgKV(F("UART baud="),String(baud));
+}
+
+void SIM800TimeClient::_setPWRKEYIdle() {
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? LOW :HIGH);
+}
+void SIM800TimeClient::_setPWRKEYPressed() {
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? HIGH :LOW);
+}
+
+void SIM800TimeClient::_pulsePWRKEY(uint16_t pressMs,uint16_t preDelayMs) {
+ _dbgln(F("SIM800:PWRKEY pulse"));
+ _dbgKV(F(" preDelayMs="),String(preDelayMs));
+ _dbgKV(F(" pressMs="),String(pressMs));
+
+ _setPWRKEYIdle();
+ delay(preDelayMs);
+ _setPWRKEYPressed();
+ delay(pressMs);
+ _setPWRKEYIdle();
+}
+
+String SIM800TimeClient::_readAll(uint32_t timeoutMs) {
+ String s;
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ while (_sim.available()) s += (char)_sim.read();
+ delay(2);
+ }
+ return s;
+}
+
+bool SIM800TimeClient::_sendAT(const char* cmd,const char* expect,uint32_t timeoutMs,String* out) {
+ while (_sim.available()) _sim.read();
+
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F(">> "));
+ _dbg->println(cmd);
+ }
+
+ _sim.print(cmd);
+ _sim.print("\r");
+
+ String resp = _readAll(timeoutMs);
+
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->println(F("<<"));
+ _dbg->println(resp);
+ }
+
+ if (out) *out = resp;
+
+ if (!expect) return true;
+ return resp.indexOf(expect) >= 0;
+}
+
+bool SIM800TimeClient::_waitATReady(uint32_t timeoutMs) {
+ _dbgln(F("SIM800:wait AT ready..."));
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ if (_sendAT("AT","OK",700)) {
+ _dbgln(F("SIM800:AT OK"));
+ return true;
+ }
+ delay(300);
+ }
+ _dbgln(F("SIM800:AT timeout"));
+ return false;
+}
+
+// ---------- URC ----------
+void SIM800TimeClient::_resetURCFlags() {
+ _seenRDY = _seenCallReady = _seenSMSReady = false;
+}
+
+void SIM800TimeClient::_drainInput(uint32_t ms) {
+ uint32_t t0 = millis();
+ while (millis() - t0 < ms) {
+ while (_sim.available()) (void)_sim.read();
+ delay(2);
+ }
+}
+
+void SIM800TimeClient::_pollURC(uint32_t ms) {
+ _dbgKV(F("SIM800:wait URC ms="),String(ms));
+ String line;
+ uint32_t t0 = millis();
+ while (millis() - t0 < ms) {
+ while (_sim.available()) {
+ char c = (char)_sim.read();
+ if (c == '\r') continue;
+
+ if (c == '\n') {
+ if (line.length()) {
+ if (_dbg) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F("URC:"));
+ _dbg->println(line);
+ }
+ if (line.indexOf("RDY") >= 0) _seenRDY = true;
+ if (line.indexOf("Call Ready") >= 0) _seenCallReady = true;
+ if (line.indexOf("SMS Ready") >= 0) _seenSMSReady = true;
+ line = "";
+ }
+ } else {
+ if (line.length() < 96) line += c;
+ }
+ }
+ delay(2);
+ }
+ if (_dbg) {
+ _dbgKV(F("URC seen RDY="),String(_seenRDY ? "1" :"0"));
+ _dbgKV(F("URC seen CallReady="),String(_seenCallReady ? "1" :"0"));
+ _dbgKV(F("URC seen SMSReady="),String(_seenSMSReady ? "1" :"0"));
+ }
+}
+
+bool SIM800TimeClient::ensureOnSmart(uint32_t atProbeTimeoutMs,
+ uint16_t pwrkeyPressMs,
+ uint32_t urcWaitMs,
+ uint32_t atReadyTimeoutMs) {
+ _dbgln(F("SIM800:ensureOnSmart()"));
+
+ // 1) Если уже отвечает — не жмем PWRKEY (чтобы не выключить)
+ if (_sendAT("AT","OK",atProbeTimeoutMs)) {
+ _dbgln(F("SIM800:already ON (AT OK)"));
+ return true;
+ }
+
+ _dbgln(F("SIM800:no AT response -> press PWRKEY"));
+ _resetURCFlags();
+ _drainInput(200);
+
+ // 2) Включаем
+ _pulsePWRKEY(pwrkeyPressMs,200);
+
+ // 3) Ждем URC
+ _pollURC(urcWaitMs);
+
+ // 4) Финальный контроль AT
+ bool ok = _waitATReady(atReadyTimeoutMs);
+ _dbgKV(F("SIM800:ensureOnSmart result="),ok ? "OK" :"FAIL");
+ return ok;
+}
+
+bool SIM800TimeClient::init(uint32_t atReadyTimeoutMs) {
+ _dbgln(F("SIM800:init()"));
+
+ if (!_waitATReady(atReadyTimeoutMs)) return false;
+
+ _sendAT("ATE0","OK",800);
+ _sendAT("AT+CMEE=2","OK",800);
+
+ // NITZ
+ _sendAT("AT+CLTS=1","OK",1200);
+ _sendAT("AT&W","OK",1200);
+
+ _dbgln(F("SIM800:init done"));
+ return true;
+}
+
+bool SIM800TimeClient::waitForNetwork(uint32_t timeoutMs) {
+ _dbgln(F("SIM800:waitForNetwork()"));
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ String r;
+ if (_sendAT("AT+CREG?","+CREG:",1200,&r)) {
+ // печать статуса прямо в лог
+ if (_dbg) _dbgKV(F("CREG resp="),r);
+
+ int idx = r.indexOf("+CREG:");
+ if (idx >= 0) {
+ if (r.indexOf(",1",idx) >= 0 || r.indexOf(",5",idx) >= 0) {
+ _dbgln(F("SIM800:network registered"));
+ return true;
+ }
+ }
+ }
+ delay(1000);
+ }
+ _dbgln(F("SIM800:network wait timeout"));
+ return false;
+}
+
+bool SIM800TimeClient::getCCLK(String& rawResp,uint32_t timeoutMs) {
+ _dbgln(F("SIM800:get CCLK"));
+ return _sendAT("AT+CCLK?","+CCLK:",timeoutMs,&rawResp);
+}
+
+bool SIM800TimeClient::parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours) {
+ int q1 = resp.indexOf('\"');
+ int q2 = resp.indexOf('\"',q1 + 1);
+ if (q1 < 0 || q2 < 0) return false;
+
+ String v = resp.substring(q1 + 1,q2);
+ if (v.length() < 17) return false;
+
+ int yy = v.substring(0,2).toInt();
+ month = v.substring(3,5).toInt();
+ day = v.substring(6,8).toInt();
+ hour = v.substring(9,11).toInt();
+ minute= v.substring(12,14).toInt();
+ second= v.substring(15,17).toInt();
+ year = 2000 + yy;
+
+ tzQuarterHours = 0;
+ if (v.length() >= 20) {
+ char sign = v.charAt(17);
+ int zz = v.substring(18).toInt();
+ tzQuarterHours = (sign == '-') ? -zz :zz;
+ }
+ return true;
+}
+
+bool SIM800TimeClient::isCCLKValid(const String& resp,int minYear) {
+ int y,mo,d,h,mi,s,tzq;
+ if (!parseCCLK(resp,y,mo,d,h,mi,s,tzq)) return false;
+ if (y < minYear) return false;
+ if (mo < 1 || mo > 12) return false;
+ if (d < 1 || d > 31) return false;
+ if (h < 0 || h > 23) return false;
+ if (mi < 0 || mi > 59) return false;
+ if (s < 0 || s > 59) return false;
+ return true;
+}
+
+// ---------- GPRS / NTP ----------
+bool SIM800TimeClient::_waitCGATT(uint32_t timeoutMs) {
+ _dbgln(F("SIM800:wait CGATT"));
+ uint32_t t0 = millis();
+ while (millis() - t0 < timeoutMs) {
+ String r;
+ if (_sendAT("AT+CGATT?","+CGATT:",1200,&r)) {
+ if (_dbg) _dbgKV(F("CGATT resp="),r);
+ if (r.indexOf("+CGATT:1") >= 0) return true;
+ }
+ _sendAT("AT+CGATT=1","OK",3000);
+ delay(1000);
+ }
+ return false;
+}
+
+bool SIM800TimeClient::_bearerClose() {
+ _dbgln(F("SIM800:SAPBR close"));
+ _sendAT("AT+SAPBR=0,1","OK",5000);
+ return true;
+}
+
+bool SIM800TimeClient::_bearerOpen(const char* apn,const char* user,const char* pass,uint32_t timeoutMs) {
+ _dbgln(F("SIM800:SAPBR open"));
+
+ _bearerClose();
+
+ if (!_sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"","OK",2000)) return false;
+
+ {
+ String cmd = String("AT+SAPBR=3,1,\"APN\",\"") + apn + "\"";
+ if (!_sendAT(cmd.c_str(),"OK",2000)) return false;
+ }
+
+ if (user && user[0]) {
+ String cmd = String("AT+SAPBR=3,1,\"USER\",\"") + user + "\"";
+ _sendAT(cmd.c_str(),"OK",2000);
+ }
+ if (pass && pass[0]) {
+ String cmd = String("AT+SAPBR=3,1,\"PWD\",\"") + pass + "\"";
+ _sendAT(cmd.c_str(),"OK",2000);
+ }
+
+ if (!_sendAT("AT+SAPBR=1,1","OK",timeoutMs)) return false;
+
+ String r;
+ if (_sendAT("AT+SAPBR=2,1","+SAPBR:",3000,&r)) {
+ if (_dbg) _dbgKV(F("SAPBR2="),r);
+ }
+ return true;
+}
+
+bool SIM800TimeClient::_ntpRequest(const char* server,int tzHours,uint32_t timeoutMs) {
+ _dbgln(F("SIM800:NTP request"));
+
+ if (!_sendAT("AT+CNTPCID=1","OK",2000)) return false;
+
+ {
+ String cmd = String("AT+CNTP=\"") + server + "\"," + String(tzHours);
+ if (!_sendAT(cmd.c_str(),"OK",3000)) return false;
+ }
+
+ while (_sim.available()) _sim.read();
+
+ if (_dbg && _logAT) _dbgln(F(">> AT+CNTP"));
+ _sim.print("AT+CNTP\r");
+
+ String resp = _readAll(timeoutMs);
+
+ if (_dbg && _logAT) {
+ _dbgln(F("<<"));
+ if (_dbg) _dbg->println(resp);
+ }
+
+ int p = resp.indexOf("+CNTP:");
+ if (p < 0) return false;
+
+ int colon = resp.indexOf(':',p);
+ if (colon < 0) return false;
+ int end = resp.indexOf('\n',colon);
+ if (end < 0) end = resp.length();
+
+ String tail = resp.substring(colon + 1,end);
+ tail.trim();
+ int code = tail.toInt();
+
+ if (_dbg) _dbgKV(F("CNTP code="),String(code));
+
+ return (code == 1);
+}
+
+bool SIM800TimeClient::syncTimeWithNTP(const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ uint32_t bearerOpenTimeoutMs,
+ uint32_t ntpTimeoutMs) {
+ _dbgln(F("SIM800:syncTimeWithNTP()"));
+
+ if (!_waitCGATT(30000)) {
+ _dbgln(F("SIM800:CGATT failed"));
+ return false;
+ }
+
+ if (!_bearerOpen(apn,user,pass,bearerOpenTimeoutMs)) {
+ _dbgln(F("SIM800:bearer open failed"));
+ _bearerClose();
+ return false;
+ }
+
+ bool ok = _ntpRequest(ntpServer,tzHours,ntpTimeoutMs);
+
+ _bearerClose();
+
+ _dbgKV(F("SIM800:NTP sync result="),ok ? "OK" :"FAIL");
+ return ok;
+}
+
+bool SIM800TimeClient::getTimeSmart(String& rawResp,
+ const char* apn,
+ const char* user,
+ const char* pass,
+ const char* ntpServer,
+ int tzHours,
+ bool forceNtpIfInvalid) {
+ _dbgln(F("SIM800:getTimeSmart()"));
+
+ if (!waitForNetwork(60000)) {
+ rawResp = "No network registration (+CREG)";
+ return false;
+ }
+
+ delay(1500);
+
+ if (!getCCLK(rawResp,1500)) return false;
+
+ if (_dbg) _dbgKV(F("CCLK raw="),rawResp);
+
+ if (isCCLKValid(rawResp)) {
+ _dbgln(F("SIM800:time valid via NITZ/RTC"));
+ return true;
+ }
+
+ _dbgln(F("SIM800:CCLK invalid"));
+ if (!forceNtpIfInvalid) return true;
+
+ _dbgln(F("SIM800:try NTP fallback"));
+ if (!syncTimeWithNTP(apn,user,pass,ntpServer,tzHours)) {
+ _dbgln(F("SIM800:NTP fallback failed"));
+ return true; // вернем невалидный CCLK как есть
+ }
+
+ delay(500);
+ bool ok2 = getCCLK(rawResp,1500);
+ if (_dbg) _dbgKV(F("CCLK after NTP="),rawResp);
+ return ok2;
+}
+3) Пример .ino (UART4 через Serial4,печать процесса,опрос раз в минуту)
+cpp Копировать
+#include <Arduino.h>
+#include "SIM800Time.h"
+
+// Для STM32F103 UART4 обычно доступен как Serial4 (PC11 RX,PC10 TX)
+#define simSerial Serial4
+
+static const uint32_t SIM_BAUD = 9600;
+static const uint8_t SIM_PWRKEY_PIN = PE0; // PWRKEY через NPN на землю
+static const bool PWRKEY_ACTIVE_HIGH = true; // "нажать" = HIGH
+
+SIM800TimeClient sim(simSerial,SIM_PWRKEY_PIN,PWRKEY_ACTIVE_HIGH);
+
+// Заполните APN:
+static const char* APN = "internet";
+static const char* USER = "";
+static const char* PASS = "";
+static const char* NTP_SERVER = "pool.ntp.org";
+static const int TZ_HOURS = 3; // MSK +3
+
+static uint32_t tLast = 0;
+static const uint32_t PERIOD_MS = 60000;
+
+static void printParsed(const String& resp) {
+ int y,mo,d,h,mi,s,tzq;
+ if (SIM800TimeClient::parseCCLK(resp,y,mo,d,h,mi,s,tzq)) {
+ Serial.print("TIME:");
+ Serial.print(y); Serial.print("-");
+ if (mo < 10) Serial.print("0"); Serial.print(mo); Serial.print("-");
+ if (d < 10) Serial.print("0"); Serial.print(d); Serial.print(" ");
+ if (h < 10) Serial.print("0"); Serial.print(h); Serial.print(":");
+ if (mi < 10) Serial.print("0"); Serial.print(mi); Serial.print(":");
+ if (s < 10) Serial.print("0"); Serial.print(s);
+ Serial.print(" tz(qhr)="); Serial.println(tzq);
+ } else {
+ Serial.print("TIME RAW:");
+ Serial.println(resp);
+ }
+}
+
+void setup() {
+ Serial.begin(115200);
+ delay(200);
+ Serial.println("=== SIM800C verbose log ===");
+
+ sim.setDebug(&Serial,true); // true -> печатать AT/ответы
+ sim.begin(SIM_BAUD);
+
+ if (!sim.ensureOnSmart(1500,1200,8000,12000)) {
+ Serial.println("ERROR:modem not ready");
+ return;
+ }
+
+ if (!sim.init(12000)) {
+ Serial.println("ERROR:init failed");
+ return;
+ }
+
+ tLast = millis() - PERIOD_MS;
+}
+
+void loop() {
+ if (millis() - tLast >= PERIOD_MS) {
+ tLast += PERIOD_MS;
+
+ String resp;
+ bool ok = sim.getTimeSmart(resp,APN,USER,PASS,NTP_SERVER,TZ_HOURS,true);
+
+ Serial.println("--- RESULT ---");
+ Serial.print("ok="); Serial.println(ok ? "1" :"0");
+ Serial.print("raw="); Serial.println(resp);
+ printParsed(resp);
+ Serial.println("--------------");
+ }
+}
+Важные замечания
+Очень подробный лог (особенно ответы модема) может замедлять цикл и слегка “рвать” тайминги. Если заметите проблемы — оставьте логи,но отключите печать AT‑ответов:
+cpp Копировать
+sim.setDebug(&Serial,false); // лог только этапов,без AT-трафика
+Если у вас не существует Serial4 в выбранном core — напишите,какой именно core/плата выбраны в Arduino IDE (строка из меню Tools → Board),и я дам точный способ открыть UART4 именно в вашем окружении.
+Если хотите,могу дополнительно добавить в лог:
+
+показ уровня сигнала AT+CSQ,
+информацию о операторе AT+COPS?,
+IP адрес bearer’а (он и так печатается в SAPBR=2,1 ответе).
+
+/////////////////////////////////////////////////////////////
+
+Если SIM800C “живёт” ~5 секунд и потом как будто выключается,это почти всегда одно из двух:
+
+Просадка питания VBAT (модем стартует,начинает регистрацию в сети/передачу,даёт импульсные токи 
+до 2 А → VBAT падает → модем уходит в reset/PowerDown).
+PWRKEY фактически остаётся “нажатым” (через NPN),и модем воспринимает это как команду выключения 
+(у SIM800 включение и выключение делаются одним и тем же входом PWRKEY разной длительностью/моментом).
+Ниже — как быстро определить причину и что исправить,плюс патч в код,чтобы PWRKEY гарантированно был отпущен.
+
+1) Как понять,что именно происходит (по логам)
+Включите ваш подробный лог URC/ответов и посмотрите,что печатает модем перед “отключением”:
+
+Если перед исчезновением связи появляется строка типа NORMAL POWER DOWN — это почти наверняка PWRKEY/команда выключения.
+Если появляются UNDER-VOLTAGE WARNING / UNDER-VOLTAGE POWER DOWN или модем циклически печатает 
+RDY снова и снова — это питание (просадка VBAT).
+Если вообще ничего не успевает вывести,а потом снова RDY — тоже часто питание.
+Если у вас нет этих строк,но просто перестаёт отвечать на AT — всё равно вероятнее питание или удержание PWRKEY.
+
+2) Аппаратные причины (питание) — самое частое
+Даже при “постоянном питании” модем может выключаться из‑за просадки.
+
+Минимум,что нужно:
+
+VBAT 3.8–4.2 В (не 5 В!),источник с пиковым током 2 А.
+Конденсаторы рядом с VBAT модема:
+470–1000 µF low ESR (или тантал/полимер) + 100 nF керамика.
+Толстые дорожки/провода питания и земли,общий GND с МК.
+Как проверить быстро: мультиметр часто не успевает. Нужен осциллограф на VBAT. 
+Если видите провалы ниже ~3.4–3.5 В в моменты активности — это причина.
+
+3) PWRKEY через NPN:почему может “выключать” через ~5 сек
+При NPN (коллектор на PWRKEY,эмиттер на GND,база от PE0 через резистор):
+
+PE0=HIGH → транзистор открыт → PWRKEY на земле (“нажато”).
+Проблемы:
+
+Нет подтяжки базы вниз → при старте/ресете МК база может всплывать,транзистор открыт,PWRKEY “нажат” слишком долго.
+PE0 на старте core может кратковременно становиться HIGH/плавающим.
+Обязательный элемент: резистор 47–100 кОм с базы на GND (base pulldown),чтобы транзистор точно был закрыт пока МК не инициализировался.
+
+4) Патч в код:сделать PWRKEY “отпущенным” аппаратно и программно
+Лучше держать PE0 не как OUTPUT LOW,а как INPUT_PULLDOWN (если доступно) когда “не нажимаем”,и переводить в OUTPUT только на время импульса. Тогда даже при ошибке меньше шанс “удержать кнопку”.
+
+Измените методы управления PWRKEY в SIM800Time.cpp
+Замените _setPWRKEYIdle() и _setPWRKEYPressed() на такие (под вашу схему:activeHigh=true,NPN тянет к земле):
+
+cpp Копировать
+void SIM800TimeClient::_setPWRKEYIdle() {
+ // Отпущено:транзистор точно закрыт
+ pinMode(_pwrkeyPin,INPUT_PULLDOWN); // если INPUT_PULLDOWN не поддерживается вашим core -> INPUT
+}
+
+void SIM800TimeClient::_setPWRKEYPressed() {
+ // Нажато:открыть транзистор
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,HIGH);
+}
+Если ваш core не поддерживает INPUT_PULLDOWN,используйте INPUT и обязательно внешний pulldown на базе NPN.
+
+И ещё:очень важно в самом начале setup()
+До любых других действий (даже до Serial.begin) жёстко “отпустите” PWRKEY:
+
+cpp Копировать
+pinMode(PE0,INPUT_PULLDOWN); // или OUTPUT + LOW,если pulldown недоступен
+5) Что сделать прямо сейчас (минимальный план)
+Включите verbose‑лог и поймайте,есть ли NORMAL POWER DOWN или UNDER-VOLTAGE....
+Поставьте резистор 47–100 кОм база→GND на NPN (если его нет).
+Добавьте конденсатор >= 470 µF прямо у VBAT SIM800C.
+Внесите патч “idle = INPUT_PULLDOWN” и “pressed = OUTPUT HIGH” как выше.
+Если вы пришлёте фрагмент лога (последние 10–30 строк перед отключением) и скажете,какой именно STM32‑core выбран в Arduino IDE (официальный STM32duino или libmaple),я точечно подстрою код под ваш core (включая вариант 
+без INPUT_PULLDOWN,если нужно) и скажу по логу,это PWRKEY или питание.
+
+//==============================================================================
+
+Получать время с SIM800C не блокируя общий процесс
+
+
+Нужно уйти от delay()/циклов ожидания и сделать машину состояний + “тикер”,который 
+вы вызываете в loop() очень часто. Тогда общий процесс (ваши задачи) не блокируется,а SIM800C обслуживается “фоном”.
+
+Ниже — готовый вариант в отдельных файлах .h / .cpp + пример .ino для STM32F103 + UART4 (Serial4) + PWRKEY на PE0 через NPN.
+
+Поддерживает:
+
+включение модема (если он не отвечает),
+инициализацию,
+запрос времени раз в минуту,
+fallback на NTP по GPRS,если AT+CCLK? невалиден (NITZ не пришёл).
+Файл SIM800TimeAsync.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class SIM800TimeAsync {
+public:
+ struct NtpConfig {
+ const char* apn = nullptr;
+ const char* user = "";
+ const char* pass = "";
+ const char* server = "pool.ntp.org";
+ int tzHours = 0; // для AT+CNTP в часах
+ bool enableFallback = false;
+ };
+
+ SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,
+ bool pwrkeyActiveHigh = true);
+
+ void begin(uint32_t baud);
+ void setDebug(Stream* dbg,bool logAT = true);
+
+ // Запустить процесс (не блокирует):проверка AT -> при необходимости PWRKEY -> init
+ void start();
+
+ // Вызывать часто из loop() (хоть каждую итерацию)
+ void tick();
+
+ // Настроить период запроса времени
+ void setPeriodMs(uint32_t periodMs);
+
+ // Настроить NTP fallback (опционально)
+ void setNtpConfig(const NtpConfig& cfg);
+
+ // Состояние
+ bool isReady() const; // модем инициализирован (AT/ATE0/CLTS)
+ bool isBusy() const; // сейчас идет транзакция/процедура
+ const char* stateName() const;
+
+ // Результат последней успешной выдачи времени
+ bool hasNewTime(); // true один раз после обновления
+ String lastCCLKRaw() const; // сырой ответ +CCLK
+ bool lastTimeValid(int minYear = 2020) const;
+
+ // Принудительно запросить время (не блокирует)
+ void requestTimeNow();
+
+ // Парсер +CCLK:"yy/MM/dd,hh:mm:ss±zz"
+ static bool parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours);
+
+private:
+ enum class State :uint8_t {
+ STOPPED,
+ PROBE_AT,
+ PWRKEY_PULSE,
+ WAIT_URC,
+ WAIT_AT_READY,
+ INIT_ATE0,
+ INIT_CMEE,
+ INIT_CLTS,
+ INIT_SAVE,
+ IDLE,
+ WAIT_NETWORK,
+ REQ_CCLK,
+
+ // NTP fallback states
+ NTP_CGATT,
+ NTP_SAPBR_CFG1,
+ NTP_SAPBR_CFG_APN,
+ NTP_SAPBR_CFG_USER,
+ NTP_SAPBR_CFG_PWD,
+ NTP_SAPBR_OPEN,
+ NTP_CNTPCID,
+ NTP_CNTP_SET,
+ NTP_CNTP_START,
+ NTP_SAPBR_CLOSE,
+ REQ_CCLK_AFTER_NTP
+ };
+
+ HardwareSerial& _sim;
+ uint8_t _pwrkeyPin;
+ bool _pwrkeyActiveHigh;
+
+ Stream* _dbg = nullptr;
+ bool _logAT = true;
+
+ // планировщик
+ uint32_t _periodMs = 60000;
+ uint32_t _nextPollMs = 0;
+ bool _forcePoll = false;
+
+ // ntp cfg
+ NtpConfig _ntp;
+
+ // состояние
+ State _st = State::STOPPED;
+ uint32_t _stEnterMs = 0;
+
+ // URC flags
+ bool _seenRDY = false;
+ bool _seenCallReady = false;
+ bool _seenSMSReady = false;
+
+ // AT транзакция
+ bool _atPending = false;
+ const char* _atExpect = nullptr;
+ uint32_t _atDeadlineMs = 0;
+ String _atResp; // собранные строки ответа
+ String _lineBuf; // текущая строка из UART
+
+ // время
+ String _lastCCLK;
+ bool _newTime = false;
+
+private:
+ // debug
+ void _log(const __FlashStringHelper* s);
+ void _logKV(const __FlashStringHelper* k,const String& v);
+ void _logATLine(const __FlashStringHelper* prefix,const String& s);
+
+ // state helpers
+ void _enter(State s);
+ void _serviceState();
+
+ // UART parsing
+ void _readUartNonBlocking();
+ void _handleLine(const String& line);
+
+ // AT helpers (не блокируют)
+ void _startAT(const char* cmd,const char* expect,uint32_t timeoutMs);
+ bool _atDoneOK() const;
+ bool _atDoneTimeout() const;
+ bool _atMatchedExpect() const;
+
+ // PWRKEY helpers
+ void _pwrkeyIdle();
+ void _pwrkeyPress();
+ void _pwrkeyRelease();
+
+ // logic
+ static bool _isCCLKValid(const String& resp,int minYear);
+};
+Файл SIM800TimeAsync.cpp
+cpp Копировать
+#include "SIM800TimeAsync.h"
+
+SIM800TimeAsync::SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,bool pwrkeyActiveHigh)
+:_sim(sim),_pwrkeyPin(pwrkeyPin),_pwrkeyActiveHigh(pwrkeyActiveHigh) {}
+
+void SIM800TimeAsync::begin(uint32_t baud) {
+ pinMode(_pwrkeyPin,OUTPUT);
+ _pwrkeyIdle(); // не "держать кнопку"
+ _sim.begin(baud);
+
+ _nextPollMs = millis() + _periodMs;
+}
+
+void SIM800TimeAsync::setDebug(Stream* dbg,bool logAT) {
+ _dbg = dbg;
+ _logAT = logAT;
+}
+
+void SIM800TimeAsync::setPeriodMs(uint32_t periodMs) {
+ _periodMs = periodMs;
+ _nextPollMs = millis() + _periodMs;
+}
+
+void SIM800TimeAsync::setNtpConfig(const NtpConfig& cfg) {
+ _ntp = cfg;
+}
+
+void SIM800TimeAsync::start() {
+ _enter(State::PROBE_AT);
+}
+
+void SIM800TimeAsync::requestTimeNow() {
+ _forcePoll = true;
+}
+
+bool SIM800TimeAsync::isReady() const {
+ return _st == State::IDLE || _st == State::WAIT_NETWORK || _st == State::REQ_CCLK
+ || (uint8_t)_st > (uint8_t)State::INIT_SAVE; // после init
+}
+
+bool SIM800TimeAsync::isBusy() const {
+ return _st != State::IDLE && _st != State::STOPPED;
+}
+
+const char* SIM800TimeAsync::stateName() const {
+ switch (_st) {
+ case State::STOPPED:return "STOPPED";
+ case State::PROBE_AT:return "PROBE_AT";
+ case State::PWRKEY_PULSE:return "PWRKEY_PULSE";
+ case State::WAIT_URC:return "WAIT_URC";
+ case State::WAIT_AT_READY:return "WAIT_AT_READY";
+ case State::INIT_ATE0:return "INIT_ATE0";
+ case State::INIT_CMEE:return "INIT_CMEE";
+ case State::INIT_CLTS:return "INIT_CLTS";
+ case State::INIT_SAVE:return "INIT_SAVE";
+ case State::IDLE:return "IDLE";
+ case State::WAIT_NETWORK:return "WAIT_NETWORK";
+ case State::REQ_CCLK:return "REQ_CCLK";
+ case State::NTP_CGATT:return "NTP_CGATT";
+ case State::NTP_SAPBR_CFG1:return "NTP_SAPBR_CFG1";
+ case State::NTP_SAPBR_CFG_APN:return "NTP_SAPBR_CFG_APN";
+ case State::NTP_SAPBR_CFG_USER:return "NTP_SAPBR_CFG_USER";
+ case State::NTP_SAPBR_CFG_PWD:return "NTP_SAPBR_CFG_PWD";
+ case State::NTP_SAPBR_OPEN:return "NTP_SAPBR_OPEN";
+ case State::NTP_CNTPCID:return "NTP_CNTPCID";
+ case State::NTP_CNTP_SET:return "NTP_CNTP_SET";
+ case State::NTP_CNTP_START:return "NTP_CNTP_START";
+ case State::NTP_SAPBR_CLOSE:return "NTP_SAPBR_CLOSE";
+ case State::REQ_CCLK_AFTER_NTP:return "REQ_CCLK_AFTER_NTP";
+ }
+ return "?";
+}
+
+bool SIM800TimeAsync::hasNewTime() {
+ bool v = _newTime;
+ _newTime = false;
+ return v;
+}
+
+String SIM800TimeAsync::lastCCLKRaw() const {
+ return _lastCCLK;
+}
+
+bool SIM800TimeAsync::lastTimeValid(int minYear) const {
+ return _isCCLKValid(_lastCCLK,minYear);
+}
+
+void SIM800TimeAsync::tick() {
+ _readUartNonBlocking();
+ _serviceState();
+}
+
+// ---------------- debug ----------------
+void SIM800TimeAsync::_log(const __FlashStringHelper* s) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->println(s);
+}
+void SIM800TimeAsync::_logKV(const __FlashStringHelper* k,const String& v) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(k); _dbg->println(v);
+}
+void SIM800TimeAsync::_logATLine(const __FlashStringHelper* prefix,const String& s) {
+ if (!_dbg || !_logAT) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(prefix); _dbg->println(s);
+}
+
+// ---------------- state ----------------
+void SIM800TimeAsync::_enter(State s) {
+ _st = s;
+ _stEnterMs = millis();
+ if (_dbg) {
+ _dbg->print('['); _dbg->print(_stEnterMs); _dbg->print("] ");
+ _dbg->print(F("STATE -> "));
+ _dbg->println(stateName());
+ }
+}
+
+void SIM800TimeAsync::_serviceState() {
+ const uint32_t now = millis();
+
+ // планировщик (только в IDLE)
+ if (_st == State::IDLE) {
+ if (_forcePoll || (int32_t)(now - _nextPollMs) >= 0) {
+ _forcePoll = false;
+ _nextPollMs = now + _periodMs;
+ _enter(State::WAIT_NETWORK);
+ return;
+ }
+ return;
+ }
+
+ switch (_st) {
+ case State::STOPPED:
+ return;
+
+ case State::PROBE_AT:
+ // не блокируем:просто стартуем AT и ждём
+ if (!_atPending) _startAT("AT","OK",1500);
+ else {
+ if (_atDoneOK()) {
+ _enter(State::INIT_ATE0);
+ } else if (_atDoneTimeout()) {
+ _enter(State::PWRKEY_PULSE);
+ }
+ }
+ return;
+
+ case State::PWRKEY_PULSE:
+ // короткая “нажатие-отпускание” без delay:делаем по времени
+ if (now - _stEnterMs < 50) {
+ _pwrkeyIdle();
+ } else if (now - _stEnterMs < 1300) {
+ _pwrkeyPress();
+ } else {
+ _pwrkeyRelease();
+ _seenRDY = _seenCallReady = _seenSMSReady = false;
+ _enter(State::WAIT_URC);
+ }
+ return;
+
+ case State::WAIT_URC:
+ // ждём URC до 8 сек,но даже если не увидим - потом проверим AT
+ if (_seenRDY || _seenCallReady || _seenSMSReady || (now - _stEnterMs) > 8000) {
+ _enter(State::WAIT_AT_READY);
+ }
+ return;
+
+ case State::WAIT_AT_READY:
+ if (!_atPending) _startAT("AT","OK",12000);
+ else {
+ if (_atDoneOK()) _enter(State::INIT_ATE0);
+ else if (_atDoneTimeout()) _enter(State::STOPPED);
+ }
+ return;
+
+ case State::INIT_ATE0:
+ if (!_atPending) _startAT("ATE0","OK",1500);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::INIT_CMEE);
+ return;
+
+ case State::INIT_CMEE:
+ if (!_atPending) _startAT("AT+CMEE=2","OK",2000);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::INIT_CLTS);
+ return;
+
+ case State::INIT_CLTS:
+ if (!_atPending) _startAT("AT+CLTS=1","OK",2000);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::INIT_SAVE);
+ return;
+
+ case State::INIT_SAVE:
+ if (!_atPending) _startAT("AT&W","OK",3000);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::IDLE);
+ return;
+
+ case State::WAIT_NETWORK:
+ if (!_atPending) _startAT("AT+CREG?","+CREG:",1500);
+ else {
+ if (_atDoneTimeout()) {
+ // повторим через секунду,не блокируя
+ if (now - _stEnterMs > 60000) { // общий таймаут 60 сек
+ _enter(State::IDLE);
+ } else {
+ _atPending = false;
+ _atResp = "";
+ // подождём 1 сек перед следующим CREG?
+ if (now - _stEnterMs > 1000) {
+ // просто продолжим,_startAT вызовется в следующем tick()
+ }
+ }
+ } else if (_atMatchedExpect()) {
+ // ищем ,1 или ,5
+ if (_atResp.indexOf(",1") >= 0 || _atResp.indexOf(",5") >= 0) {
+ _enter(State::REQ_CCLK);
+ } else {
+ // ещё не зарегистрирован
+ _atPending = false;
+ _atResp = "";
+ }
+ }
+ }
+ return;
+
+ case State::REQ_CCLK:
+ if (!_atPending) _startAT("AT+CCLK?","+CCLK:",1500);
+ else {
+ if (_atDoneOK() || _atMatchedExpect()) {
+ // сохраним сырой ответ (весь буфер)
+ _lastCCLK = _atResp;
+ _newTime = true;
+
+ if (!_isCCLKValid(_lastCCLK,2020) && _ntp.enableFallback && _ntp.apn && _ntp.apn[0]) {
+ _enter(State::NTP_CGATT);
+ } else {
+ _enter(State::IDLE);
+ }
+ } else if (_atDoneTimeout()) {
+ _enter(State::IDLE);
+ }
+ }
+ return;
+
+ // -------- NTP fallback (не блокирует) --------
+ case State::NTP_CGATT:
+ if (!_atPending) _startAT("AT+CGATT?","+CGATT:",2000);
+ else {
+ if (_atDoneTimeout()) { _enter(State::NTP_SAPBR_CLOSE); return; }
+ if (_atMatchedExpect()) {
+ if (_atResp.indexOf("+CGATT:1") >= 0) _enter(State::NTP_SAPBR_CFG1);
+ else { _atPending = false; _atResp=""; _startAT("AT+CGATT=1","OK",5000); }
+ }
+ }
+ return;
+
+ case State::NTP_SAPBR_CFG1:
+ if (!_atPending) _startAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"","OK",2000);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::NTP_SAPBR_CFG_APN);
+ return;
+
+ case State::NTP_SAPBR_CFG_APN:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"APN\",\"") + _ntp.apn + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atDoneOK() || _atDoneTimeout()) {
+ _enter((_ntp.user && _ntp.user[0]) ? State::NTP_SAPBR_CFG_USER
+ :((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN));
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_USER:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"USER\",\"") + _ntp.user + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atDoneOK() || _atDoneTimeout()) {
+ _enter((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_PWD:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"PWD\",\"") + _ntp.pass + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atDoneOK() || _atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_OPEN:
+ if (!_atPending) _startAT("AT+SAPBR=1,1","OK",45000);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::NTP_CNTPCID);
+ return;
+
+ case State::NTP_CNTPCID:
+ if (!_atPending) _startAT("AT+CNTPCID=1","OK",2000);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::NTP_CNTP_SET);
+ return;
+
+ case State::NTP_CNTP_SET:{
+ if (!_atPending) {
+ String cmd = String("AT+CNTP=\"") + (_ntp.server ? _ntp.server :"pool.ntp.org") + "\"," + String(_ntp.tzHours);
+ _startAT(cmd.c_str(),"OK",3000);
+ } else if (_atDoneOK() || _atDoneTimeout()) {
+ _enter(State::NTP_CNTP_START);
+ }
+ return;
+ }
+
+ case State::NTP_CNTP_START:
+ // CNTP возвращает +CNTP:<code> асинхронно,ждём его в _handleLine
+ if (!_atPending) _startAT("AT+CNTP","+CNTP:",20000);
+ else {
+ if (_atMatchedExpect()) {
+ // успех обычно +CNTP:1
+ if (_atResp.indexOf("+CNTP:1") >= 0 || _atResp.indexOf("+CNTP:1") >= 0) {
+ _enter(State::NTP_SAPBR_CLOSE);
+ } else {
+ _enter(State::NTP_SAPBR_CLOSE);
+ }
+ } else if (_atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_CLOSE);
+ }
+ }
+ return;
+
+ case State::NTP_SAPBR_CLOSE:
+ if (!_atPending) _startAT("AT+SAPBR=0,1","OK",8000);
+ else if (_atDoneOK() || _atDoneTimeout()) _enter(State::REQ_CCLK_AFTER_NTP);
+ return;
+
+ case State::REQ_CCLK_AFTER_NTP:
+ if (!_atPending) _startAT("AT+CCLK?","+CCLK:",1500);
+ else {
+ if (_atDoneOK() || _atMatchedExpect()) {
+ _lastCCLK = _atResp;
+ _newTime = true;
+ }
+ _enter(State::IDLE);
+ }
+ return;
+ }
+}
+
+// ---------------- UART + URC ----------------
+void SIM800TimeAsync::_readUartNonBlocking() {
+ while (_sim.available()) {
+ char c = (char)_sim.read();
+ if (c == '\r') continue;
+
+ if (c == '\n') {
+ if (_lineBuf.length()) {
+ _handleLine(_lineBuf);
+ _lineBuf = "";
+ }
+ } else {
+ if (_lineBuf.length() < 160) _lineBuf += c;
+ }
+ }
+}
+
+void SIM800TimeAsync::_handleLine(const String& line) {
+ // URC
+ if (line.indexOf("RDY") >= 0) _seenRDY = true;
+ if (line.indexOf("Call Ready") >= 0) _seenCallReady = true;
+ if (line.indexOf("SMS Ready") >= 0) _seenSMSReady = true;
+
+ // Лог входящих строк
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F("<< "));
+ _dbg->println(line);
+ }
+
+ // Если идет AT-транзакция — копим ответ
+ if (_atPending) {
+ _atResp += line;
+ _atResp += "\n";
+
+ // быстрый финиш по OK/ERROR/expect — окончательно обработаем в _serviceState()
+ // (здесь лишь накапливаем)
+ }
+}
+
+// ---------------- AT helpers ----------------
+void SIM800TimeAsync::_startAT(const char* cmd,const char* expect,uint32_t timeoutMs) {
+ // очистить "хвост" от предыдущего
+ _atResp = "";
+ _atExpect = expect;
+ _atPending = true;
+ _atDeadlineMs = millis() + timeoutMs;
+
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F(">> "));
+ _dbg->println(cmd);
+ }
+
+ _sim.print(cmd);
+ _sim.print("\r");
+}
+
+bool SIM800TimeAsync::_atDoneOK() const {
+ if (!_atPending) return true;
+ if ((int32_t)(millis() - _atDeadlineMs) >= 0) return false;
+ return (_atResp.indexOf("\nOK") >= 0) || (_atResp.startsWith("OK")) || (_atResp.indexOf("OK\n") >= 0);
+}
+
+bool SIM800TimeAsync::_atDoneTimeout() const {
+ if (!_atPending) return false;
+ return (int32_t)(millis() - _atDeadlineMs) >= 0;
+}
+
+bool SIM800TimeAsync::_atMatchedExpect() const {
+ if (!_atPending || !_atExpect) return false;
+ return _atResp.indexOf(_atExpect) >= 0;
+}
+
+// ---------------- PWRKEY helpers ----------------
+// Для вашей схемы (NPN тянет к GND):лучше НЕ держать кнопку.
+// Если ваш core не поддерживает INPUT_PULLDOWN,используйте INPUT и внешний pulldown на базе NPN.
+void SIM800TimeAsync::_pwrkeyIdle() {
+ // отпущено
+#if defined(INPUT_PULLDOWN)
+ pinMode(_pwrkeyPin,INPUT_PULLDOWN);
+#else
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? LOW :HIGH);
+#endif
+}
+
+void SIM800TimeAsync::_pwrkeyPress() {
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? HIGH :LOW);
+}
+
+void SIM800TimeAsync::_pwrkeyRelease() {
+ _pwrkeyIdle();
+}
+
+// ---------------- time parse/valid ----------------
+bool SIM800TimeAsync::parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours) {
+ int q1 = resp.indexOf('\"');
+ int q2 = resp.indexOf('\"',q1 + 1);
+ if (q1 < 0 || q2 < 0) return false;
+
+ String v = resp.substring(q1 + 1,q2); // yy/MM/dd,hh:mm:ss±zz
+ if (v.length() < 17) return false;
+
+ int yy = v.substring(0,2).toInt();
+ month = v.substring(3,5).toInt();
+ day = v.substring(6,8).toInt();
+ hour = v.substring(9,11).toInt();
+ minute = v.substring(12,14).toInt();
+ second = v.substring(15,17).toInt();
+ year = 2000 + yy;
+
+ tzQuarterHours = 0;
+ if (v.length() >= 20) {
+ char sign = v.charAt(17);
+ int zz = v.substring(18).toInt();
+ tzQuarterHours = (sign == '-') ? -zz :zz;
+ }
+ return true;
+}
+
+bool SIM800TimeAsync::_isCCLKValid(const String& resp,int minYear) {
+ int y,mo,d,h,mi,s,tzq;
+ if (!parseCCLK(resp,y,mo,d,h,mi,s,tzq)) return false;
+ if (y < minYear) return false;
+ if (mo < 1 || mo > 12) return false;
+ if (d < 1 || d > 31) return false;
+ if (h < 0 || h > 23) return false;
+ if (mi < 0 || mi > 59) return false;
+ if (s < 0 || s > 59) return false;
+ return true;
+}
+Пример SIM800_Time_NonBlocking.ino
+cpp Копировать
+#include <Arduino.h>
+#include "SIM800TimeAsync.h"
+
+// UART4 на STM32F103 обычно доступен как Serial4 (PC11 RX,PC10 TX)
+#define MODEM Serial4
+
+static const uint8_t PWRKEY_PIN = PE0; // через NPN на землю
+static const bool PWRKEY_ACTIVE_HIGH = true;
+
+SIM800TimeAsync sim(MODEM,PWRKEY_PIN,PWRKEY_ACTIVE_HIGH);
+
+SIM800TimeAsync::NtpConfig ntp;
+
+void setup() {
+ // ВАЖНО:отпустить PWRKEY сразу (чтобы не держать "кнопку" при старте)
+ pinMode(PE0,OUTPUT);
+ digitalWrite(PE0,LOW);
+
+ Serial.begin(115200);
+
+ sim.setDebug(&Serial,true); // false -> без AT-трафика
+ sim.begin(9600);
+
+ ntp.apn = "internet"; // заполните APN
+ ntp.user = "";
+ ntp.pass = "";
+ ntp.server = "pool.ntp.org";
+ ntp.tzHours = 3; // пример:MSK
+ ntp.enableFallback = true;
+ sim.setNtpConfig(ntp);
+
+ sim.setPeriodMs(60000); // 1 минута
+ sim.start(); // НЕ блокирует
+}
+
+void loop() {
+ // “Фоновое” обслуживание SIM800
+ sim.tick();
+
+ // Здесь — ваш основной код без задержек
+ // ...
+ // например,мигание,датчики,управление и т.п.
+
+ // Когда время обновилось — обработайте
+ if (sim.hasNewTime()) {
+ Serial.println(F("=== TIME UPDATED ==="));
+ Serial.println(sim.lastCCLKRaw());
+ }
+}
+Что важно знать
+Это действительно неблокирующий подход:никаких delay() и циклов ожидания регистрации/ответов — всё разнесено по состояниям.
+В loop() обязательно вызывайте sim.tick() часто (десятки/сотни раз в секунду).
+Если у вас ранее “отключалось через 5 секунд”,то не держите PWRKEY и поставьте pulldown 47–100к на базу NPN,как я писал ранее.
+Если скажете,какой именно core STM32F1 у вас (официальный STM32duino или libmaple/rogerclark),я 
+подстрою кусок INPUT_PULLDOWN/инициализацию PE0 под ваш 
+вариант,чтобы точно компилировалось и не “держало кнопку” при старте.
+
+//////////////////////////////////////////////////////////////////////////////////////
+
+Добавьте установку RTC в момент,когда пришло новое валидное время от SIM800C (после NITZ или после NTP‑fallback). Ниже — готовый фрагмент для вашего неблокирующего варианта SIM800TimeAsync.
+
+1) Функция вычисления дня недели (для dayOfWeek)
+SIM800 AT+CCLK? день недели не даёт,поэтому считаем сами.
+
+В большинстве библиотек RTC/DS3231 dayOfWeek:1..7,где 1=Sunday(воскресенье). Если у вашей библиотеки иначе (например 1=Monday) — скажите,поправлю.
+
+cpp Копировать
+// 0=Sunday..6=Saturday (Sakamoto)
+static uint8_t dow0_sun(int y,int m,int d) {
+ static int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ if (m < 3) y -= 1;
+ return (uint8_t)((y + y/4 - y/100 + y/400 + t[m-1] + d) % 7);
+}
+
+// 1..7 where 1=Sunday..7=Saturday
+static uint8_t dow1_sun(int y,int m,int d) {
+ return (uint8_t)(dow0_sun(y,m,d) + 1);
+}
+2) В loop() при обновлении времени — записать в RTC
+Предположим,у вас уже есть объект rtc с методом:
+
+cpp Копировать
+rtc.setTime(uint8_t second,uint8_t minute,uint8_t hour,
+ uint8_t dayOfWeek,uint8_t dayOfMonth,
+ uint8_t month,uint16_t year);
+Тогда добавьте:
+
+cpp Копировать
+#include <Arduino.h>
+#include "SIM800TimeAsync.h"
+
+// ВАЖНО:подключите вашу RTC-библиотеку и объявите rtc
+// Например:
+// #include <SomeRtcLib.h>
+// SomeRtcClass rtc;
+
+void loop() {
+ sim.tick(); // неблокирующее обслуживание модема
+
+ if (sim.hasNewTime()) {
+ String raw = sim.lastCCLKRaw();
+
+ int year,month,day,hour,minute,second,tzq;
+ if (SIM800TimeAsync::parseCCLK(raw,year,month,day,hour,minute,second,tzq)) {
+
+ // (опционально) проверка "адекватности" года
+ if (year >= 2020) {
+ uint8_t dayOfWeek = dow1_sun(year,month,day); // 1..7 (1=Sunday)
+ rtc.setTime((uint8_t)second,(uint8_t)minute,(uint8_t)hour,
+ dayOfWeek,(uint8_t)day,(uint8_t)month,(uint16_t)year);
+
+ Serial.print(F("RTC updated from SIM800:"));
+ Serial.println(raw);
+ } else {
+ Serial.print(F("Time invalid,RTC not updated:"));
+ Serial.println(raw);
+ }
+
+ } else {
+ Serial.print(F("CCLK parse failed,RTC not updated:"));
+ Serial.println(raw);
+ }
+ }
+
+ // ваш остальной код...
+}
+Важный нюанс про timezone из AT+CCLK
+AT+CCLK? возвращает время уже с локальным смещением и поле ±zz (в четвертях часа). 
+Я записываю время в RTC как есть (локальное). 
+Если вам нужно хранить в RTC UTC,скажите — добавлю корректировку по tzq (включая переход суток/месяца/года).
+
+Если напишете,какую именно RTC-библиотеку вы используете (название/ссылка и как создаётся rtc),
+я подгоню пример под неё (у некоторых dayOfWeek начинается с понедельника или вообще не используется).
+
+ 0 - воскресенье, 1 - понедельник, ... 6 - суббота
+ нужно хранить в RTC UTC,скажите — добавлю корректировку по tzq (включая переход суток/месяца/года)
+ 
+ //*********************************************************************
+ 
+ В вашем RealtimeClock::setTime(...) 4‑й параметр dayOfWeek по факту должен быть 1..7,потому что:
+
+в getTime() вы делаете constrain(t.dayOfWeek,1,7);
+getDayOfWeekStr() ожидает 1..7 и мапит 1=Mon … 7=Sun
+DS3231 обычно тоже хранит DOW как 1..7 (как выбрано пользователем)
+А ваша фраза “0‑воскресенье..6‑суббота” — это формат tm_wday. Поэтому правильно сделать так:
+
+считаем 0..6 (0=Sun),
+затем конвертируем в формат DS3231:Sunday(0) → 7,остальные оставляем как есть.
+Ниже — готовый код,который:
+
+парсит +CCLK
+переводит локальное время в UTC по tzq (четверти часа) с корректным переносом даты
+вычисляет DOW и записывает в rtc.setTime(...)
+1) Вставьте хелперы (в ваш .ino)
+cpp Копировать
+// ---------- DOW:0=Sun..6=Sat ----------
+static uint8_t dow0_sun(int y,int m,int d) {
+ static int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ if (m < 3) y -= 1;
+ return (uint8_t)((y + y/4 - y/100 + y/400 + t[m-1] + d) % 7);
+}
+
+// Конверсия под вашу RTC/DS3231:1=Mon..6=Sat,7=Sun
+static uint8_t ds3231DowFromDow0(uint8_t dow0) {
+ return (dow0 == 0) ? 7 :dow0; // Sun->7,Mon..Sat->1..6
+}
+
+// ---------- UTC conversion helpers ----------
+static int32_t daysFromCivil(int y,int m,int d) {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468); // to 1970-01-01
+}
+
+static void civilFromDays(int32_t z,int &y,int &m,int &d) {
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+}
+
+static int64_t toEpochSeconds(int y,int mo,int d,int h,int mi,int s) {
+ int32_t days = daysFromCivil(y,mo,d);
+ return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+static void fromEpochSeconds(int64_t t,int &y,int &mo,int &d,int &h,int &mi,int &s) {
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+ if (rem < 0) { rem += 86400LL; days -= 1; }
+
+ civilFromDays((int32_t)days,y,mo,d);
+
+ h = (int)(rem / 3600LL);
+ rem %= 3600LL;
+ mi = (int)(rem / 60LL);
+ s = (int)(rem % 60LL);
+}
+
+// Local(+tzq) -> UTC. tzq = четверти часа,local = utc + tz
+static void localToUTC(int &y,int &mo,int &d,int &h,int &mi,int &s,int tzQuarterHours) {
+ const int offsetMin = tzQuarterHours * 15;
+ int64_t epochLocal = toEpochSeconds(y,mo,d,h,mi,s);
+ int64_t epochUTC = epochLocal - (int64_t)offsetMin * 60LL;
+ fromEpochSeconds(epochUTC,y,mo,d,h,mi,s);
+}
+2) Использование:когда SIM800 дал новое время — пишем UTC в DS3231
+Пример для вашего неблокирующего получения (где sim.hasNewTime() и SIM800TimeAsync::parseCCLK(...)):
+
+cpp Копировать
+#include "RTCSupport.h"
+// предположим,у вас где-то:
+extern RealtimeClock rtc;
+
+void loop() {
+ sim.tick();
+
+ if (sim.hasNewTime()) {
+ String raw = sim.lastCCLKRaw();
+
+ int year,month,day,hour,minute,second,tzq;
+ if (SIM800TimeAsync::parseCCLK(raw,year,month,day,hour,minute,second,tzq)) {
+
+ // Перевод в UTC (с переносом даты/времени)
+ localToUTC(year,month,day,hour,minute,second,tzq);
+
+ // DOW по UTC-дате:0..6 (Sun..Sat) -> 1..7 (Mon..Sun) как у вас в RTC/DS3231
+ uint8_t dow0 = dow0_sun(year,month,day);
+ uint8_t dsDow = ds3231DowFromDow0(dow0);
+
+ rtc.setTime((uint8_t)second,(uint8_t)minute,(uint8_t)hour,
+ dsDow,(uint8_t)day,(uint8_t)month,(uint16_t)year);
+
+ Serial.print(F("RTC set UTC from SIM800. Raw="));
+ Serial.println(raw);
+ } else {
+ Serial.print(F("CCLK parse failed,RTC not updated. Raw="));
+ Serial.println(raw);
+ }
+ }
+
+ // остальной код...
+}
+Важно про “не блокировать общий процесс”
+У вас RealtimeClock::setTime() внутри мигает LED и делает несколько delay(500) — это блокирует
+ примерно на 1.6 секунды каждый раз при установке времени. Если это критично,уберите эти delay()
+ /мигания или замените на неблокирующее мигание в loop().
+
+Рекомендация по NTP,если храните UTC
+Если вы используете AT+CNTP="server",tz,и вы хотите,чтобы модем сам держал RTC в UTC — ставьте tzHours = 0.
+ Тогда и +CCLK чаще будет с +00. Но даже если оператор/NITZ даст локальное со смещением — ваш 
+ перевод localToUTC(...) всё равно корректно приведёт к UTC.
+
+Если скажете,где у вас объявлен объект rtc (глобально? в каком файле?),могу показать полностью 
+компилируемый пример .ino под вашу структуру проекта.
+
+//---------------------------------------------------------------****************************************
+
+У вас rtc — это RealtimeClock (DS3231),и его setTime(second,minute,hour,dayOfWeek,dayOfMonth,month,year)
+ ожидает dayOfWeek в формате 1..7,где 1=Mon … 7=Sun (это видно по getDayOfWeekStr()).
+
+А SIM800 +CCLK даёт дату/время и tzq (четверти часа). Чтобы хранить UTC в DS3231,нужно:
+
+распарсить +CCLK
+перевести Local → UTC по tzq (с переходом даты)
+вычислить день недели по UTC-дате (0=Sun..6=Sat)
+перевести его в ваш формат DS3231 (Sun→7,Mon..Sat→1..6)
+вызвать rtc.setTime(...)
+Ниже — что именно добавить/изменить в вашем скетче.
+
+1) Добавьте хелперы (вверх файла,после include’ов)
+cpp Копировать
+// --- DOW:0=Sunday..6=Saturday ---
+static uint8_t dow0_sun(int y,int m,int d) {
+ static int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ if (m < 3) y -= 1;
+ return (uint8_t)((y + y/4 - y/100 + y/400 + t[m-1] + d) % 7);
+}
+
+// Для вашего DS3231/RTCSupport:1=Mon..6=Sat,7=Sun
+static uint8_t ds3231DowFromDow0(uint8_t dow0) {
+ return (dow0 == 0) ? 7 :dow0; // Sun->7,Mon..Sat->1..6
+}
+
+// --- Local(+tzq) -> UTC conversion (с переносом даты) ---
+static int32_t daysFromCivil(int y,int m,int d) {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468); // days to 1970-01-01
+}
+
+static void civilFromDays(int32_t z,int &y,int &m,int &d) {
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+}
+
+static int64_t toEpochSeconds(int y,int mo,int d,int h,int mi,int s) {
+ int32_t days = daysFromCivil(y,mo,d);
+ return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+static void fromEpochSeconds(int64_t t,int &y,int &mo,int &d,int &h,int &mi,int &s) {
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+ if (rem < 0) { rem += 86400LL; days -= 1; }
+ civilFromDays((int32_t)days,y,mo,d);
+ h = (int)(rem / 3600LL); rem %= 3600LL;
+ mi = (int)(rem / 60LL);
+ s = (int)(rem % 60LL);
+}
+
+// tzq:четверти часа,local = utc + tz => utc = local - tz
+static void localToUTC(int &y,int &mo,int &d,int &h,int &mi,int &s,int tzQuarterHours) {
+ const int offsetMin = tzQuarterHours * 15;
+ int64_t epochLocal = toEpochSeconds(y,mo,d,h,mi,s);
+ int64_t epochUTC = epochLocal - (int64_t)offsetMin * 60LL;
+ fromEpochSeconds(epochUTC,y,mo,d,h,mi,s);
+}
+2) Измените обработку sim.hasNewTime() в loop() — записываем UTC в RTC
+Замените ваш текущий блок:
+
+cpp Копировать
+if (sim.hasNewTime()) 
+{
+ Serial.println(F("=== TIME UPDATED ==="));
+ Serial.println(sim.lastCCLKRaw());
+}
+на:
+
+cpp Копировать
+if (sim.hasNewTime())
+{
+ String raw = sim.lastCCLKRaw();
+ Serial.println(F("=== TIME UPDATED ==="));
+ Serial.println(raw);
+
+ int year,month,day,hour,minute,second,tzq;
+ if (SIM800TimeAsync::parseCCLK(raw,year,month,day,hour,minute,second,tzq))
+ {
+ // Переводим в UTC по tzq (с переносом даты)
+ localToUTC(year,month,day,hour,minute,second,tzq);
+
+ // DOW по UTC-дате
+ uint8_t dow0 = dow0_sun(year,month,day); // 0..6 (Sun..Sat)
+ uint8_t dsDow = ds3231DowFromDow0(dow0); // 1..7 (Mon..Sun)
+
+ // Запись UTC в DS3231
+ rtc.setTime((uint8_t)second,(uint8_t)minute,(uint8_t)hour,
+ dsDow,(uint8_t)day,(uint8_t)month,(uint16_t)year);
+
+ Serial.print(F("RTC set to UTC:"));
+ RTCTime nowUTC = rtc.getTime();
+ Serial.print(rtc.getDateStr(nowUTC));
+ Serial.print(F(" "));
+ Serial.println(rtc.getTimeStr(nowUTC));
+ }
+ else
+ {
+ Serial.println(F("CCLK parse failed -> RTC not updated"));
+ }
+}
+3) Рекомендация:для NTP fallback хранить UTC проще
+Раз вы храните UTC в RTC,логичнее попросить SIM800 тоже синхронизироваться в UTC:
+
+cpp Копировать
+ntp.tzHours = 0; // вместо 3
+Даже если оставить 3,ваш пересчёт localToUTC(...) всё равно приведёт к UTC корректно.
+
+Важный момент про “не блокируя”
+rtc.setTime() у вас внутри делает 4 раза delay(500) (мигание светодиодом) — это блокирует цикл примерно на 1.6 секунды при каждой установке времени. Если это мешает работе (частота/кнопки/экран),лучше убрать эти delay() и сделать мигание неблокирующим в loop().
+
+Если хотите — скажите,нужно ли сохранить индикацию LED,я предложу неблокирующий вариант “мигнуть 4 раза” без delay().
+
+//===========================================================================
+
+По логу видно,что модем инициализируется нормально,но в момент “обновления времени” у вас в lastCCLKRaw()
+ попадает только OK,поэтому парсер и падает:
+
+=== TIME UPDATED ===
+OK
+CCLK parse failed
+Это означает,что ваша неблокирующая AT‑логика завершает транзакцию по OK,не дожидаясь строки +CCLK: 
+(или вы “унаследовали” OK от предыдущей команды,если _atPending/_atResp не сбрасываются при переходах).
+
+Нужно исправить 2 вещи:
+
+Гарантированно сбрасывать AT-транзакцию при входе в новое состояние
+Для AT+CCLK? считать успехом только наличие +CCLK:,а не OK
+Ниже — конкретные патчи.
+
+1) Сброс AT-транзакции в _enter()
+В SIM800TimeAsync::_enter(State s) добавьте сброс (если ещё не добавляли):
+
+cpp Копировать
+void SIM800TimeAsync::_enter(State s) {
+ // сброс текущей AT-сессии при переходе
+ _atPending = false;
+ _atExpect = nullptr;
+ _atResp = "";
+ _atDeadlineMs = 0;
+
+ _st = s;
+ _stEnterMs = millis();
+ ...
+}
+Это убирает эффект “перешли в новое состояние,а там уже висит старый OK/timeout”.
+
+2) Не поднимать событие “TIME UPDATED” от одного OK
+В SIM800TimeAsync.cpp,в состоянии REQ_CCLK замените логику завершения.
+
+Было (у вас примерно так)
+cpp Копировать
+case State::REQ_CCLK:
+ if (!_atPending) _startAT("AT+CCLK?","+CCLK:",1500);
+ else {
+ if (_atDoneOK() || _atMatchedExpect()) {
+ _lastCCLK = _atResp;
+ _newTime = true;
+ ...
+ }
+Сделайте так (успех только по +CCLK:)
+cpp Копировать
+case State::REQ_CCLK:
+ if (!_atPending) {
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ if (_atMatchedExpect()) {
+ _lastCCLK = _atResp;
+ _newTime = true;
+
+ if (!_isCCLKValid(_lastCCLK,2020) && _ntp.enableFallback && _ntp.apn && _ntp.apn[0]) {
+ _enter(State::NTP_CGATT);
+ } else {
+ _enter(State::IDLE);
+ }
+ } else if (_atDoneTimeout()) {
+ // ничего не обновляем,просто выходим
+ _enter(State::IDLE);
+ }
+ }
+ return;
+И аналогично для REQ_CCLK_AFTER_NTP:
+
+cpp Копировать
+case State::REQ_CCLK_AFTER_NTP:
+ if (!_atPending) {
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ if (_atMatchedExpect()) {
+ _lastCCLK = _atResp;
+ _newTime = true;
+ }
+ _enter(State::IDLE);
+ }
+ return;
+Теперь hasNewTime() будет срабатывать только когда реально пришла строка +CCLK:.
+
+3) На время диагностики включите AT-лог
+Поставьте в setup():
+
+cpp Копировать
+sim.setDebug(&Serial,true);
+И вы должны увидеть что-то вроде:
+
+>> AT+CCLK?
+<< +CCLK:"26/01/18,12:34:56+12"
+<< OK
+Если вы видите только OK без +CCLK: — тогда проблема уже не в логике,а в том,что модем реально 
+не отдаёт время (или вы читаете не тот UART/уровни/скорость),но по вашему первому логу AT работает,так 
+что это почти наверняка именно “раннее завершение по OK”.
+
+4) Важный момент в вашем loop()
+Вы сейчас печатаете === TIME UPDATED === без установки RTC. После фикса lastCCLKRaw() станет содержать
+ +CCLK...,и можно безопасно вызывать ваш код записи UTC в DS3231.
+
+Если хотите — я дам готовую вставку именно под ваш rtc.setTime(...) (1..7 где 7=Sunday) с учётом UTC
+ и tzq,но сначала доведём до того,чтобы +CCLK стабильно появлялся в raw.
+
+Если пришлёте лог с sim.setDebug(&Serial,true) именно вокруг AT+CCLK? и AT+CNTP,я скажу,
+приходит ли +CCLK вообще и какой tz модем возвращает.
+
+//*****************************---------------------------------------------------------
+
+По логу всё правильно:SIM800 сначала отвечает OK,а строка +CCLK: приходит чуть позже:
+
+>> AT+CCLK?
+<< OK
+<< +CCLK:"26/01/18,19:43:06+12"
+Сейчас у вас lastCCLKRaw() содержит весь буфер (OK + +CCLK...),это нормально — парсер 
+нашёл кавычки и отработал. Но по результату видно,что перевод в UTC у вас фактически не 
+применился:при +12 (это +3 часа) UTC должен быть 16:43:06,а вы записали 19:43:xx. Значит,в 
+вашем коде tzq приходит как 0 или вы не вызываете localToUTC(...)/вызываете не с тем tzq.
+
+1) Проверьте,что tzq реально распарсился (добавьте вывод перед конвертацией)
+В ваш блок if (sim.hasNewTime()) добавьте диагностику:
+
+cpp Копировать
+int year,month,day,hour,minute,second,tzq;
+if (SIM800TimeAsync::parseCCLK(raw,year,month,day,hour,minute,second,tzq)) {
+ Serial.print("PARSED local:");
+ Serial.print(year); Serial.print("-");
+ Serial.print(month); Serial.print("-");
+ Serial.print(day); Serial.print(" ");
+ Serial.print(hour); Serial.print(":");
+ Serial.print(minute); Serial.print(":");
+ Serial.print(second);
+ Serial.print(" tzq="); Serial.println(tzq); // ДОЛЖНО быть 12 для +12
+
+ localToUTC(year,month,day,hour,minute,second,tzq);
+
+ Serial.print("UTC:");
+ Serial.print(year); Serial.print("-");
+ Serial.print(month); Serial.print("-");
+ Serial.print(day); Serial.print(" ");
+ Serial.print(hour); Serial.print(":");
+ Serial.print(minute); Serial.print(":");
+ Serial.println(second);
+}
+Если tzq печатается 0 — значит у вас в текущей версии SIM800TimeAsync::parseCCLK() не
+ парсится таймзона (или парсится не в тот параметр). Тогда пришлите текущую реализацию parseCCLK()
+ из SIM800TimeAsync.cpp — я укажу точную правку.
+
+2) Рекомендую хранить в _lastCCLK только строку +CCLK:... (а не весь буфер)
+Так вы исключите любые побочные OK и упрощаете обработку.
+
+В SIM800TimeAsync::_handleLine(...) добавьте:
+
+cpp Копировать
+if (_atPending && line.startsWith("+CCLK:")) {
+ _lastCCLK = line; // только одна строка
+ _newTime = true;
+}
+И тогда в REQ_CCLK не нужно делать _lastCCLK = _atResp; — у вас уже будет чистая строка времени.
+
+3) Для NTP,раз вы храните UTC в RTC
+Поставьте:
+
+cpp Копировать
+ntp.tzHours = 0; // UTC
+Тогда после NTP модем будет выставлять RTC ближе к UTC,и даже если сеть отдаёт локальное 
+через NITZ — ваша коррекция по tzq всё равно приведёт к UTC.
+
+Если после пункта (1) вы увидите tzq=12,но UTC всё равно не меняется — значит localToUTC() 
+не вызывается или вызывается не теми переменными (например,другая tzq). 
+Пришлите именно ваш текущий кусок if (sim.hasNewTime()) { ... } целиком — скажу,где ошибка.
+
+//////////////////////////////////////////////////////////////////////++++++++++++++++++++++++++++++
+
+По этому логу модем включился и отвечает:
+
+>> AT → << OK (в 18874)
+затем прилетают URC *PSUTTZ...,DST:0,+CIEV...
+Но ваша машина состояний не распознала успешный ответ OK в состоянии WAIT_AT_READY 
+и просидела там до таймаута 12 сек,после чего ушла в STOPPED:
+
+[18860] STATE -> WAIT_AT_READY
+[18860] >> AT
+[18874] << OK
+...
+[30860] STATE -> STOPPED // ровно через ~12 сек
+Значит проблема не в SIM800,а в логике завершения AT‑транзакции:вы 
+печатаете << OK,но условие “команда завершилась успешно” не срабатывает.
+
+Надёжнее всего в неблокирующем варианте не вычислять “OK пришёл?” сканированием всего 
+буфера,а фиксировать это флагом в момент приёма строки.
+
+Исправление:фиксировать OK/ERROR флагами (рекомендую)
+1) В SIM800TimeAsync.h добавьте поля
+В private:
+
+cpp Копировать
+bool _atOk = false;
+bool _atErr = false;
+2) В _startAT() сбрасывайте флаги
+В SIM800TimeAsync::_startAT(...):
+
+cpp Копировать
+_atResp = "";
+_atExpect = expect;
+_atPending = true;
+_atDeadlineMs = millis() + timeoutMs;
+
+_atOk = false;
+_atErr = false;
+3) В _handleLine() выставляйте флаги
+В SIM800TimeAsync::_handleLine(const String& line) внутри if (_atPending):
+
+cpp Копировать
+if (line == "OK") _atOk = true;
+else if (line == "ERROR") _atErr = true;
+
+_atResp += line;
+_atResp += "\n";
+4) В состоянии WAIT_AT_READY используйте _atOk
+Замените логику в WAIT_AT_READY на:
+
+cpp Копировать
+case State::WAIT_AT_READY:
+ if (!_atPending) _startAT("AT","OK",12000);
+ else {
+ if (_atOk) _enter(State::INIT_ATE0);
+ else if (_atDoneTimeout()) _enter(State::STOPPED);
+ }
+ return;
+Так вы гарантированно перейдёте в INIT_ATE0 сразу после прихода строки OK,даже 
+если в буфере потом будут URC (*PSUTTZ,+CIEV и т.д.).
+
+Важно:STOPPED лучше заменить на “попробовать снова”
+Чтобы устройство само восстанавливалось,вместо STOPPED можно сделать:
+
+либо _enter(State::PROBE_AT) через пару секунд
+либо повторить PWRKEY_PULSE (если AT не отвечает)
+Например,в месте где сейчас STOPPED,лучше:
+
+cpp Копировать
+_enter(State::PROBE_AT);
+(или сделать отдельный RETRY_WAIT).
+
+Дополнение (по вашему URC *PSUTTZ)
+Вы уже получаете время по URC:
+
+*PSUTTZ:2026,1,18,16,54,2,"+12",0
+Это фактически “время от сети” (аналог NITZ). Можно в будущем вообще не 
+делать AT+CCLK?,а парсить *PSUTTZ и сразу выставлять 
+RTC (с переводом в UTC). Это будет ещё быстрее и полностью неблокирующе.
+
+Если хотите — пришлите ваш текущий SIM800TimeAsync.cpp (кусок _handleLine,_startAT,WAIT_AT_READY),
+я вставлю точные правки “строка в строку”,чтобы у вас компилировалось без расхождений.
+
+//*****************************************************************************************
+
+Ниже — полный исправленный файл SIM800TimeAsync.cpp под ваш SIM800TimeAsync.h.
+
+Ключевые исправления по сравнению с вашим фрагментом:
+
+stateName() только возвращает строку,без логики/return; внутри switch (у вас там был код из _serviceState,это ломает всё).
+Добавлены и реально используются флаги _atOk / _atErr.
+_handleLine() теперь копит все строки во время AT‑транзакции и корректно выставляет _atOk/_atErr,а не только когда строка начинается с +CCLK: (у вас из‑за этого OK “терялся” и WAIT_AT_READY уходил в STOPPED).
+Для AT+CCLK? событие времени формируется только когда пришёл +CCLK:,а не по одному OK.
+Важно:в вашем SIM800TimeAsync.h должны быть объявлены поля: bool _atOk=false; bool _atErr=false; Если их нет — добавьте в private:.
+
+SIM800TimeAsync.cpp
+cpp Копировать
+#include "SIM800TimeAsync.h"
+
+SIM800TimeAsync::SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,bool pwrkeyActiveHigh)
+ :_sim(sim)
+ ,_pwrkeyPin(pwrkeyPin)
+ ,_pwrkeyActiveHigh(pwrkeyActiveHigh)
+{}
+
+void SIM800TimeAsync::begin(uint32_t baud) {
+ pinMode(_pwrkeyPin,OUTPUT);
+ _pwrkeyIdle(); // не "держать кнопку"
+ _sim.begin(baud);
+
+ _nextPollMs = millis() + _periodMs;
+}
+
+void SIM800TimeAsync::setDebug(Stream* dbg,bool logAT) {
+ _dbg = dbg;
+ _logAT = logAT;
+}
+
+void SIM800TimeAsync::setPeriodMs(uint32_t periodMs) {
+ _periodMs = periodMs;
+ _nextPollMs = millis() + _periodMs;
+}
+
+void SIM800TimeAsync::setNtpConfig(const NtpConfig& cfg) {
+ _ntp = cfg;
+}
+
+void SIM800TimeAsync::start() {
+ _enter(State::PROBE_AT);
+}
+
+void SIM800TimeAsync::requestTimeNow() {
+ _forcePoll = true;
+}
+
+bool SIM800TimeAsync::isReady() const {
+ return _st == State::IDLE
+ || _st == State::WAIT_NETWORK
+ || _st == State::REQ_CCLK
+ || (uint8_t)_st > (uint8_t)State::INIT_SAVE;
+}
+
+bool SIM800TimeAsync::isBusy() const {
+ return _st != State::IDLE && _st != State::STOPPED;
+}
+
+const char* SIM800TimeAsync::stateName() const {
+ switch (_st) {
+ case State::STOPPED:return "STOPPED";
+ case State::PROBE_AT:return "PROBE_AT";
+ case State::PWRKEY_PULSE:return "PWRKEY_PULSE";
+ case State::WAIT_URC:return "WAIT_URC";
+ case State::WAIT_AT_READY:return "WAIT_AT_READY";
+ case State::INIT_ATE0:return "INIT_ATE0";
+ case State::INIT_CMEE:return "INIT_CMEE";
+ case State::INIT_CLTS:return "INIT_CLTS";
+ case State::INIT_SAVE:return "INIT_SAVE";
+ case State::IDLE:return "IDLE";
+ case State::WAIT_NETWORK:return "WAIT_NETWORK";
+ case State::REQ_CCLK:return "REQ_CCLK";
+ case State::NTP_CGATT:return "NTP_CGATT";
+ case State::NTP_SAPBR_CFG1:return "NTP_SAPBR_CFG1";
+ case State::NTP_SAPBR_CFG_APN:return "NTP_SAPBR_CFG_APN";
+ case State::NTP_SAPBR_CFG_USER:return "NTP_SAPBR_CFG_USER";
+ case State::NTP_SAPBR_CFG_PWD:return "NTP_SAPBR_CFG_PWD";
+ case State::NTP_SAPBR_OPEN:return "NTP_SAPBR_OPEN";
+ case State::NTP_CNTPCID:return "NTP_CNTPCID";
+ case State::NTP_CNTP_SET:return "NTP_CNTP_SET";
+ case State::NTP_CNTP_START:return "NTP_CNTP_START";
+ case State::NTP_SAPBR_CLOSE:return "NTP_SAPBR_CLOSE";
+ case State::REQ_CCLK_AFTER_NTP:return "REQ_CCLK_AFTER_NTP";
+ }
+ return "?";
+}
+
+bool SIM800TimeAsync::hasNewTime() {
+ bool v = _newTime;
+ _newTime = false;
+ return v;
+}
+
+String SIM800TimeAsync::lastCCLKRaw() const {
+ return _lastCCLK;
+}
+
+bool SIM800TimeAsync::lastTimeValid(int minYear) const {
+ return _isCCLKValid(_lastCCLK,minYear);
+}
+
+void SIM800TimeAsync::tick() {
+ _readUartNonBlocking();
+ _serviceState();
+}
+
+// ---------------- debug ----------------
+void SIM800TimeAsync::_log(const __FlashStringHelper* s) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->println(s);
+}
+
+void SIM800TimeAsync::_logKV(const __FlashStringHelper* k,const String& v) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(k); _dbg->println(v);
+}
+
+void SIM800TimeAsync::_logATLine(const __FlashStringHelper* prefix,const String& s) {
+ if (!_dbg || !_logAT) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(prefix); _dbg->println(s);
+}
+
+// ---------------- state ----------------
+void SIM800TimeAsync::_enter(State s) {
+ // Сброс AT-транзакции при переходе состояния
+ _atPending = false;
+ _atExpect = nullptr;
+ _atResp = "";
+ _atDeadlineMs = 0;
+ _atOk = false;
+ _atErr = false;
+
+ _st = s;
+ _stEnterMs = millis();
+
+ if (_dbg) {
+ _dbg->print('['); _dbg->print(_stEnterMs); _dbg->print("] ");
+ _dbg->print(F("STATE -> "));
+ _dbg->println(stateName());
+ }
+}
+
+void SIM800TimeAsync::_serviceState() {
+ const uint32_t now = millis();
+
+ // планировщик (только в IDLE)
+ if (_st == State::IDLE) {
+ if (_forcePoll || (int32_t)(now - _nextPollMs) >= 0) {
+ _forcePoll = false;
+ _nextPollMs = now + _periodMs;
+ _enter(State::WAIT_NETWORK);
+ }
+ return;
+ }
+
+ switch (_st) {
+ case State::STOPPED:
+ return;
+
+ case State::PROBE_AT:
+ if (!_atPending) {
+ _startAT("AT","OK",1500);
+ } else {
+ if (_atOk) {
+ _enter(State::INIT_ATE0);
+ } else if (_atDoneTimeout()) {
+ _enter(State::PWRKEY_PULSE);
+ }
+ }
+ return;
+
+ case State::PWRKEY_PULSE:
+ // “нажатие” без delay:50мс idle,затем ~1.25с press
+ if (now - _stEnterMs < 50) {
+ _pwrkeyIdle();
+ } else if (now - _stEnterMs < 1300) {
+ _pwrkeyPress();
+ } else {
+ _pwrkeyRelease();
+ _seenRDY = _seenCallReady = _seenSMSReady = false;
+ _enter(State::WAIT_URC);
+ }
+ return;
+
+ case State::WAIT_URC:
+ if (_seenRDY || _seenCallReady || _seenSMSReady || (now - _stEnterMs) > 8000) {
+ _enter(State::WAIT_AT_READY);
+ }
+ return;
+
+ case State::WAIT_AT_READY:
+ if (!_atPending) {
+ _startAT("AT","OK",12000);
+ } else {
+ if (_atOk) {
+ _enter(State::INIT_ATE0);
+ } else if (_atDoneTimeout()) {
+ _enter(State::STOPPED);
+ }
+ }
+ return;
+
+ case State::INIT_ATE0:
+ if (!_atPending) _startAT("ATE0","OK",1500);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_CMEE);
+ return;
+
+ case State::INIT_CMEE:
+ if (!_atPending) _startAT("AT+CMEE=2","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_CLTS);
+ return;
+
+ case State::INIT_CLTS:
+ if (!_atPending) _startAT("AT+CLTS=1","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_SAVE);
+ return;
+
+ case State::INIT_SAVE:
+ if (!_atPending) _startAT("AT&W","OK",3000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::IDLE);
+ return;
+
+ case State::WAIT_NETWORK:
+ if (!_atPending) {
+ _startAT("AT+CREG?","+CREG:",1500);
+ } else {
+ if (_atDoneTimeout()) {
+ // общий таймаут ожидания сети:60с
+ if (now - _stEnterMs > 60000) {
+ _enter(State::IDLE);
+ } else {
+ // повторим без блокировки
+ _atPending = false;
+ _atResp = "";
+ _atOk = _atErr = false;
+ }
+ } else if (_atMatchedExpect()) {
+ if (_atResp.indexOf(",1") >= 0 || _atResp.indexOf(",5") >= 0) {
+ _enter(State::REQ_CCLK);
+ } else {
+ // ещё не зарегистрирован — повторим
+ _atPending = false;
+ _atResp = "";
+ _atOk = _atErr = false;
+ }
+ }
+ }
+ return;
+
+ case State::REQ_CCLK:
+ if (!_atPending) {
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ // ВАЖНО:для CCLK считаем успешным только наличие +CCLK:
+ if (_atMatchedExpect()) {
+ // _lastCCLK установится в _handleLine() когда придет строка +CCLK:
+ // но на всякий случай:
+ if (_lastCCLK.length() == 0) _lastCCLK = _atResp;
+
+ // событие времени поднимем только если реально есть +CCLK:
+ if (_lastCCLK.indexOf("+CCLK:") >= 0) _newTime = true;
+
+ if (!_isCCLKValid(_lastCCLK,2020) && _ntp.enableFallback && _ntp.apn && _ntp.apn[0]) {
+ _enter(State::NTP_CGATT);
+ } else {
+ _enter(State::IDLE);
+ }
+ } else if (_atDoneTimeout()) {
+ _enter(State::IDLE);
+ }
+ }
+ return;
+
+ // -------- NTP fallback (не блокирует) --------
+ case State::NTP_CGATT:
+ if (!_atPending) _startAT("AT+CGATT?","+CGATT:",2000);
+ else {
+ if (_atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_CLOSE);
+ return;
+ }
+ if (_atMatchedExpect()) {
+ if (_atResp.indexOf("+CGATT:1") >= 0) {
+ _enter(State::NTP_SAPBR_CFG1);
+ } else {
+ // попробуем приаттачиться
+ _atPending = false;
+ _startAT("AT+CGATT=1","OK",5000);
+ }
+ }
+ }
+ return;
+
+ case State::NTP_SAPBR_CFG1:
+ if (!_atPending) _startAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_SAPBR_CFG_APN);
+ return;
+
+ case State::NTP_SAPBR_CFG_APN:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"APN\",\"") + _ntp.apn + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter((_ntp.user && _ntp.user[0]) ? State::NTP_SAPBR_CFG_USER
+ :((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN));
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_USER:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"USER\",\"") + _ntp.user + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_PWD:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"PWD\",\"") + _ntp.pass + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_OPEN:
+ if (!_atPending) _startAT("AT+SAPBR=1,1","OK",45000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_CNTPCID);
+ return;
+
+ case State::NTP_CNTPCID:
+ if (!_atPending) _startAT("AT+CNTPCID=1","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_CNTP_SET);
+ return;
+
+ case State::NTP_CNTP_SET:{
+ if (!_atPending) {
+ String cmd = String("AT+CNTP=\"") + (_ntp.server ? _ntp.server :"pool.ntp.org") + "\"," + String(_ntp.tzHours);
+ _startAT(cmd.c_str(),"OK",3000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter(State::NTP_CNTP_START);
+ }
+ return;
+ }
+
+ case State::NTP_CNTP_START:
+ // ждём +CNTP:<code>
+ if (!_atPending) _startAT("AT+CNTP","+CNTP:",20000);
+ else {
+ if (_atMatchedExpect() || _atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_CLOSE);
+ }
+ }
+ return;
+
+ case State::NTP_SAPBR_CLOSE:
+ if (!_atPending) _startAT("AT+SAPBR=0,1","OK",8000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::REQ_CCLK_AFTER_NTP);
+ return;
+
+ case State::REQ_CCLK_AFTER_NTP:
+ if (!_atPending) {
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ if (_atMatchedExpect()) {
+ if (_lastCCLK.indexOf("+CCLK:") >= 0) _newTime = true;
+ }
+ _enter(State::IDLE);
+ }
+ return;
+ }
+}
+
+// ---------------- UART + URC ----------------
+void SIM800TimeAsync::_readUartNonBlocking() {
+ while (_sim.available()) {
+ char c = (char)_sim.read();
+ if (c == '\r') continue;
+
+ if (c == '\n') {
+ if (_lineBuf.length()) {
+ _handleLine(_lineBuf);
+ _lineBuf = "";
+ }
+ } else {
+ if (_lineBuf.length() < 160) _lineBuf += c;
+ }
+ }
+}
+
+void SIM800TimeAsync::_handleLine(const String& line) {
+ // URC признаки
+ if (line.indexOf("RDY") >= 0) _seenRDY = true;
+ if (line.indexOf("Call Ready") >= 0) _seenCallReady = true;
+ if (line.indexOf("SMS Ready") >= 0) _seenSMSReady = true;
+
+ // Лог входящих строк
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F("<< "));
+ _dbg->println(line);
+ }
+
+ // AT-транзакция:копим ВСЕ строки,чтобы OK/ERROR не терялись
+ if (_atPending) {
+ if (line == "OK") _atOk = true;
+ else if (line == "ERROR") _atErr = true;
+
+ if (line.startsWith("+CCLK:")) {
+ // сохраняем "чистую" строку времени
+ _lastCCLK = line;
+ // событие не поднимаем здесь,поднимаем в state (когда увидели +CCLK:)
+ }
+
+ _atResp += line;
+ _atResp += "\n";
+ }
+}
+
+// ---------------- AT helpers ----------------
+void SIM800TimeAsync::_startAT(const char* cmd,const char* expect,uint32_t timeoutMs) {
+ _atResp = "";
+ _atExpect = expect;
+ _atPending = true;
+ _atDeadlineMs = millis() + timeoutMs;
+ _atOk = false;
+ _atErr = false;
+
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F(">> "));
+ _dbg->println(cmd);
+ }
+
+ _sim.print(cmd);
+ _sim.print("\r");
+}
+
+bool SIM800TimeAsync::_atDoneTimeout() const {
+ if (!_atPending) return false;
+ return (int32_t)(millis() - _atDeadlineMs) >= 0;
+}
+
+bool SIM800TimeAsync::_atMatchedExpect() const {
+ if (!_atPending || !_atExpect) return false;
+ return _atResp.indexOf(_atExpect) >= 0;
+}
+
+// ---------------- PWRKEY helpers ----------------
+void SIM800TimeAsync::_pwrkeyIdle() {
+#if defined(INPUT_PULLDOWN)
+ pinMode(_pwrkeyPin,INPUT_PULLDOWN);
+#else
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? LOW :HIGH);
+#endif
+}
+
+void SIM800TimeAsync::_pwrkeyPress() {
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? HIGH :LOW);
+}
+
+void SIM800TimeAsync::_pwrkeyRelease() {
+ _pwrkeyIdle();
+}
+
+// ---------------- time parse/valid ----------------
+bool SIM800TimeAsync::parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours) {
+
+ int q1 = resp.indexOf('\"');
+ int q2 = resp.indexOf('\"',q1 + 1);
+ if (q1 < 0 || q2 < 0) return false;
+
+ String v = resp.substring(q1 + 1,q2); // yy/MM/dd,hh:mm:ss±zz
+ if (v.length() < 17) return false;
+
+ int yy = v.substring(0,2).toInt();
+ month = v.substring(3,5).toInt();
+ day = v.substring(6,8).toInt();
+ hour = v.substring(9,11).toInt();
+ minute = v.substring(12,14).toInt();
+ second = v.substring(15,17).toInt();
+ year = 2000 + yy;
+
+ tzQuarterHours = 0;
+ if (v.length() >= 20) {
+ char sign = v.charAt(17);
+ int zz = v.substring(18).toInt(); // четверти часа
+ tzQuarterHours = (sign == '-') ? -zz :zz;
+ }
+ return true;
+}
+
+bool SIM800TimeAsync::_isCCLKValid(const String& resp,int minYear) {
+ int y,mo,d,h,mi,s,tzq;
+ if (!parseCCLK(resp,y,mo,d,h,mi,s,tzq)) return false;
+ if (y < minYear) return false;
+ if (mo < 1 || mo > 12) return false;
+ if (d < 1 || d > 31) return false;
+ if (h < 0 || h > 23) return false;
+ if (mi < 0 || mi > 59) return false;
+ if (s < 0 || s > 59) return false;
+ return true;
+}
+Что ещё стоит поправить у вас в loop() (важно)
+У вас двойной вызов sim.hasNewTime():
+
+один раз печатаете === TIME UPDATED ===,
+позже снова проверяете — но hasNewTime() сбрасывает флаг и второй раз уже не сработает.
+Сделайте один блок (где и печать,и установка RTC).
+
+Если хотите,я также соберу полный комплект:актуальный SIM800TimeAsync.h 
+(с _atOk/_atErr и полями без рассинхрона)
+ + пример .ino именно под ваш проект (Serial4,PE0,DS3231 UTC).

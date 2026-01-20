@@ -1,0 +1,49 @@
+По вашему выводу это не “виснет в рантайме”,а не линкуется код AT24C128Settings:
+
+undefined reference to `AT24C128Settings::AT24C128Settings(...)`
+undefined reference to `AT24C128Settings::begin()`
+undefined reference to `AT24C128Settings::defaults(...)`
+undefined reference to `AT24C128Settings::load(...)`
+Это означает одно: в сборку не попал файл AT24C128Settings.cpp (есть .h,но нет скомпилированного .cpp),поэтому линкер не находит реализацию методов.
+
+1) Как правильно добавить .cpp в Arduino IDE 1.8.9 (важно)
+Вариант A (проще всего): положить файлы рядом с .ino
+Sketch → Show Sketch Folder
+В открывшейся папке должны лежать:
+Ver.IVCH_26_01_19_00.ino
+AT24C128Settings.h
+AT24C128Settings.cpp
+TimeFeed.h
+TimeFeed.cpp
+SIM800TimeAsync.h
+SIM800TimeAsync.cpp
+Закройте и заново откройте Arduino IDE/скетч.
+В Arduino IDE 1.8.x подпапки (например src/) для скетча не компилируются. Если вы положили .cpp в подпапку — он не соберётся,и будет “undefined reference”.
+
+Вариант B: оформить как библиотеку
+Положить AT24C128Settings.h/.cpp в: Documents\Arduino\libraries\AT24C128Settings\
+и перезапустить IDE. Но для вашей ситуации вариант A быстрее.
+
+2) Почему у вас всё равно “заливается”,хотя есть undefined reference
+По идее undefined reference должен останавливать линковку. В вашем логе это показано как “warning”,а прошивка всё равно заливается — такое бывает в вашем core/скриптах сборки (Arduino_STM32),когда вывод урезан/нестрогий,но по факту бинарник мог собраться без этих вызовов или залиться предыдущий. В любом случае — пока .cpp не участвует в сборке,функции не будут работать.
+
+3) Ещё 2 замечания по вашему .ino (не про линковку)
+Опечатка:
+cpp Копировать
+Serial.println("AT24C128 found (0x50");
+Нужно:
+
+cpp Копировать
+Serial.println("AT24C128 found (0x50)");
+Вы используете fmod()/isnan() — добавьте:
+cpp Копировать
+#include <math.h>
+4) Что сделать прямо сейчас (проверка за 30 секунд)
+После того как добавите AT24C128Settings.cpp рядом с .ino,в setup() оставьте временно:
+
+cpp Копировать
+Serial.print("ee.begin() = ");
+Serial.println(ee.begin() ? "OK" : "FAIL");
+Если компиляция пройдёт без undefined reference — проблема решена.
+
+Если хотите,скиньте структуру папки скетча (список файлов) — скажу,какой именно .cpp у вас “не видит” Arduino IDE.

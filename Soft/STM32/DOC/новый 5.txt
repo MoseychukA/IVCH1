@@ -1,0 +1,76 @@
+Причина,почему “не устанавливает согласно cfg.tzHours = 2”: AT+CCLK? возвращает 
+локальное время и смещение,которое пришло от сети (NITZ). Например ...+12 (это +3 часа,т.к. четверти часа). 
+ Ваш код сейчас пишет в RTC именно это сетевое локальное время,а cfg.tzHours нигде не применяется при записи в RTC.
+
+Чтобы уметь записывать время в любом выбранном часовом поясе,нужно делать так:
+
+распарсить +CCLK → получить local_net и tzq_net
+перевести local_net → UTC по tzq_net
+перевести UTC → local_target по cfg.tzHours (ваш выбранный часовой пояс)
+записать local_target в rtc.setTime(...)
+Ниже — готовый код.
+
+1) Добавьте функцию utcToLocal() (обратная к вашей localToUTC)
+(у вас уже есть toEpochSeconds/fromEpochSeconds — используем их)
+
+cpp Копировать
+// UTC -> Local по tzq (четверти часа):local = utc + tz
+static void utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours)
+{
+ const int offsetMin = tzQuarterHours * 15;
+ int64_t epochUTC = toEpochSeconds(y,mo,d,h,mi,s);
+ int64_t epochLocal = epochUTC + (int64_t)offsetMin * 60LL;
+ fromEpochSeconds(epochLocal,y,mo,d,h,mi,s);
+}
+2) Замените обработку sim.hasNewTime() на запись в выбранный TZ
+В вашем loop() (вне меню-скобок!),в блоке if (sim.hasNewTime()):
+
+cpp Копировать
+if (sim.hasNewTime())
+{
+ String raw = sim.lastCCLKRaw();
+
+ int y,mo,d,h,mi,s,tzq_net;
+ if (SIM800TimeAsync::parseCCLK(raw,y,mo,d,h,mi,s,tzq_net))
+ {
+ // 1) local(net) -> UTC
+ localToUTC(y,mo,d,h,mi,s,tzq_net);
+
+ // 2) UTC -> local(target TZ from cfg)
+ int tzq_target = (int)cfg.tzHours * 4; // часы -> четверти часа
+ utcToLocal(y,mo,d,h,mi,s,tzq_target);
+
+ // DOW по целевому локальному времени
+ uint8_t dow0 = dow0_sun(y,mo,d);
+ uint8_t dsDow = ds3231DowFromDow0(dow0);
+
+ // Пишем в RTC уже В ЦЕЛЕВОМ часовом поясе
+ rtc.setTime((uint8_t)s,(uint8_t)mi,(uint8_t)h,dsDow,(uint8_t)d,(uint8_t)mo,(uint16_t)y);
+
+ // Строки для TFT — тоже в целевом TZ
+ snprintf(gDateStr,sizeof(gDateStr),"%02d.%02d.%04d",d,mo,y);
+ snprintf(gTimeStr,sizeof(gTimeStr),"%02d:%02d:%02d",h,mi,s);
+ gTimeUpdated = true;
+
+ Serial.print("TZ net(qhr)="); Serial.print(tzq_net);
+ Serial.print(" targetHours="); Serial.println(cfg.tzHours);
+ }
+}
+Теперь при cfg.tzHours = 2 RTC будет показывать время UTC+2,даже если сеть прислала +3.
+
+3) Важно про NTP (чтобы не путаться со смещениями)
+Для максимальной предсказуемости рекомендую,чтобы NTP на модеме всегда синхронизировал UTC,а преобразование в ваш TZ делал МК:
+
+в EEPROM храните cfg.tzHours как “целевой TZ для RTC/экрана”
+а для AT+CNTP используйте tzHours = 0
+То есть в applyCfgToSim() можно временно сделать:
+
+cpp Копировать
+ntp.tzHours = 0; // NTP всегда UTC
+(остальные поля — из cfg). Тогда +CCLK после NTP будет ближе к UTC,а вы всё равно переведёте в целевой cfg.tzHours.
+
+4) Если нужны часовые пояса с 30/45 минутами
+Ваш cfg.tzHours (int8) не покрывает,например,UTC+5:30. Тогда надо хранить не часы,а tzQuarterHours (четверти часа) в EEPROM. 
+Если это нужно — скажите,я предложу фиксированный адрес и обновлю AT24C128Settings (например ADDR_TZ_QHR).
+
+Если вы пришлёте,какое значение +CCLK приходит сейчас (строка целиком) и чему равен cfg.tzHours в Serial (после загрузки из EEPROM),я проверю,что у вас действительно применяется целевой TZ,а не “сетевой”.

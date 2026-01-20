@@ -1,0 +1,55 @@
+По логу преобразование работает,но у вас целевая тайм‑зона не 2,а 0:
+
+TZ net(qhr)=12 targetHours=0
+То есть код честно берёт cfg.tzHours,и он равен 0 (значит из EEPROM/дефолтов пришло 0,а не 2). 
+Поэтому время пересчитывается в UTC (часовой пояс 0),а не в UTC+2.
+
+1) Сначала проверьте:что реально загрузилось из AT24C128
+Сразу после ee.load(cfg,false); в setup() добавьте:
+
+cpp Копировать
+Serial.print("cfg.tzHours="); Serial.println((int)cfg.tzHours);
+Serial.print("cfg.periodMs="); Serial.println(cfg.periodMs);
+Serial.print("cfg.enableFallback="); Serial.println(cfg.enableFallback ? 1 :0);
+Serial.print("cfg.apn="); Serial.println(cfg.apn);
+Serial.print("cfg.server="); Serial.println(cfg.server);
+Если там cfg.tzHours=0 — значит в EEPROM реально записан 0.
+
+2) Запишите tzHours=2 в EEPROM (проверка без меню)
+В setup() временно (один раз) сделайте:
+
+cpp Копировать
+cfg.tzHours = 2;
+ee.writeTzHours(cfg.tzHours); // или ee.save(cfg,true);
+Serial.println("Wrote tzHours=2 to EEPROM");
+Перезагрузите и убедитесь,что печать после ee.load показывает cfg.tzHours=2.
+
+Адрес tzHours по нашей карте — 0x0006 (1 байт,int8). Из “других программ” туда надо писать 0x02,а не ASCII '2' (0x32).
+
+3) Важный момент:хотите два разных TZ (для NTP и для RTC)
+Сейчас одно поле cfg.tzHours вы используете как целевой TZ для записи в RTC. Но для NTP я ранее рекомендовал 
+ставить AT+CNTP в UTC (tzHours=0). Это конфликт:одно поле не может быть и “TZ для RTC”,и “TZ для CNTP”.
+
+Правильнее хранить ДВА параметра в EEPROM:
+
+tzTargetHours — в какой зоне показывать/писать в RTC (например 2)
+tzNtpHours — какую зону передавать в AT+CNTP (обычно 0)
+У вас свободен байт 0x0007 — можно его использовать под tzNtpHours.
+
+Минимальная доработка карты памяти
+0x0006 — tzTargetHours (как сейчас)
+0x0007 — tzNtpHours (новое)
+И в applyCfgToSim() делайте:
+
+cpp Копировать
+ntp.tzHours = tzNtpHours; // чаще 0
+А при записи в RTC используйте:
+
+cpp Копировать
+int tzq_target = (int)tzTargetHours * 4;
+Если хотите — я обновлю AT24C128Settings.h/.cpp под эти два поля (с методами readTzTargetHours/readTzNtpHours и т.д.).
+
+4) Почему у вас в логе +CCLK:"..." с пробелом
+Это нормально. Ваш парсер ищет кавычки,поэтому пробел после : не мешает.
+
+Если пришлёте вывод значений cfg.* сразу после ee.load(cfg,false) (п.1),я точно скажу:проблема в EEPROM (там реально 0) или в том,что cfg перезаписывается позже в коде.

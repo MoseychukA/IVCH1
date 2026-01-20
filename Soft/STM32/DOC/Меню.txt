@@ -201,3 +201,312 @@ github.com
 Задержки в обработке кнопок и антидребезг минимальны для работы меню.
 Реальные действия замените в функции handleMenuSelect.
 Если потребуется расширить (например, добавлять данные из памяти, изменять цвета, делать вложенные уровни меню), просто спрашивайте!
+
+//---------------------------------------------------------------------------
+
+Предлагаю архитектуру меню в виде классов, раздельно по .h и .cpp, с чистым разделением логики меню, работы с кнопками и дисплеем, а также основной программы. Не используется глобальный сценарий .ino.
+
+Архитектура (кратко)
+Menu.h / Menu.cpp — логика меню и его состояний.
+Buttons.h / Buttons.cpp — работа с кнопками и антидребезгом.
+Display.h / Display.cpp (опционально) — работа с экраном.
+main.cpp — функция main() и loop().
+Все статусы (выбор страницы/выбор пункта) организованы чётким конечным автоматом:
+сначала выбор страницы, затем выбор пункта на выбранной странице.
+1. Menu.h
+#ifndef MENU_H
+#define MENU_H
+
+#include <TFT_eSPI.h>
+
+enum MenuState { MENU_IDLE, MENU_PAGE_SELECT, MENU_ITEM_SELECT };
+
+class Menu {
+public:
+    Menu(TFT_eSPI* disp);
+    void activate();
+    void deactivate();
+    void nextPage();
+    void prevPage();
+    void nextItem();
+    void prevItem();
+    void select(); // фиксация выбора
+    void draw();
+
+    bool isActive() const;
+    MenuState getState() const;
+
+private:
+    TFT_eSPI* tft;
+    int page;
+    int item;
+    MenuState state;
+    void drawPages();
+    void drawItems();
+};
+
+#endif
+2. Menu.cpp
+#include "Menu.h"
+
+const char* menu[5][5] = {
+    {"P1-1", "P1-2", "P1-3", "P1-4", "P1-5"},
+    {"P2-1", "P2-2", "P2-3", "P2-4", "P2-5"},
+    {"P3-1", "P3-2", "P3-3", "P3-4", "P3-5"},
+    {"P4-1", "P4-2", "P4-3", "P4-4", "P4-5"},
+    {"P5-1", "P5-2", "P5-3", "P5-4", "P5-5"}
+};
+
+Menu::Menu(TFT_eSPI* disp) {
+    tft = disp;
+    page = 0;
+    item = 0;
+    state = MENU_IDLE;
+}
+
+void Menu::activate() {
+    page = 0;
+    item = 0;
+    state = MENU_PAGE_SELECT;
+    draw();
+}
+
+void Menu::deactivate() {
+    state = MENU_IDLE;
+    tft->fillScreen(TFT_BLACK);
+}
+
+bool Menu::isActive() const {
+    return state != MENU_IDLE;
+}
+
+MenuState Menu::getState() const {
+    return state;
+}
+
+void Menu::nextPage() {
+    if(state == MENU_PAGE_SELECT) {
+        page = (page + 1) % 5;
+        drawPages();
+    }
+}
+
+void Menu::prevPage() {
+    if(state == MENU_PAGE_SELECT) {
+        page = (page + 4) % 5;
+        drawPages();
+    }
+}
+
+void Menu::nextItem() {
+    if(state == MENU_ITEM_SELECT) {
+        item = (item + 1) % 5;
+        drawItems();
+    }
+}
+
+void Menu::prevItem() {
+    if(state == MENU_ITEM_SELECT) {
+        item = (item + 4) % 5;
+        drawItems();
+    }
+}
+
+void Menu::select() {
+    if(state == MENU_PAGE_SELECT) {
+        state = MENU_ITEM_SELECT;
+        item = 0;
+        drawItems();
+    } else if(state == MENU_ITEM_SELECT) {
+        // Здесь можно добавить логику действия по выбранному пункту
+        deactivate();
+    }
+}
+
+void Menu::draw() {
+    if(state == MENU_PAGE_SELECT) {
+        drawPages();
+    } else if(state == MENU_ITEM_SELECT) {
+        drawItems();
+    }
+}
+
+void Menu::drawPages() {
+    tft->fillScreen(TFT_BLACK);
+    tft->setTextColor(TFT_WHITE, TFT_BLACK);
+    tft->setTextSize(2);
+    tft->drawString("Выбор страницы", 30, 10);
+    for (int i = 0; i < 5; i++) {
+        if (i == page)
+            tft->setTextColor(TFT_YELLOW, TFT_BLUE);
+        else
+            tft->setTextColor(TFT_WHITE, TFT_BLACK);
+        char buf[16];
+        sprintf(buf, "Страница %d", i+1);
+        tft->drawString(buf, 40, 40 + i*30);
+    }
+}
+
+void Menu::drawItems() {
+    tft->fillScreen(TFT_BLACK);
+    tft->setTextColor(TFT_WHITE, TFT_BLACK);
+    tft->setTextSize(2);
+    char head[20];
+    sprintf(head, "Страница %d:", page+1);
+    tft->drawString(head, 30, 10);
+    for(int i=0; i<5; i++){
+        if (i == item)
+            tft->setTextColor(TFT_YELLOW, TFT_BLUE);
+        else
+            tft->setTextColor(TFT_WHITE, TFT_BLACK);
+        tft->drawString(menu[page][i], 40, 40 + i*30);
+    }
+}
+3. Buttons.h
+#ifndef BUTTONS_H
+#define BUTTONS_H
+
+#include <stdint.h>
+
+enum ButtonEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
+
+class Button {
+public:
+    Button(uint8_t pin, unsigned long longPressMs = 700);
+    void update();
+    ButtonEvent getEvent();
+
+private:
+    uint8_t pin;
+    unsigned long lastPressed;
+    bool lastState;
+    bool pressedFlag;
+    unsigned long pressedTime;
+    unsigned long longPressDuration;
+    ButtonEvent event;
+};
+
+#endif
+4. Buttons.cpp
+#include "Buttons.h"
+#include <Arduino.h>
+
+Button::Button(uint8_t apin, unsigned long longPressMs) {
+    pin = apin;
+    pinMode(pin, INPUT_PULLUP);
+    lastState = true;
+    pressedFlag = false;
+    longPressDuration = longPressMs;
+    event = BTN_NONE;
+}
+
+void Button::update() {
+    bool state = digitalRead(pin);
+    event = BTN_NONE;
+    if (!state && lastState) { // Нажатие
+        pressedFlag = true;
+        pressedTime = millis();
+    }
+    if (state && !lastState && pressedFlag) { // Отпускание
+        unsigned long d = millis() - pressedTime;
+        if (d > 15 && d < longPressDuration) {
+            event = BTN_SHORT;
+        }
+        pressedFlag = false;
+    }
+    if (!state && pressedFlag) {
+        if ((millis() - pressedTime) >= longPressDuration) {
+            event = BTN_LONG;
+            pressedFlag = false;
+        }
+    }
+    lastState = state;
+}
+
+ButtonEvent Button::getEvent() {
+    return event;
+}
+5. main.cpp (или другой основной файл)
+#include <Arduino.h>
+#include "Menu.h"
+#include "Buttons.h"
+#include <TFT_eSPI.h>
+
+#define SW1_PIN PC3 // Вызов меню/выход
+#define SW2_PIN PC2 // Навигация (выбор страницы или пункта) вниз
+#define SW3_PIN PC1 // Навигация вверх
+#define SW4_PIN PC0 // Фиксация
+
+TFT_eSPI tft = TFT_eSPI();
+Menu menu(&tft);
+
+Button btnSW1(SW1_PIN);
+Button btnSW2(SW2_PIN);
+Button btnSW3(SW3_PIN);
+Button btnSW4(SW4_PIN);
+
+void setup() {
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+}
+
+void loop() {
+    btnSW1.update();
+    btnSW2.update();
+    btnSW3.update();
+    btnSW4.update();
+
+    if (!menu.isActive()) {
+        if (btnSW1.getEvent() == BTN_LONG) {
+            menu.activate(); // Вход в меню (выбор страницы)
+        }
+    } else {
+        // В режиме выбора страницы
+        if (menu.getState() == MENU_PAGE_SELECT) {
+            if (btnSW2.getEvent() == BTN_SHORT) menu.nextPage();
+            if (btnSW3.getEvent() == BTN_SHORT) menu.prevPage();
+            if (btnSW4.getEvent() == BTN_SHORT) menu.select(); // перейти к выбору пункта
+            if (btnSW1.getEvent() == BTN_SHORT) menu.deactivate(); // выход из меню без выбора
+        }
+        // В режиме выбора пункта
+        else if (menu.getState() == MENU_ITEM_SELECT) {
+            if (btnSW2.getEvent() == BTN_SHORT) menu.nextItem();
+            if (btnSW3.getEvent() == BTN_SHORT) menu.prevItem();
+            if (btnSW4.getEvent() == BTN_SHORT) menu.select(); // выбор пункта, выход из меню
+            if (btnSW1.getEvent() == BTN_SHORT) menu.deactivate(); // выход из меню без выбора
+        }
+    }
+    delay(10); // Для стабильности работы кнопок
+}
+Суть логики
+Длинное нажатие SW1 — активация режима меню (страничного выбора).
+SW2/SW3 — листание страниц, потом пунктов на странице (в зависимости от состояния).
+SW4 — фиксация: переход к выбору пункта или фиксация действия и выход.
+Короткое нажатие SW1 — выход из меню на любом этапе (без фиксации).
+Меню реализовано конечным автоматом:
+
+Сначала всегда только листание страниц,
+После их фиксации — только выбор пунктов
+Всё управление и рисование вынесено в класс, вся логика раздельно по файлам.
+Arduino IDE распознает .cpp/.h — .ino файл можно не использовать.
+
+Если потребуется, пришлю схему связей и последовательностей состояний (в виде диаграммы или еще примеры)!
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Изменения в меню.
+
+При листании кнопками
+Button btnSW2(SW2_PIN);
+Button btnSW3(SW3_PIN);
+страницы листаются влево или вправо.
+На странице выводятся пункты меню.
+При нажатии на Button btnSW1(SW1_PIN)
+происходит фиксация страницы.
+листание пунктов меню на странице Button btnSW2(SW2_PIN);
+Button btnSW3(SW3_PIN);
+Фиксация пункта кнопкой Button btnSW4(SW4_PIN);
+Вызывается тестовая программа выбранного пункта.
+Возврат на стартовую страницу кнопкой Button btnSW1(SW1_PIN)

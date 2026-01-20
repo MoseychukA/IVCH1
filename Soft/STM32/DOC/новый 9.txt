@@ -1,0 +1,1940 @@
+Изменить построение меню.
+Необходимо создать постоянно обновляемую главную сраницу.
+Необходимо создать независимые страницы на каждого пункта меню MENU_PAGE_SELECT
+
+void setup();
+    void update();
+    void draw();
+    void onActivate();
+    void onButtonPressed(int buttonID);
+    void onButtonReleased(int buttonID);
+	
+	Ниже — вариант переделки Menu.h/Menu.cpp под вашу архитектуру:
+
+Главная страница (HOME) постоянно обновляется (через Menu::update()),независимо от меню.
+Каждая “страница” Str1..Str5 (то,что выбирается в MENU_PAGE_SELECT) является отдельной программой с методами:
+cpp Копировать
+void setup();
+void update();
+void draw();
+void onActivate();
+void onButtonPressed(int buttonID);
+void onButtonReleased(int buttonID);
+Menu становится диспетчером:управляет состояниями и передаёт события кнопок активной странице.
+Ниже даю готовые файлы. Страницы сейчас сделаны как заглушки (Page1..Page5),их можно наполнять вашей логикой.
+
+1) Новый Menu.h
+cpp Копировать
+#ifndef MENU_H
+#define MENU_H
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+
+extern const char* menu[5][5];
+
+enum MenuState { MENU_IDLE, MENU_PAGE_SELECT, MENU_ITEM_SELECT, MENU_TEST };
+
+// ID кнопок (единая нумерация)
+enum MenuButtonID {
+ BTN_SW1 = 1,
+ BTN_SW2 = 2,
+ BTN_SW3 = 3,
+ BTN_SW4 = 4
+};
+
+class Menu; // forward
+
+// Интерфейс "страницы-программы"
+class IMenuPage {
+public:
+ virtual ~IMenuPage() {}
+ virtual void setup() = 0;
+ virtual void update() = 0;
+ virtual void draw() = 0;
+ virtual void onActivate() = 0;
+ virtual void onButtonPressed(int buttonID) = 0;
+ virtual void onButtonReleased(int buttonID) = 0;
+};
+
+// Диспетчер меню + HOME
+class Menu {
+public:
+ Menu(TFT_eSPI* disp);
+
+ void setup(const String& ver);
+
+ // Вызывать каждый loop():обновляет HOME или активную страницу
+ void update();
+
+ // HOME
+ void drawStartPage(); // рисует статическую часть HOME (будет дергаться автоматически)
+ void invalidateHome(); // принудительно обновить динамику HOME
+
+ // Управление меню
+ void activate();
+ void deactivate();
+
+ void nextPage();
+ void prevPage();
+
+ void nextItem();
+ void prevItem();
+
+ void fixPage(); // перейти из выбора страниц в активную страницу
+ void fixItem(); // "действие" на выбранном пункте (пробрасываем в страницу)
+
+ void backToStart();
+
+ bool isActive() const;
+ MenuState getState() const;
+
+ // События кнопок (вызывайте из .ino при нажатии/отпускании)
+ void onButtonPressed(int buttonID);
+ void onButtonReleased(int buttonID);
+
+ // Доступ для страниц
+ TFT_eSPI* display() const { return tft; }
+ int currentPageIndex() const { return page; } // 0..4
+ int currentItemIndex() const { return item; } // 0..4
+ const char* itemLabel(int p,int i) const { return menu[p][i]; }
+
+private:
+ TFT_eSPI* tft = nullptr;
+ String versionString;
+
+ int page = 0; // выбранная страница (0..4)
+ int item = 0; // выбранный пункт (0..4)
+ MenuState state = MENU_IDLE;
+
+ // страницы Str1..Str5
+ IMenuPage* pages[5] = {nullptr,nullptr,nullptr,nullptr,nullptr};
+
+ // ---- HOME scheduling / caching ----
+ uint32_t _lastHomeTickMs = 0;
+ bool _homeStaticDrawn = false;
+ bool _homeDirty = true;
+
+ char _lastTime[9] = "00:00:00";
+ char _lastDate[11] = "00.00.0000";
+ uint8_t _lastBars = 255;
+ bool _lastNet = false;
+
+private:
+ // Рисование
+ void drawPageSelect();   // MENU_PAGE_SELECT
+ void drawActivePage();   // MENU_ITEM_SELECT (активная страница-программа)
+
+ // HOME
+ void drawHomeStatic();
+ void drawHomeDynamic();
+
+ // Сервис
+ void attachPages(); // связывает страницы с Menu/TFT
+};
+
+#endif
+2) Новый Menu.cpp (со страницами Page1..Page5)
+Важно:здесь я использую TimeFeed.h и NetFeed.h (которые мы делали ранее). HOME будет показывать время/дату и сеть/сигнал.
+
+cpp Копировать
+#include "Menu.h"
+#include <TFT_eSPI.h>
+
+#include "TimeFeed.h"
+#include "NetFeed.h"
+
+// ваши шрифты оставил как были (можете использовать)
+#include "zTimesNRItalic18.h"
+#include "zTimesNRItalic24.h"
+#include "zTimesNRItalic28.h"
+#include "zTimesNRItalic36.h"
+#include "zCalibri36.h"
+#include "zTimesNR28.h"
+#include "zTimesNR14.h"
+#include "zTimesNR18.h"
+#include "zTimesNR24.h"
+
+#define AA_FONT_CALI zCalibri36
+#define AA_FONT_TIME18I zTimesNRItalic18
+#define AA_FONT_TIME24I zTimesNRItalic24
+#define AA_FONT_TIME28I zTimesNRItalic28
+#define AA_FONT_TIME36I zTimesNRItalic36
+#define AA_FONT_TIME28 zTimesNR28
+#define AA_FONT_TIME18 zTimesNR18
+#define AA_FONT_TIME24 zTimesNR24
+
+// Таблица пунктов (как у вас)
+const char* menu[5][5] = {
+ {"P1-1","P1-2","P1-3","P1-4","P1-5"},
+ {"P2-1","P2-2","P2-3","P2-4","P2-5"},
+ {"P3-1","P3-2","P3-3","P3-4","P3-5"},
+ {"P4-1","P4-2","P4-3","P4-4","P4-5"},
+ {"P5-1","P5-2","P5-3","P5-4","P5-5"}
+};
+
+// ------------------ Примеры страниц-программ ------------------
+class PageBase : public IMenuPage {
+public:
+ PageBase(Menu* m) :_m(m) {}
+protected:
+ Menu* _m;
+ TFT_eSPI* tft() const { return _m ? _m->display() : nullptr; }
+ int page() const { return _m ? _m->currentPageIndex() : 0; }
+ int item() const { return _m ? _m->currentItemIndex() : 0; }
+};
+
+class Page1 : public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+ void onActivate() override { draw(); }
+
+ void update() override {
+ // если нужно периодическое обновление внутри страницы — делайте тут
+ }
+
+ void draw() override {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->setTextSize(2);
+ d->drawString("PAGE 1",10,10);
+
+ for (int i = 0; i < 5; i++) {
+ d->setTextColor(i == item() ? TFT_GREEN :TFT_WHITE, TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),20,50 + i * 28);
+ }
+ }
+
+ void onButtonPressed(int buttonID) override {
+ // пример:по SW4 запуск действия
+ if (buttonID == BTN_SW4) {
+ // тут ваш код для выбранного пункта item()
+ // ...
+ }
+ }
+
+ void onButtonReleased(int) override {}
+};
+
+class Page2 : public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+ void onActivate() override { draw(); }
+
+ void update() override {
+ // например,перерисовать статус сети раз в 500мс можно тут (если нужно)
+ }
+
+ void draw() override {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->setTextSize(2);
+ d->drawString("PAGE 2",10,10);
+
+ char buf[48];
+ snprintf(buf,sizeof(buf),"NET:%d RSSI:%ddBm [%u]",
+ gNetRegistered ? 1 :0, (int)gRssiDbm, (unsigned)gSignalBars);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,10,60);
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW4) {
+ // действие по пункту
+ }
+ }
+ void onButtonReleased(int) override {}
+};
+
+class Page3 : public PageBase { public: using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { if (!tft()) return; tft()->fillScreen(TFT_BLACK); tft()->setTextColor(TFT_YELLOW,TFT_BLACK); tft()->setTextSize(2); tft()->drawString("PAGE 3",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page4 : public PageBase { public: using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { if (!tft()) return; tft()->fillScreen(TFT_BLACK); tft()->setTextColor(TFT_YELLOW,TFT_BLACK); tft()->setTextSize(2); tft()->drawString("PAGE 4",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page5 : public PageBase { public: using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { if (!tft()) return; tft()->fillScreen(TFT_BLACK); tft()->setTextColor(TFT_YELLOW,TFT_BLACK); tft()->setTextSize(2); tft()->drawString("PAGE 5",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+// -------------------------------------------------------------
+
+Menu::Menu(TFT_eSPI* disp) :tft(disp) {
+ page = 0;
+ item = 0;
+ state = MENU_IDLE;
+}
+
+void Menu::attachPages()
+{
+ // создаём страницы и прикрепляем
+ static Page1 p1(this);
+ static Page2 p2(this);
+ static Page3 p3(this);
+ static Page4 p4(this);
+ static Page5 p5(this);
+
+ pages[0] = &p1;
+ pages[1] = &p2;
+ pages[2] = &p3;
+ pages[3] = &p4;
+ pages[4] = &p5;
+}
+
+void Menu::setup(const String& ver)
+{
+ versionString = ver;
+
+ tft->init();
+ tft->setRotation(3);
+ tft->fillScreen(TFT_NAVY);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+
+ // ваш стартовый экран включения (оставил как было)
+ tft->loadFont(AA_FONT_CALI);
+ tft->setCursor(120,20); tft->println("IVCH");
+ tft->setCursor(100,50); tft->println("DECIMA");
+
+ tft->loadFont(AA_FONT_TIME24I);
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->setCursor(84,90); tft->println("ВКЛЮЧЕНИЕ");
+
+ tft->loadFont(AA_FONT_TIME18);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->setCursor(5,130); tft->println("(C) 2026");
+ tft->setCursor(5,150); tft->println("www.decima.ru");
+
+ uint16_t tbw1 = tft->textWidth(versionString);
+ uint16_t x_tft = (tft->width() - tbw1) - 4;
+ tft->setCursor(x_tft,150);
+ tft->print(versionString);
+
+ tft->loadFont(AA_FONT_TIME24I);
+
+ attachPages();
+ for (int i=0;i<5;i++) if (pages[i]) pages[i]->setup();
+
+ // HOME готовим
+ drawStartPage();
+}
+
+void Menu::update()
+{
+ const uint32_t now = millis();
+
+ // HOME постоянно обновляется,когда MENU_IDLE
+ if (state == MENU_IDLE) {
+ if (!_homeStaticDrawn) {
+ drawHomeStatic();
+ _homeStaticDrawn = true;
+ _homeDirty = true;
+ }
+
+ // обновление динамики (время/сеть/сигнал) без полного fillScreen
+ if (_homeDirty || (now - _lastHomeTickMs) > 200) {
+ _lastHomeTickMs = now;
+ drawHomeDynamic();
+ _homeDirty = false;
+ }
+ return;
+ }
+
+ // активная страница обновляется сама
+ if (state == MENU_ITEM_SELECT) {
+ if (pages[page]) pages[page]->update();
+ }
+}
+
+void Menu::drawStartPage()
+{
+ // переключаемся в HOME (MENU_IDLE)
+ state = MENU_IDLE;
+ _homeStaticDrawn = false;
+ _homeDirty = true;
+}
+
+void Menu::invalidateHome()
+{
+ _homeDirty = true;
+}
+
+void Menu::drawHomeStatic()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("HOME",10,10);
+
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("DATE:",10,50);
+ tft->drawString("TIME:",10,80);
+ tft->drawString("NET :",10,110);
+ tft->drawString("SIG :",10,140);
+
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->drawString(versionString,10,200);
+
+ // сброс кеша,чтобы первый drawHomeDynamic точно отрисовал
+ strcpy(_lastDate,"");
+ strcpy(_lastTime,"");
+ _lastBars = 255;
+ _lastNet = !gNetRegistered; // чтобы изменилось
+}
+
+void Menu::drawHomeDynamic()
+{
+ // Date
+ if (strcmp(_lastDate,gDateStr) != 0) {
+ strncpy(_lastDate,gDateStr,sizeof(_lastDate)-1);
+ _lastDate[sizeof(_lastDate)-1] = 0;
+ tft->fillRect(80,50,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastDate,80,50);
+ }
+
+ // Time
+ if (strcmp(_lastTime,gTimeStr) != 0) {
+ strncpy(_lastTime,gTimeStr,sizeof(_lastTime)-1);
+ _lastTime[sizeof(_lastTime)-1] = 0;
+ tft->fillRect(80,80,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastTime,80,80);
+ }
+
+ // Net
+ if (_lastNet != gNetRegistered) {
+ _lastNet = gNetRegistered;
+ tft->fillRect(80,110,240,20,TFT_BLACK);
+ tft->setTextColor(gNetRegistered ? TFT_GREEN :TFT_RED,TFT_BLACK);
+ tft->drawString(gNetRegistered ? "CONNECTED" :"NO",80,110);
+ }
+
+ // Signal
+ if (_lastBars != gSignalBars) {
+ _lastBars = gSignalBars;
+ tft->fillRect(80,140,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+
+ char buf[32];
+ if (gCsqRssi == 99 || gRssiDbm == 0) snprintf(buf,sizeof(buf),"-- [0/5]");
+ else snprintf(buf,sizeof(buf),"%ddBm [%u/5]",(int)gRssiDbm,(unsigned)gSignalBars);
+
+ tft->drawString(buf,80,140);
+ }
+}
+
+void Menu::activate()
+{
+ page = 0;
+ item = 0;
+ state = MENU_PAGE_SELECT;
+ drawPageSelect();
+}
+
+void Menu::deactivate()
+{
+ drawStartPage(); // вернуться на HOME
+}
+
+bool Menu::isActive() const { return state != MENU_IDLE; }
+MenuState Menu::getState() const { return state; }
+
+void Menu::prevPage()
+{
+ if (state == MENU_PAGE_SELECT) {
+ page = (page + 4) % 5;
+ drawPageSelect();
+ }
+}
+
+void Menu::nextPage()
+{
+ if (state == MENU_PAGE_SELECT) {
+ page = (page + 1) % 5;
+ drawPageSelect();
+ }
+}
+
+void Menu::prevItem()
+{
+ if (state == MENU_ITEM_SELECT) {
+ item = (item + 4) % 5;
+ if (pages[page]) pages[page]->draw();
+ }
+}
+
+void Menu::nextItem()
+{
+ if (state == MENU_ITEM_SELECT) {
+ item = (item + 1) % 5;
+ if (pages[page]) pages[page]->draw();
+ }
+}
+
+void Menu::fixPage()
+{
+ if (state == MENU_PAGE_SELECT) {
+ item = 0;
+ state = MENU_ITEM_SELECT;
+ if (pages[page]) pages[page]->onActivate();
+ else drawActivePage();
+ }
+}
+
+void Menu::fixItem()
+{
+ if (state == MENU_ITEM_SELECT) {
+ // Вместо MENU_TEST:передаём событие странице (она решает что делать)
+ if (pages[page]) pages[page]->onButtonPressed(BTN_SW4);
+ }
+}
+
+void Menu::backToStart()
+{
+ deactivate();
+}
+
+void Menu::draw()
+{
+ if (state == MENU_PAGE_SELECT) drawPageSelect();
+ else if (state == MENU_ITEM_SELECT) drawActivePage();
+ else if (state == MENU_TEST) drawTestPage();
+ else drawStartPage();
+}
+
+void Menu::drawPageSelect()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("SELECT PAGE",10,10);
+
+ for (int i = 0; i < 5; i++) {
+ tft->setTextColor(i == page ? TFT_GREEN :TFT_WHITE, (i == page ? TFT_BLUE :TFT_BLACK));
+ char s[8];
+ snprintf(s,sizeof(s),"Str%d",i + 1);
+ tft->drawString(s,30,50 + i * 30);
+ }
+}
+
+void Menu::drawActivePage()
+{
+ if (pages[page]) pages[page]->draw();
+}
+
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:короткое SW1 — открыть меню
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW1) activate();
+ return;
+ }
+
+ // PAGE SELECT:SW2/SW3 листают,SW1 фиксирует
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) prevPage();
+ else if (buttonID == BTN_SW3) nextPage();
+ else if (buttonID == BTN_SW1) fixPage();
+ return;
+ }
+
+ // ACTIVE PAGE:передаём странице + даём базовую навигацию
+ if (state == MENU_ITEM_SELECT) {
+ if (buttonID == BTN_SW2) prevItem();
+ else if (buttonID == BTN_SW3) nextItem();
+ else if (buttonID == BTN_SW1) backToStart();
+ else if (buttonID == BTN_SW4) fixItem();
+
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+}
+
+void Menu::onButtonReleased(int buttonID)
+{
+ if (state == MENU_ITEM_SELECT && pages[page]) pages[page]->onButtonReleased(buttonID);
+}
+
+// Оставлены для совместимости со старым кодом:
+void Menu::select() {}
+void Menu::runTest() {}
+void Menu::drawTestPage()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextColor(TFT_RED,TFT_BLACK);
+ tft->setTextSize(2);
+ tft->drawString("TEST (legacy)",20,60);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("SW1 - exit",20,120);
+}
+3) Что нужно сделать в .ino
+В loop() добавить постоянный вызов:
+cpp Копировать
+menu_start.update();
+События кнопок лучше направлять в Menu::onButtonPressed/onButtonReleased. Если ваша библиотека 
+Button даёт события типа BTN_SHORT/BTN_LONG,то на “нажатие” 
+можно трактовать BTN_SHORT как pressed (или pressed+released одним событием). Минимально:
+cpp Копировать
+if (btnSW1.getEvent() == BTN_SHORT) menu_start.onButtonPressed(BTN_SW1);
+if (btnSW2.getEvent() == BTN_SHORT) menu_start.onButtonPressed(BTN_SW2);
+if (btnSW3.getEvent() == BTN_SHORT) menu_start.onButtonPressed(BTN_SW3);
+if (btnSW4.getEvent() == BTN_SHORT) menu_start.onButtonPressed(BTN_SW4);
+Если сможете получать отдельно “pressed/released” — вызывайте оба.
+
+Важно
+Главная страница будет обновляться из TimeFeed/NetFeed. Поэтому ваш код должен продолжать 
+обновлять gTimeStr/gDateStr и gNetRegistered/gSignalBars/....
+Страницы Page1..Page5 сейчас — шаблоны. Внутри onButtonPressed/Released и update/draw вы 
+размещаете любую логику “программ” для каждой страницы.
+Если пришлёте,как именно ваша библиотека Buttons.h сигнализирует нажатие/отпускание (какие events есть),
+я подстрою обработчик так,чтобы реально использовались onButtonPressed и onButtonReleased,а не только “короткое нажатие”
+
+//==============================================================================================
+Ниже — доработанный Button класс,который не ломает вашу текущую логику (BTN_SHORT/BTN_LONG через getEvent()),но добавляет:
+
+события фронтов:нажал / отпустил (getEdge())
+текущее состояние:нажата ли кнопка сейчас (isPressed())
+Это позволит вызывать в меню/страницах:
+
+onButtonPressed(id) по EDGE_PRESSED
+onButtonReleased(id) по EDGE_RELEASED
+BTN_SHORT/BTN_LONG как отдельные “жесты” при необходимости
+Buttons.h (обновлённый)
+cpp Копировать
+#ifndef BUTTONS_H
+#define BUTTONS_H
+
+#include <stdint.h>
+
+enum ButtonEvent { BTN_NONE,BTN_SHORT,BTN_LONG };
+enum ButtonEdge { EDGE_NONE,EDGE_PRESSED,EDGE_RELEASED };
+
+class Button {
+public:
+ Button(uint8_t pin,unsigned long longPressMs = 700);
+
+ // Вызывать в loop()
+ void update();
+
+ // Совместимо со старым кодом:события короткое/длинное нажатие (одноразовые)
+ ButtonEvent getEvent();
+
+ // Новое:фронты нажатия/отпускания (одноразовые)
+ ButtonEdge getEdge();
+
+ // Новое:текущее состояние
+ bool isPressed() const;
+
+private:
+ uint8_t pin;
+
+ bool lastLevel; // уровень пина на предыдущем update():true=HIGH (отпущено при INPUT_PULLUP)
+ bool pressedFlag; // идет ли удержание
+ bool longSent; // уже отправляли BTN_LONG в рамках текущего удержания
+ unsigned long pressedTime;
+ unsigned long longPressDuration;
+
+ ButtonEvent event;
+ ButtonEdge edge;
+};
+
+#endif
+Buttons.cpp (обновлённый)
+cpp Копировать
+#include "Buttons.h"
+#include <Arduino.h>
+
+Button::Button(uint8_t apin,unsigned long longPressMs)
+{
+ pin = apin;
+ pinMode(pin,INPUT_PULLUP);
+
+ lastLevel = true; // HIGH = отпущено
+ pressedFlag = false;
+ longSent = false;
+
+ pressedTime = 0;
+ longPressDuration = longPressMs;
+
+ event = BTN_NONE;
+ edge = EDGE_NONE;
+}
+
+bool Button::isPressed() const
+{
+ // INPUT_PULLUP:LOW = нажато
+ return digitalRead(pin) == LOW;
+}
+
+void Button::update()
+{
+ bool level = digitalRead(pin); // true=HIGH (отпущено),false=LOW (нажато)
+
+ event = BTN_NONE;
+ edge = EDGE_NONE;
+
+ // фронт:отпущено->нажато
+ if (!level && lastLevel)
+ {
+ edge = EDGE_PRESSED;
+ pressedFlag = true;
+ longSent = false;
+ pressedTime = millis();
+ }
+
+ // фронт:нажато->отпущено
+ if (level && !lastLevel)
+ {
+ edge = EDGE_RELEASED;
+
+ if (pressedFlag)
+ {
+ unsigned long d = millis() - pressedTime;
+
+ // короткое нажатие:только если long ещё не было
+ if (!longSent && d > 15 && d < longPressDuration)
+ {
+ event = BTN_SHORT;
+ }
+
+ pressedFlag = false;
+ longSent = false;
+ }
+ }
+
+ // удержание:long press
+ if (!level && pressedFlag && !longSent)
+ {
+ if ((millis() - pressedTime) >= longPressDuration)
+ {
+ event = BTN_LONG;
+ longSent = true;
+ // pressedFlag можно оставить true до отпускания
+ }
+ }
+
+ lastLevel = level;
+}
+
+ButtonEvent Button::getEvent()
+{
+ return event;
+}
+
+ButtonEdge Button::getEdge()
+{
+ return edge;
+}
+Как использовать в вашем .ino (пример)
+Теперь можно без digitalRead() снаружи:
+
+cpp Копировать
+btnSW1.update();
+auto e1 = btnSW1.getEvent();
+auto ed1 = btnSW1.getEdge();
+
+if (ed1 == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW1);
+if (ed1 == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW1);
+
+if (e1 == BTN_LONG) {
+ // если хотите отдельно обрабатывать long
+ menu_start.onButtonPressed(BTN_SW1 | 0x80);
+}
+Важно
+BTN_SHORT по вашей логике появляется на отпускании (как и раньше).
+EDGE_PRESSED/EDGE_RELEASED появляются независимо от short/long и 
+позволяют страницам получать “нажал/отпустил”.
+Если хотите — могу ещё добавить:
+
+авто-повтор при удержании (repeat),
+настройку debounce,
+метод pressDurationMs() для страниц.
+
+//----------------------------------------------------------------------------------------
+
+Ниже — обновлённый Button класс с:
+
+настраиваемым debounce (debounceMs,по умолчанию 25 мс)
+методом pressDurationMs() (для страниц)
+сохранением совместимости:getEvent() возвращает BTN_SHORT/BTN_LONG,а getEdge() — EDGE_PRESSED/EDGE_RELEASED.
+Buttons.h
+cpp Копировать
+#ifndef BUTTONS_H
+#define BUTTONS_H
+
+#include <stdint.h>
+
+enum ButtonEvent { BTN_NONE,BTN_SHORT,BTN_LONG };
+enum ButtonEdge { EDGE_NONE,EDGE_PRESSED,EDGE_RELEASED };
+
+class Button {
+public:
+ // longPressMs:порог длинного нажатия
+ // debounceMs:антидребезг по уровню (стабилизация)
+ Button(uint8_t pin,unsigned long longPressMs = 700,unsigned long debounceMs = 25);
+
+ // вызывать в loop()
+ void update();
+
+ // одноразовые события "жестов"
+ ButtonEvent getEvent();
+
+ // одноразовые события фронтов
+ ButtonEdge getEdge();
+
+ // текущее (стабильное) состояние
+ bool isPressed() const;
+
+ // длительность текущего удержания (если нажата) или последнего удержания (если отпущена)
+ unsigned long pressDurationMs() const;
+
+private:
+ uint8_t pin;
+
+ unsigned long longPressDuration;
+ unsigned long debounceDuration;
+
+ // raw level tracking
+ bool lastRawLevel; // предыдущий считанный уровень (не отфильтрованный)
+ unsigned long lastRawChangeMs;
+
+ // debounced stable level
+ bool stableLevel; // true=HIGH(отпущено),false=LOW(нажато)
+ bool lastStableLevel;
+
+ // press tracking
+ bool pressedFlag;
+ bool longSent;
+ unsigned long pressedTime;
+ unsigned long lastReleaseDuration;
+
+ // outputs
+ ButtonEvent event;
+ ButtonEdge edge;
+};
+
+#endif
+Buttons.cpp
+cpp Копировать
+#include "Buttons.h"
+#include <Arduino.h>
+
+Button::Button(uint8_t apin,unsigned long longPressMs,unsigned long debounceMs)
+{
+ pin = apin;
+ pinMode(pin,INPUT_PULLUP);
+
+ longPressDuration = longPressMs;
+ debounceDuration = debounceMs;
+
+ lastRawLevel = true;
+ stableLevel = true;
+ lastStableLevel = true;
+ lastRawChangeMs = 0;
+
+ pressedFlag = false;
+ longSent = false;
+ pressedTime = 0;
+ lastReleaseDuration = 0;
+
+ event = BTN_NONE;
+ edge = EDGE_NONE;
+}
+
+bool Button::isPressed() const
+{
+ // stable (debounced) состояние
+ return stableLevel == false; // INPUT_PULLUP:LOW=нажато
+}
+
+unsigned long Button::pressDurationMs() const
+{
+ if (isPressed()) {
+ return millis() - pressedTime;
+ }
+ return lastReleaseDuration;
+}
+
+void Button::update()
+{
+ event = BTN_NONE;
+ edge = EDGE_NONE;
+
+ // 1) читаем raw уровень
+ bool raw = digitalRead(pin); // true=HIGH (отпущено),false=LOW (нажато)
+ unsigned long now = millis();
+
+ // 2) отслеживаем изменение raw (для debounce)
+ if (raw != lastRawLevel) {
+ lastRawLevel = raw;
+ lastRawChangeMs = now;
+ }
+
+ // 3) если raw стабилен debounceDuration — принимаем как stable
+ if ((now - lastRawChangeMs) >= debounceDuration) {
+ stableLevel = raw;
+ }
+
+ // 4) фронты по stable уровню
+ if (stableLevel != lastStableLevel) {
+
+ if (!stableLevel && lastStableLevel) {
+ // отпущено -> нажато
+ edge = EDGE_PRESSED;
+ pressedFlag = true;
+ longSent = false;
+ pressedTime = now;
+ }
+
+ if (stableLevel && !lastStableLevel) {
+ // нажато -> отпущено
+ edge = EDGE_RELEASED;
+
+ if (pressedFlag) {
+ unsigned long d = now - pressedTime;
+ lastReleaseDuration = d;
+
+ // short:только если long ещё не отправляли
+ if (!longSent && d < longPressDuration) {
+ event = BTN_SHORT;
+ }
+
+ pressedFlag = false;
+ longSent = false;
+ } else {
+ // если по какой-то причине отпустили без pressedFlag — всё равно фиксируем
+ lastReleaseDuration = 0;
+ }
+ }
+
+ lastStableLevel = stableLevel;
+ }
+
+ // 5) long press (по stable удержанию)
+ if (!stableLevel && pressedFlag && !longSent) {
+ if ((now - pressedTime) >= longPressDuration) {
+ event = BTN_LONG;
+ longSent = true;
+ }
+ }
+}
+
+ButtonEvent Button::getEvent() { return event; }
+ButtonEdge Button::getEdge() { return edge; }
+Как использовать в Menu/страницах
+В .ino:
+
+cpp Копировать
+btnSW1.update();
+
+if (btnSW1.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW1);
+if (btnSW1.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW1);
+
+if (btnSW1.getEvent() == BTN_LONG) {
+ // пример:сообщить странице о long
+ menu_start.onButtonPressed(BTN_SW1 | 0x80);
+}
+
+// В странице можно спросить длительность удержания:
+unsigned long ms = btnSW1.pressDurationMs();
+Примечание
+pressDurationMs():
+
+пока кнопка нажата — показывает “сколько удерживается сейчас”
+после отпускания — показывает длительность последнего удержания
+Если хотите — добавлю wasLong() (было ли long в текущем/последнем удержании) и “auto-repeat” при удержании.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Да,ваши текущие Menu.h/Menu.cpp нужно обновить,потому что сейчас:
+
+Главная страница не обновляется (рисуется один раз в drawStartPage()).
+Страницы не являются “программами” с setup/update/draw/onActivate/onButtonPressed/onButtonReleased.
+В конце вашего Menu.cpp стоит лишний #endif — это ошибка (в .cpp его быть не должно).
+Ниже — полностью готовые Menu.h и Menu.cpp под вашу архитектуру страниц-программ и постоянно обновляемую главную страницу.
+
+Menu.h (новый)
+cpp Копировать
+#ifndef MENU_H
+#define MENU_H
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+
+extern const char* menu[5][5];
+
+enum MenuState { MENU_IDLE,MENU_PAGE_SELECT,MENU_ITEM_SELECT,MENU_TEST };
+
+// ID кнопок (единые)
+enum MenuButtonID {
+ BTN_SW1 = 1,
+ BTN_SW2 = 2,
+ BTN_SW3 = 3,
+ BTN_SW4 = 4
+};
+
+// Интерфейс страницы-программы
+class IMenuPage {
+public:
+ virtual ~IMenuPage() {}
+ virtual void setup() = 0;
+ virtual void update() = 0;
+ virtual void draw() = 0;
+ virtual void onActivate() = 0;
+ virtual void onButtonPressed(int buttonID) = 0;
+ virtual void onButtonReleased(int buttonID) = 0;
+};
+
+class Menu {
+public:
+ Menu(TFT_eSPI* disp);
+
+ void setup(const String& ver);
+
+ // ВАЖНО:вызывать постоянно из loop()
+ void update();
+
+ // HOME (главная страница)
+ void drawStartPage(); // переключиться на HOME
+ void invalidateHome(); // принудительно обновить HOME-динамику
+
+ // Управление меню (как у вас было)
+ void activate();
+ void deactivate();
+ void nextPage();
+ void prevPage();
+ void nextItem();
+ void prevItem();
+ void select(); // оставлено для совместимости (пусто)
+ void draw(); // перерисовка текущего экрана
+
+ void fixPage();
+ void fixItem();
+ void backToStart();
+
+ void runTest(); // оставлено для совместимости (пусто/legacy)
+ void drawTestPage(); // legacy
+
+ bool isActive() const;
+ MenuState getState() const;
+
+ // НОВОЕ:события кнопок (pressed/released)
+ void onButtonPressed(int buttonID);
+ void onButtonReleased(int buttonID);
+
+ // Доступ страницам
+ TFT_eSPI* display() const { return tft; }
+ int currentPageIndex() const { return page; } // 0..4
+ int currentItemIndex() const { return item; } // 0..4
+ const char* itemLabel(int p,int i) const { return menu[p][i]; }
+
+private:
+ TFT_eSPI* tft = nullptr;
+ int page = 0;
+ int item = 0;
+ MenuState state = MENU_IDLE;
+ String versionString;
+
+ // страницы Str1..Str5
+ IMenuPage* pages[5] = {nullptr,nullptr,nullptr,nullptr,nullptr};
+
+ // HOME scheduling/caching
+ uint32_t _lastHomeTickMs = 0;
+ bool _homeStaticDrawn = false;
+ bool _homeDirty = true;
+
+ char _lastTime[9] = "00:00:00";
+ char _lastDate[11] = "00.00.0000";
+ bool _lastNet = false;
+ uint8_t _lastBars = 255;
+
+private:
+ void attachPages();
+
+ // HOME
+ void drawHomeStatic();
+ void drawHomeDynamic();
+
+ // MENU_PAGE_SELECT
+ void drawPageSelect();
+
+ // MENU_ITEM_SELECT
+ void drawActivePage();
+};
+
+#endif
+Menu.cpp (новый)
+Включает HOME,страницы Page1..Page5 (заглушки),и использует данные из TimeFeed и NetFeed.
+
+cpp Копировать
+#include "Menu.h"
+#include <TFT_eSPI.h>
+
+#include "TimeFeed.h" // gDateStr,gTimeStr,gTimeUpdated
+#include "NetFeed.h" // gNetRegistered,gRssiDbm,gSignalBars,...
+
+// Шрифты (как у вас)
+#include "zTimesNRItalic18.h"
+#include "zTimesNRItalic24.h"
+#include "zTimesNRItalic28.h"
+#include "zTimesNRItalic36.h"
+#include "zCalibri36.h"
+#include "zTimesNR28.h"
+#include "zTimesNR14.h"
+#include "zTimesNR18.h"
+#include "zTimesNR24.h"
+
+#define AA_FONT_CALI zCalibri36
+#define AA_FONT_TIME18I zTimesNRItalic18
+#define AA_FONT_TIME24I zTimesNRItalic24
+#define AA_FONT_TIME28I zTimesNRItalic28
+#define AA_FONT_TIME36I zTimesNRItalic36
+#define AA_FONT_TIME28 zTimesNR28
+#define AA_FONT_TIME18 zTimesNR18
+#define AA_FONT_TIME24 zTimesNR24
+
+// Таблица меню
+const char* menu[5][5] = {
+ {"P1-1","P1-2","P1-3","P1-4","P1-5"},
+ {"P2-1","P2-2","P2-3","P2-4","P2-5"},
+ {"P3-1","P3-2","P3-3","P3-4","P3-5"},
+ {"P4-1","P4-2","P4-3","P4-4","P4-5"},
+ {"P5-1","P5-2","P5-3","P5-4","P5-5"}
+};
+
+// -------------------- Примеры страниц --------------------
+class PageBase :public IMenuPage {
+public:
+ PageBase(Menu* m) :_m(m) {}
+protected:
+ Menu* _m = nullptr;
+ TFT_eSPI* tft() const { return _m ? _m->display() :nullptr; }
+ int page() const { return _m ? _m->currentPageIndex() :0; }
+ int item() const { return _m ? _m->currentItemIndex() :0; }
+};
+
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override {
+ auto d = tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("PAGE 1",10,10);
+ for(int i=0;i<5;i++){
+ d->setTextColor(i==item()?TFT_GREEN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),20,50+i*28);
+ }
+ }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int buttonID) override {
+ // пример:SW4 = действие по пункту
+ if (buttonID == BTN_SW4) {
+ // ... ваша логика ...
+ }
+ }
+ void onButtonReleased(int) override {}
+};
+
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override {
+ auto d = tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("PAGE 2 (status)",10,10);
+
+ char buf[48];
+ snprintf(buf,sizeof(buf),"NET:%d RSSI:%ddBm [%u]",
+ gNetRegistered ? 1 :0,
+ (int)gRssiDbm,
+ (unsigned)gSignalBars);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,10,60);
+ }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page3 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { auto d=tft(); if(!d) return; d->fillScreen(TFT_BLACK); d->setTextSize(2); d->setTextColor(TFT_YELLOW,TFT_BLACK); d->drawString("PAGE 3",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page4 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { auto d=tft(); if(!d) return; d->fillScreen(TFT_BLACK); d->setTextSize(2); d->setTextColor(TFT_YELLOW,TFT_BLACK); d->drawString("PAGE 4",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page5 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { auto d=tft(); if(!d) return; d->fillScreen(TFT_BLACK); d->setTextSize(2); d->setTextColor(TFT_YELLOW,TFT_BLACK); d->drawString("PAGE 5",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+// ---------------------------------------------------------
+
+Menu::Menu(TFT_eSPI* disp) :tft(disp) {}
+
+void Menu::attachPages()
+{
+ static Page1 p1(this);
+ static Page2 p2(this);
+ static Page3 p3(this);
+ static Page4 p4(this);
+ static Page5 p5(this);
+ pages[0] = &p1;
+ pages[1] = &p2;
+ pages[2] = &p3;
+ pages[3] = &p4;
+ pages[4] = &p5;
+}
+
+void Menu::setup(const String& ver)
+{
+ versionString = ver;
+
+ tft->init();
+ tft->setRotation(3);
+ tft->fillScreen(TFT_NAVY);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+
+ // ваш стартовый экран (оставлен)
+ tft->loadFont(AA_FONT_CALI);
+ tft->setCursor(120,20); tft->println("IVCH");
+ tft->setCursor(100,50); tft->println("DECIMA");
+
+ tft->loadFont(AA_FONT_TIME24I);
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->setCursor(84,90); tft->println("ВКЛЮЧЕНИЕ");
+
+ tft->loadFont(AA_FONT_TIME18);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->setCursor(5,130); tft->println("(C) 2026");
+ tft->setCursor(5,150); tft->println("www.decima.ru");
+
+ uint16_t tbw = tft->textWidth(versionString);
+ uint16_t x = (tft->width() - tbw) - 4;
+ tft->setCursor(x,150);
+ tft->print(versionString);
+
+ attachPages();
+ for (int i=0;i<5;i++) if (pages[i]) pages[i]->setup();
+
+ // перейти на HOME
+ drawStartPage();
+}
+
+void Menu::update()
+{
+ const uint32_t now = millis();
+
+ // HOME постоянно обновляется
+ if (state == MENU_IDLE) {
+ if (!_homeStaticDrawn) {
+ drawHomeStatic();
+ _homeStaticDrawn = true;
+ _homeDirty = true;
+ }
+
+ // обновлять динамику не чаще 200 мс
+ if (_homeDirty || (now - _lastHomeTickMs) > 200) {
+ _lastHomeTickMs = now;
+ drawHomeDynamic();
+ _homeDirty = false;
+ }
+ return;
+ }
+
+ // активная страница обновляется сама
+ if (state == MENU_ITEM_SELECT) {
+ if (pages[page]) pages[page]->update();
+ }
+}
+
+void Menu::invalidateHome() { _homeDirty = true; }
+
+void Menu::drawStartPage()
+{
+ state = MENU_IDLE;
+ _homeStaticDrawn = false;
+ _homeDirty = true;
+}
+
+void Menu::drawHomeStatic()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("HOME",10,10);
+
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("DATE:",10,50);
+ tft->drawString("TIME:",10,80);
+ tft->drawString("NET :",10,110);
+ tft->drawString("SIG :",10,140);
+
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->drawString(versionString,10,200);
+
+ // сброс кеша
+ _lastDate[0] = 0;
+ _lastTime[0] = 0;
+ _lastNet = !gNetRegistered;
+ _lastBars = 255;
+}
+
+void Menu::drawHomeDynamic()
+{
+ // Date
+ if (strcmp(_lastDate,gDateStr) != 0) {
+ strncpy(_lastDate,gDateStr,sizeof(_lastDate)-1);
+ _lastDate[sizeof(_lastDate)-1] = 0;
+ tft->fillRect(80,50,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastDate,80,50);
+ }
+
+ // Time
+ if (strcmp(_lastTime,gTimeStr) != 0) {
+ strncpy(_lastTime,gTimeStr,sizeof(_lastTime)-1);
+ _lastTime[sizeof(_lastTime)-1] = 0;
+ tft->fillRect(80,80,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastTime,80,80);
+ }
+
+ // Net
+ if (_lastNet != gNetRegistered) {
+ _lastNet = gNetRegistered;
+ tft->fillRect(80,110,240,20,TFT_BLACK);
+ tft->setTextColor(gNetRegistered ? TFT_GREEN :TFT_RED,TFT_BLACK);
+ tft->drawString(gNetRegistered ? "CONNECTED" :"NO",80,110);
+ }
+
+ // Signal
+ if (_lastBars != gSignalBars) {
+ _lastBars = gSignalBars;
+ tft->fillRect(80,140,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ char buf[32];
+ if (gCsqRssi == 99 || gRssiDbm == 0) snprintf(buf,sizeof(buf),"-- [0/5]");
+ else snprintf(buf,sizeof(buf),"%ddBm [%u/5]",(int)gRssiDbm,(unsigned)gSignalBars);
+ tft->drawString(buf,80,140);
+ }
+}
+
+void Menu::activate()
+{
+ page = 0;
+ item = 0;
+ state = MENU_PAGE_SELECT;
+ draw();
+}
+
+void Menu::deactivate()
+{
+ drawStartPage();
+}
+
+bool Menu::isActive() const { return state != MENU_IDLE; }
+MenuState Menu::getState() const { return state; }
+
+void Menu::prevPage() { if (state == MENU_PAGE_SELECT) { page = (page + 4) % 5; drawPageSelect(); } }
+void Menu::nextPage() { if (state == MENU_PAGE_SELECT) { page = (page + 1) % 5; drawPageSelect(); } }
+
+void Menu::prevItem() { if (state == MENU_ITEM_SELECT) { item = (item + 4) % 5; drawActivePage(); } }
+void Menu::nextItem() { if (state == MENU_ITEM_SELECT) { item = (item + 1) % 5; drawActivePage(); } }
+
+void Menu::fixPage()
+{
+ if (state == MENU_PAGE_SELECT) {
+ item = 0;
+ state = MENU_ITEM_SELECT;
+ if (pages[page]) pages[page]->onActivate();
+ else drawActivePage();
+ }
+}
+
+void Menu::fixItem()
+{
+ if (state == MENU_ITEM_SELECT) {
+ // передаем действие странице (по кнопке SW4)
+ if (pages[page]) pages[page]->onButtonPressed(BTN_SW4);
+ }
+}
+
+void Menu::backToStart() { deactivate(); }
+
+void Menu::draw()
+{
+ if (state == MENU_PAGE_SELECT) drawPageSelect();
+ else if (state == MENU_ITEM_SELECT) drawActivePage();
+ else if (state == MENU_TEST) drawTestPage();
+ else drawStartPage();
+}
+
+void Menu::drawPageSelect()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("SELECT PAGE",10,10);
+
+ for (int i=0;i<5;i++) {
+ bool sel = (i == page);
+ tft->setTextColor(sel ? TFT_GREEN :TFT_WHITE,sel ? TFT_BLUE :TFT_BLACK);
+ char s[8];
+ snprintf(s,sizeof(s),"Str%d",i+1);
+ tft->drawString(s,30,50 + i*30);
+ }
+}
+
+void Menu::drawActivePage()
+{
+ if (pages[page]) pages[page]->draw();
+}
+
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:нажатие SW1 открывает меню
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW1) activate();
+ return;
+ }
+
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) prevPage();
+ else if (buttonID == BTN_SW3) nextPage();
+ else if (buttonID == BTN_SW1) fixPage();
+ else if (buttonID == BTN_SW4) backToStart(); // опционально
+ return;
+ }
+
+ if (state == MENU_ITEM_SELECT) {
+ // базовая навигация
+ if (buttonID == BTN_SW2) prevItem();
+ else if (buttonID == BTN_SW3) nextItem();
+ else if (buttonID == BTN_SW1) backToStart();
+ else if (buttonID == BTN_SW4) fixItem();
+
+ // и отдать событие странице
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+}
+
+void Menu::onButtonReleased(int buttonID)
+{
+ if (state == MENU_ITEM_SELECT && pages[page]) pages[page]->onButtonReleased(buttonID);
+}
+
+void Menu::select() {}
+void Menu::runTest() {}
+
+void Menu::drawTestPage()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextColor(TFT_RED,TFT_BLACK);
+ tft->setTextSize(2);
+ tft->drawString("TEST (legacy)",20,60);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("SW1 - exit",20,120);
+}
+3) Что нужно изменить в .ino (минимально)
+В loop() обязательно добавьте:
+cpp Копировать
+menu_start.update();
+После обновления кнопок используйте новый Button (getEdge()):
+cpp Копировать
+btnSW1.update();
+if (btnSW1.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW1);
+if (btnSW1.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW1);
+
+btnSW2.update();
+if (btnSW2.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW2);
+if (btnSW2.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW2);
+
+btnSW3.update();
+if (btnSW3.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW3);
+if (btnSW3.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW3);
+
+btnSW4.update();
+if (btnSW4.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW4);
+if (btnSW4.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW4);
+Примечания
+Главная страница (HOME) берёт данные из TimeFeed и NetFeed. Поэтому ваш код 
+должен продолжать обновлять gDateStr/gTimeStr
+ и NetFeed_UpdateFromSim(sim) (как раньше).
+Независимость страниц обеспечена:Page1..Page5 — отдельные “программы” с требуемыми методами.
+ Заполняйте их логикой.
+Если хотите — скажите,что именно должна показывать каждая из 5 страниц (Str1..Str5),и я
+ разнесу вашу текущую логику (частота/SD/настройки модема/настройки TZ) по соответствующим PageX классам.
+ 
+ //-----------------------------------------------------------------------
+ 
+ Нужно поправить две вещи:
+
+Возврат на главную (HOME) не работает,потому что при новой архитектуре Menu должен получать
+ события через Menu::onButtonPressed/onButtonReleased,а у вас,скорее всего,остаётся старый 
+ код с menu_start.isActive() и вызовами prevPage()/nextPage()/backToStart() напрямую по BTN_SHORT/BTN_LONG.
+ Тогда backToStart() может вообще не вызываться (или вызывается в неправильном состоянии).
+
+Страница 2 (Str2) должна менять TZ и писать в AT24C128 — это делаем в классе Page2 внутри Menu.cpp.
+
+Ниже — конкретные правки.
+
+1) Почему нет возврата на HOME и как сделать правильно
+Требование к .ino
+В loop() должно быть:
+
+menu_start.update(); — всегда
+кнопки должны вызывать:
+menu_start.onButtonPressed(BTN_SWx) на EDGE_PRESSED
+menu_start.onButtonReleased(BTN_SWx) на EDGE_RELEASED
+Пример (с вашим доработанным Button,где есть getEdge()):
+
+cpp Копировать
+btnSW1.update();
+if (btnSW1.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW1);
+if (btnSW1.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW1);
+
+btnSW2.update();
+if (btnSW2.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW2);
+if (btnSW2.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW2);
+
+btnSW3.update();
+if (btnSW3.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW3);
+if (btnSW3.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW3);
+
+btnSW4.update();
+if (btnSW4.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW4);
+if (btnSW4.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW4);
+
+// обязательно каждый loop:
+menu_start.update();
+И важно
+Уберите/закомментируйте старый блок вида:
+
+cpp Копировать
+if (!menu_start.isActive()) { ... } else { switch(menu_start.getState()) ... }
+Иначе вы одновременно используете старую и новую модель управления,и поведение станет непредсказуемым (в т.ч. “нет возврата”).
+
+2) Страница 2 (Str2) — установка часового пояса и запись в EEPROM
+Идея управления на Page2
+SW2:уменьшить cfg.tzTargetHours
+SW3:увеличшить cfg.tzTargetHours
+SW4:сохранить в EEPROM (ee.writeTzTargetHours(...))
+SW1:возврат на HOME (это уже делает Menu,если в Menu::onButtonPressed вы так настроили)
+Нужно,чтобы Menu.cpp видел ee и cfg
+Самый простой способ:объявить их extern в Menu.cpp.
+
+В начале Menu.cpp добавьте:
+
+cpp Копировать
+#include "AT24C128Settings.h"
+
+// ВАЖНО:в .ino эти объекты должны быть ГЛОБАЛЬНЫМИ (не static)
+extern AT24C128Settings ee;
+extern AT24C128Settings::Config cfg;
+Проверьте в .ino,что у вас именно так:
+
+cpp Копировать
+AT24C128Settings ee(Wire,0x50);
+AT24C128Settings::Config cfg;
+без static.
+
+Реализация Page2 (в Menu.cpp)
+Замените ваш class Page2 на такой:
+
+cpp Копировать
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _savedMsgMs = 0;
+ draw();
+ }
+
+ void update() override {
+ // гасим сообщение "SAVED" через 1 сек
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ draw();
+ }
+ }
+
+ void draw() override {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("PAGE 2:TIME ZONE",10,10);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ char buf1[32];
+ snprintf(buf1,sizeof(buf1),"TZ target:%d",(int)cfg.tzTargetHours);
+ d->drawString(buf1,10,60);
+
+ char buf2[32];
+ snprintf(buf2,sizeof(buf2),"TZ NTP :%d",(int)cfg.tzNtpHours);
+ d->drawString(buf2,10,90);
+
+ d->drawString("SW2 - TZ-",10,140);
+ d->drawString("SW3 - TZ+",10,165);
+ d->drawString("SW4 - SAVE",10,190);
+ d->drawString("SW1 - HOME",10,215);
+
+ if (_savedMsgMs) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",220,190);
+ }
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW2) {
+ cfg.tzTargetHours--;
+ clampTz(cfg.tzTargetHours);
+ draw();
+ }
+ else if (buttonID == BTN_SW3) {
+ cfg.tzTargetHours++;
+ clampTz(cfg.tzTargetHours);
+ draw();
+ }
+ else if (buttonID == BTN_SW4) {
+ // сохранить только tzTargetHours (и при желании tzNtpHours тоже)
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ // ee.writeTzNtpHours(cfg.tzNtpHours);
+
+ _savedMsgMs = millis();
+ draw();
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ uint32_t _savedMsgMs = 0;
+
+ static void clampTz(int8_t& tz) {
+ // разумные пределы
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+};
+Если хотите ещё и tzNtpHours менять на этой же странице — скажите,сделаю схему 
+(например,удержание SW2/SW3 меняет tzNtpHours).
+
+3) Важно:после сохранения TZ нужно “применить” конфиг
+Page2 записала cfg.tzTargetHours и EEPROM,но:
+
+если у вас пересчёт времени/RTC использует cfg.tzTargetHours — он начнёт действовать сразу (cfg уже изменён).
+если вам ещё надо применить cfg.tzNtpHours к sim.setNtpConfig(...) — это делается в .ino (например,функцией applyCfgToSim(cfg)).
+Самый простой способ:в .ino раз в секунду проверять “cfg изменился” или сделать глобальный
+ флаг gCfgChanged,который Page2 поднимает. Если нужно — дам готово.
+
+Быстрая проверка “возврат на HOME”
+После перехода на новую обработку кнопок (через onButtonPressed/Released) у вас:
+
+на активной странице SW1 должен вызывать backToStart() в Menu::onButtonPressed (как в моём коде),и вы вернётесь в MENU_IDLE (HOME).
+Если пришлёте ваш текущий Menu::onButtonPressed (как сейчас реализован),я точечно скажу,какая ветка мешает возврату.
+
+//------------------------------------------------------------------------------------------
+
+Нужно разделить Page2 на:
+
+static (рисуется один раз при onActivate()):заголовки/подписи/рамки
+dynamic (обновляется без fillScreen):только значения TZ и индикатор “SAVED”,и только если они изменились.
+Ниже — готовая замена Page2,которая перерисовывает только изменившиеся области через fillRect(...) + drawString(...)
+ и использует кэш предыдущих значений.
+
+Код предполагает,что Page2 остаётся внутри Menu.cpp как класс.
+
+Page2 (обновлённая,частичная перерисовка)
+cpp Копировать
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+ _lastTzTarget = 127;
+ _lastTzNtp = 127;
+ _lastSavedVisible = false;
+ _savedMsgMs = 0;
+
+ draw(); // нарисует static+dynamic
+ }
+
+ void update() override {
+ // скрыть "SAVED" через 1 сек
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic(); // только динамику
+ }
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW2) {
+ cfg.tzTargetHours--;
+ clampTz(cfg.tzTargetHours);
+ drawDynamic();
+ }
+ else if (buttonID == BTN_SW3) {
+ cfg.tzTargetHours++;
+ clampTz(cfg.tzTargetHours);
+ drawDynamic();
+ }
+ else if (buttonID == BTN_SW4) {
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ _savedMsgMs = millis();
+ drawDynamic();
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ bool _staticDrawn = false;
+
+ int8_t _lastTzTarget = 127;
+ int8_t _lastTzNtp = 127;
+
+ bool _lastSavedVisible = false;
+ uint32_t _savedMsgMs = 0;
+
+ // координаты областей (подберите под вашу верстку)
+ static const int X_LABEL = 10;
+ static const int X_VAL = 170;
+ static const int Y_TZT = 60;
+ static const int Y_TZN = 90;
+ static const int W_VAL = 140;
+ static const int H_VAL = 22;
+
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = 190;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 22;
+
+ void drawStatic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("PAGE 2:TIME ZONE",10,10);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString("TZ target:",X_LABEL,Y_TZT);
+ d->drawString("TZ NTP :",X_LABEL,Y_TZN);
+
+ d->drawString("SW2 - TZ-",10,140);
+ d->drawString("SW3 - TZ+",10,165);
+ d->drawString("SW4 - SAVE",10,190);
+ d->drawString("SW1 - HOME",10,215);
+
+ // очистим области динамики
+ d->fillRect(X_VAL,Y_TZT,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_TZN,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ }
+
+ void drawDynamic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ // TZ target (перерисовать только если изменился)
+ if (_lastTzTarget != cfg.tzTargetHours) {
+ _lastTzTarget = cfg.tzTargetHours;
+ d->fillRect(X_VAL,Y_TZT,W_VAL,H_VAL,TFT_BLACK);
+
+ char buf[16];
+ snprintf(buf,sizeof(buf),"%d",(int)_lastTzTarget);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_TZT);
+ }
+
+ // TZ NTP (если вы позже будете его менять — готово)
+ if (_lastTzNtp != cfg.tzNtpHours) {
+ _lastTzNtp = cfg.tzNtpHours;
+ d->fillRect(X_VAL,Y_TZN,W_VAL,H_VAL,TFT_BLACK);
+
+ char buf[16];
+ snprintf(buf,sizeof(buf),"%d",(int)_lastTzNtp);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_TZN);
+ }
+
+ // SAVED indicator
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+};
+Что это даёт
+При входе на страницу рисуется экран один раз (fillScreen только в drawStatic()).
+При изменении TZ перерисовывается только прямоугольник со значением.
+“SAVED” рисуется/стирается только при изменении видимости.
+Рекомендация (чтобы не было мерцания)
+Если шрифт большой/AA-шрифт — лучше использовать один и тот же setTextSize и не менять loadFont в динамике. 
+Если вы используете loadFont() — делайте это в drawStatic(),а в drawDynamic() не меняйте шрифт.
+
+Если покажете вашу фактическую разметку страницы 2 (координаты/шрифты),я подставлю размеры 
+прямоугольников под ваш шрифт так,чтобы точно затиралось значение без “хвостов”.
+
+/////////////////////////////////////////////////////////////////////////////////
+
+Причина “время на главной обновляется редко” почти всегда такая:на HOME вы рисуете gTimeStr,а 
+gTimeStr обновляется только когда пришло время от SIM800 (sim.hasNewTime()),то есть раз в минуту/10 минут — поэтому на экране “редко”.
+
+Чтобы HOME обновлялся каждые 500 мс,нужно периодически обновлять gTimeStr/gDateStr из RTC,а не ждать SIM800.
+
+1) Обновлять gTimeStr/gDateStr из RTC каждые 500 мс (в .ino)
+Добавьте в loop() (или отдельной функцией),например сразу после RTCTime now = rtc.getTime();:
+
+cpp Копировать
+// Обновлять строки времени для дисплея каждые 500 мс
+static uint32_t lastUiTimeMs = 0;
+if (millis() - lastUiTimeMs >= 500) {
+ lastUiTimeMs += 500;
+
+ RTCTime now = rtc.getTime();
+
+ snprintf(gDateStr,sizeof(gDateStr),"%02u.%02u.%04u",
+ (unsigned)now.dayOfMonth,(unsigned)now.month,(unsigned)now.year);
+ snprintf(gTimeStr,sizeof(gTimeStr),"%02u:%02u:%02u",
+ (unsigned)now.hour,(unsigned)now.minute,(unsigned)now.second);
+
+ gTimeUpdated = true; // если используете этот флаг
+ menu_start.invalidateHome(); // чтобы HOME перерисовал динамику сразу
+}
+Теперь даже если SIM800 обновляет RTC редко,HOME будет показывать “живые” секунды.
+
+2) Уменьшить расстояние между строками на главной странице (Menu.cpp)
+В drawHomeStatic() у вас сейчас примерно:
+
+DATE:y=50
+TIME:y=80
+NET :y=110
+SIG :y=140
+Сделайте компактнее,например:
+
+DATE:40
+TIME:65
+NET :90
+SIG :115
+И обязательно поменяйте те же Y в drawHomeDynamic() (где fillRect/drawString).
+
+Пример правки (в Menu.cpp)
+В начале Menu.cpp (удобно):
+
+cpp Копировать
+static const int Y_DATE = 40;
+static const int Y_TIME = 65;
+static const int Y_NET = 90;
+static const int Y_SIG = 115;
+static const int Y_VER = 160;
+
+Дальше в drawHomeStatic():
+
+cpp Копировать
+tft->drawString("DATE:",10,Y_DATE);
+tft->drawString("TIME:",10,Y_TIME);
+tft->drawString("NET :",10,Y_NET);
+tft->drawString("SIG :",10,Y_SIG);
+И в drawHomeDynamic():
+
+cpp Копировать
+tft->fillRect(80,Y_DATE,240,20,TFT_BLACK);
+tft->drawString(_lastDate,80,Y_DATE);
+
+tft->fillRect(80,Y_TIME,240,20,TFT_BLACK);
+tft->drawString(_lastTime,80,Y_TIME);
+
+tft->fillRect(80,Y_NET,240,20,TFT_BLACK);
+tft->drawString(...,80,Y_NET);
+
+tft->fillRect(80,Y_SIG,240,20,TFT_BLACK);
+tft->drawString(...,80,Y_SIG);
+Важный момент
+Вы уже поставили обновление HOME раз в 500 мс в Menu::update(). Но если gTimeStr не 
+меняется — перерисовки не будет (кеш сравнивает строки).
+ После пункта (1) строки будут меняться,и обновление станет “частым”.
+
+Если хотите — пришлите текущие drawHomeStatic()/drawHomeDynamic() (ваши координаты и шрифт/размер текста),и я подберу точные fillRect размеры,чтобы не оставалось “хвостов” от старых значений

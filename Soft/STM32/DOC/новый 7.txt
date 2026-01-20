@@ -1,0 +1,432 @@
+Ниже — обновлённые AT24C128Settings.h/.cpp с разделением тайм‑зон на:
+
+tzTargetHours — целевой часовой пояс для записи в RTC/отображения (например 2)
+tzNtpHours — часовой пояс для AT+CNTP (рекомендую 0,чтобы NTP всегда синхронизировал UTC)
+Также добавлены методы:
+
+readTzTargetHours()/writeTzTargetHours()
+readTzNtpHours()/writeTzNtpHours()
+Файлы совместимы с вашим Arduino_STM32 (libmaple) (requestFrom(addr,len) и write(uint8*,len)).
+
+AT24C128Settings.h (обновлённый)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class AT24C128Settings {
+public:
+ static constexpr uint8_t I2C_ADDR = 0x50;
+
+ struct Config {
+ char apn[32];
+ char user[32];
+ char pass[32];
+ char server[48];
+
+ int8_t tzTargetHours; // TZ для RTC/экрана (например 2)
+ int8_t tzNtpHours; // TZ для AT+CNTP (рекомендую 0=UTC)
+
+ bool enableFallback;
+ uint32_t periodMs;
+ };
+
+ explicit AT24C128Settings(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+ bool begin();
+
+ // strict=true:требует MAGIC+VERSION
+ // strict=false:читает поля по фикс. адресам даже если MAGIC не задан
+ bool load(Config& cfg,bool strict = false);
+
+ bool save(const Config& cfg,bool writeMagic = true);
+
+ static void defaults(Config& cfg);
+
+ // --- Низкоуровневые:поля по отдельности ---
+ bool writeAPN(const char* s);
+ bool writeUSER(const char* s);
+ bool writePASS(const char* s);
+ bool writeSERVER(const char* s);
+
+ bool writeTzTargetHours(int8_t tz);
+ bool writeTzNtpHours(int8_t tz);
+
+ bool writeEnableFallback(bool en);
+ bool writePeriodMs(uint32_t ms);
+
+ bool readAPN(char* out,size_t outSize);
+ bool readUSER(char* out,size_t outSize);
+ bool readPASS(char* out,size_t outSize);
+ bool readSERVER(char* out,size_t outSize);
+
+ bool readTzTargetHours(int8_t& tz);
+ bool readTzNtpHours(int8_t& tz);
+
+ bool readEnableFallback(bool& en);
+ bool readPeriodMs(uint32_t& ms);
+
+ // --- Фиксированные адреса (для внешних программ) ---
+ static constexpr uint16_t ADDR_MAGIC = 0x0000; // u32 'S8CF'
+ static constexpr uint16_t ADDR_VER = 0x0004; // u8 version
+ static constexpr uint16_t ADDR_ENFALL = 0x0005; // u8 0/1
+ static constexpr uint16_t ADDR_TZ_TARGET = 0x0006; // i8
+ static constexpr uint16_t ADDR_TZ_NTP = 0x0007; // i8 (новое)
+ static constexpr uint16_t ADDR_PERIOD = 0x0008; // u32 LE
+
+ static constexpr uint16_t ADDR_APN = 0x0100; // 32 bytes
+ static constexpr uint16_t ADDR_USER = 0x0120; // 32 bytes
+ static constexpr uint16_t ADDR_PASS = 0x0140; // 32 bytes
+ static constexpr uint16_t ADDR_SERVER = 0x0160; // 48 bytes
+
+private:
+ TwoWire* _w;
+ uint8_t _addr;
+
+ static constexpr uint8_t PAGE_SIZE = 64;
+ static constexpr uint32_t MAGIC = 0x46433853; // 'S''8''C''F' в LE
+ static constexpr uint8_t VERSION = 2; // было 1,теперь 2
+
+ bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+ bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool waitReady(uint32_t timeoutMs = 50);
+
+ bool readU32(uint16_t memAddr,uint32_t& v);
+ bool writeU32(uint16_t memAddr,uint32_t v);
+
+ bool readI8(uint16_t memAddr,int8_t& v);
+ bool writeI8(uint16_t memAddr,int8_t v);
+
+ bool readU8(uint16_t memAddr,uint8_t& v);
+ bool writeU8(uint16_t memAddr,uint8_t v);
+
+ bool readFixedString(uint16_t memAddr,char* out,size_t outSize,size_t maxFieldSize);
+ bool writeFixedString(uint16_t memAddr,const char* s,size_t maxFieldSize);
+
+ static bool isPrintableAscii(char c);
+ static bool isValidTextString(const char* s);
+};
+AT24C128Settings.cpp (обновлённый,libmaple совместимый)
+cpp Копировать
+#include "AT24C128Settings.h"
+
+AT24C128Settings::AT24C128Settings(TwoWire& w,uint8_t addr) :_w(&w),_addr(addr) {}
+
+bool AT24C128Settings::begin() {
+ _w->beginTransmission(_addr);
+ return (_w->endTransmission() == 0);
+}
+
+void AT24C128Settings::defaults(Config& cfg) {
+ memset(&cfg,0,sizeof(cfg));
+ strncpy(cfg.apn,"internet",sizeof(cfg.apn)-1);
+ strncpy(cfg.user,"mts",sizeof(cfg.user)-1);
+ strncpy(cfg.pass,"mts",sizeof(cfg.pass)-1);
+ strncpy(cfg.server,"pool.ntp.org",sizeof(cfg.server)-1);
+
+ cfg.tzTargetHours = 3; // пример:MSK
+ cfg.tzNtpHours = 0; // NTP всегда UTC (рекомендация)
+
+ cfg.enableFallback = true;
+ cfg.periodMs = 600000;
+}
+
+bool AT24C128Settings::load(Config& cfg,bool strict) {
+ defaults(cfg);
+
+ uint32_t mg = 0;
+ uint8_t ver = 0;
+
+ bool haveMagic = readU32(ADDR_MAGIC,mg) && (mg == MAGIC);
+ bool haveVer = readU8(ADDR_VER,ver) && (ver == VERSION);
+
+ if (strict && !(haveMagic && haveVer)) return false;
+
+ // строки
+ (void)readFixedString(ADDR_APN,cfg.apn,sizeof(cfg.apn),32);
+ (void)readFixedString(ADDR_USER,cfg.user,sizeof(cfg.user),32);
+ (void)readFixedString(ADDR_PASS,cfg.pass,sizeof(cfg.pass),32);
+ (void)readFixedString(ADDR_SERVER,cfg.server,sizeof(cfg.server),48);
+
+ if (!isValidTextString(cfg.apn)) strncpy(cfg.apn,"internet",sizeof(cfg.apn)-1);
+ if (!isValidTextString(cfg.server)) strncpy(cfg.server,"pool.ntp.org",sizeof(cfg.server)-1);
+
+ // TZ
+ int8_t tzT;
+ if (readI8(ADDR_TZ_TARGET,tzT)) cfg.tzTargetHours = tzT;
+
+ int8_t tzN;
+ if (readI8(ADDR_TZ_NTP,tzN)) cfg.tzNtpHours = tzN;
+ else cfg.tzNtpHours = 0; // если поле ещё не записывали
+
+ // enableFallback
+ uint8_t en;
+ if (readU8(ADDR_ENFALL,en)) cfg.enableFallback = (en != 0);
+
+ // period
+ uint32_t p;
+ if (readU32(ADDR_PERIOD,p) && p >= 1000 && p <= 86400000UL) cfg.periodMs = p;
+
+ return true;
+}
+
+bool AT24C128Settings::save(const Config& cfg,bool writeMagic) {
+ if (writeMagic) {
+ (void)writeU32(ADDR_MAGIC,MAGIC);
+ (void)writeU8(ADDR_VER,VERSION);
+ }
+
+ if (!writeU8(ADDR_ENFALL,cfg.enableFallback ? 1 :0)) return false;
+ if (!writeI8(ADDR_TZ_TARGET,cfg.tzTargetHours)) return false;
+ if (!writeI8(ADDR_TZ_NTP,cfg.tzNtpHours)) return false;
+ if (!writeU32(ADDR_PERIOD,cfg.periodMs)) return false;
+
+ if (!writeFixedString(ADDR_APN,cfg.apn,32)) return false;
+ if (!writeFixedString(ADDR_USER,cfg.user,32)) return false;
+ if (!writeFixedString(ADDR_PASS,cfg.pass,32)) return false;
+ if (!writeFixedString(ADDR_SERVER,cfg.server,48)) return false;
+
+ return true;
+}
+
+// ---- single field API ----
+bool AT24C128Settings::writeAPN(const char* s) { return writeFixedString(ADDR_APN,s,32); }
+bool AT24C128Settings::writeUSER(const char* s){ return writeFixedString(ADDR_USER,s,32); }
+bool AT24C128Settings::writePASS(const char* s){ return writeFixedString(ADDR_PASS,s,32); }
+bool AT24C128Settings::writeSERVER(const char* s){ return writeFixedString(ADDR_SERVER,s,48); }
+
+bool AT24C128Settings::writeTzTargetHours(int8_t tz){ return writeI8(ADDR_TZ_TARGET,tz); }
+bool AT24C128Settings::writeTzNtpHours(int8_t tz){ return writeI8(ADDR_TZ_NTP,tz); }
+
+bool AT24C128Settings::writeEnableFallback(bool en){ return writeU8(ADDR_ENFALL,en?1:0); }
+bool AT24C128Settings::writePeriodMs(uint32_t ms){ return writeU32(ADDR_PERIOD,ms); }
+
+bool AT24C128Settings::readAPN(char* out,size_t outSize){ return readFixedString(ADDR_APN,out,outSize,32); }
+bool AT24C128Settings::readUSER(char* out,size_t outSize){ return readFixedString(ADDR_USER,out,outSize,32); }
+bool AT24C128Settings::readPASS(char* out,size_t outSize){ return readFixedString(ADDR_PASS,out,outSize,32); }
+bool AT24C128Settings::readSERVER(char* out,size_t outSize){ return readFixedString(ADDR_SERVER,out,outSize,48); }
+
+bool AT24C128Settings::readTzTargetHours(int8_t& tz){ return readI8(ADDR_TZ_TARGET,tz); }
+bool AT24C128Settings::readTzNtpHours(int8_t& tz){ return readI8(ADDR_TZ_NTP,tz); }
+
+bool AT24C128Settings::readEnableFallback(bool& en){
+ uint8_t v; if(!readU8(ADDR_ENFALL,v)) return false;
+ en = (v != 0); return true;
+}
+bool AT24C128Settings::readPeriodMs(uint32_t& ms){ return readU32(ADDR_PERIOD,ms); }
+
+// ---- low level (Arduino_STM32/libmaple compatible) ----
+bool AT24C128Settings::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ if (_w->endTransmission() != 0) return false;
+
+ uint8_t got = _w->requestFrom((uint8_t)_addr,(int)len);
+ if (got != (uint8_t)len) return false;
+
+ for (size_t i = 0; i < len; i++) out[i] = (uint8_t)_w->read();
+ return true;
+}
+
+bool AT24C128Settings::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+ size_t off = 0;
+ while (off < len) {
+ uint16_t a = memAddr + (uint16_t)off;
+ uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+ size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+ if (!writePage(a,data + off,chunk)) return false;
+ if (!waitReady(50)) return false;
+ off += chunk;
+ }
+ return true;
+}
+
+bool AT24C128Settings::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ _w->write((uint8_t*)data,(int)len); // libmaple требует non-const
+ return (_w->endTransmission() == 0);
+}
+
+bool AT24C128Settings::waitReady(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while ((millis() - t0) < timeoutMs) {
+ _w->beginTransmission(_addr);
+ if (_w->endTransmission() == 0) return true;
+ delay(1);
+ }
+ return false;
+}
+
+bool AT24C128Settings::readU32(uint16_t memAddr,uint32_t& v) {
+ uint8_t b[4];
+ if (!readBytes(memAddr,b,4)) return false;
+ v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+ return true;
+}
+
+bool AT24C128Settings::writeU32(uint16_t memAddr,uint32_t v) {
+ uint8_t b[4] = {
+ (uint8_t)(v & 0xFF),
+ (uint8_t)((v >> 8) & 0xFF),
+ (uint8_t)((v >> 16) & 0xFF),
+ (uint8_t)((v >> 24) & 0xFF)
+ };
+ return writeBytes(memAddr,b,4);
+}
+
+bool AT24C128Settings::readI8(uint16_t memAddr,int8_t& v) {
+ uint8_t b;
+ if (!readBytes(memAddr,&b,1)) return false;
+ v = (int8_t)b;
+ return true;
+}
+
+bool AT24C128Settings::writeI8(uint16_t memAddr,int8_t v) {
+ uint8_t b = (uint8_t)v;
+ return writeBytes(memAddr,&b,1);
+}
+
+bool AT24C128Settings::readU8(uint16_t memAddr,uint8_t& v) {
+ return readBytes(memAddr,&v,1);
+}
+
+bool AT24C128Settings::writeU8(uint16_t memAddr,uint8_t v) {
+ return writeBytes(memAddr,&v,1);
+}
+
+bool AT24C128Settings::readFixedString(uint16_t memAddr,char* out,size_t outSize,size_t maxFieldSize) {
+ if (!out || outSize == 0) return false;
+ memset(out,0,outSize);
+
+ uint8_t buf[64];
+ if (maxFieldSize > sizeof(buf)) return false;
+ if (!readBytes(memAddr,buf,maxFieldSize)) return false;
+
+ size_t n = 0;
+ while (n < maxFieldSize && n + 1 < outSize) {
+ char c = (char)buf[n];
+ if (c == '\0') break;
+ if (!isPrintableAscii(c)) break; // режем мусор
+ out[n] = c;
+ n++;
+ }
+ out[n] = '\0';
+ return true;
+}
+
+bool AT24C128Settings::writeFixedString(uint16_t memAddr,const char* s,size_t maxFieldSize) {
+ uint8_t buf[64];
+ if (maxFieldSize > sizeof(buf)) return false;
+ memset(buf,0,maxFieldSize);
+
+ if (s && s[0]) {
+ size_t n = min(strlen(s),(size_t)(maxFieldSize - 1));
+ memcpy(buf,s,n);
+ buf[n] = '\0';
+ }
+ return writeBytes(memAddr,buf,maxFieldSize);
+}
+
+bool AT24C128Settings::isPrintableAscii(char c) {
+ return (c >= 32 && c <= 126);
+}
+
+bool AT24C128Settings::isValidTextString(const char* s) {
+ if (!s || !s[0]) return false;
+ for (size_t i = 0; s[i]; i++) {
+ if (!isPrintableAscii(s[i])) return false;
+ }
+ return true;
+}
+Как применить в вашем .ino (2 строки логики)
+1) В applyCfgToSim()
+Теперь используйте cfg.tzNtpHours (а не tzTarget):
+
+cpp Копировать
+ntp.tzHours = c.tzNtpHours; // для AT+CNTP (обычно 0)
+2) При записи времени в RTC используйте cfg.tzTargetHours
+(как мы обсуждали ранее:сеть даёт tzq_net,вы переводите в UTC,затем в target)
+
+cpp Копировать
+int tzq_target = (int)cfg.tzTargetHours * 4;
+Фиксированные адреса для внешних программ (важно)
+tzTargetHours = 0x0006 (int8)
+tzNtpHours = 0x0007 (int8)
+enableFallback = 0x0005 (u8)
+periodMs = 0x0008 (u32 LE)
+Если хотите,я могу дать короткий “EEPROM init” фрагмент,который один раз запишет 
+все поля дефолтами и очистит мусорные строки (APN/SERVER) — чтобы больше не видеть “кракозябры” при чтении.
+
+//--------------------------------------------------------------------
+
+Ниже — короткий “EEPROM init” фрагмент,который:
+
+проверяет наличие AT24C128 (0x50),
+загружает конфиг,
+если конфиг “пустой/старый/битый” (нет MAGIC+VERSION=2 или строки пустые) — записывает дефолты,
+при необходимости можно принудительно перезаписать всё один раз.
+Для версии AT24C128Settings с VERSION = 2 (tzTargetHours/tzNtpHours).
+
+Вариант A:инициализация “если не инициализировано”
+Вставьте в setup() сразу после Wire.begin():
+
+cpp Копировать
+AT24C128Settings::Config cfg;
+
+if (!ee.begin()) {
+ Serial.println(F("EEPROM AT24C128 not found"));
+} else {
+ // Попробуем "строго" (требует MAGIC+VERSION=2)
+ if (!ee.load(cfg,true)) {
+ Serial.println(F("EEPROM not initialized -> write defaults"));
+
+ AT24C128Settings::defaults(cfg);
+
+ // Пример ваших значений:
+ cfg.tzTargetHours = 2; // целевой TZ для RTC/экрана
+ cfg.tzNtpHours = 0; // NTP в UTC
+ cfg.periodMs = 600000; // 10 минут
+ cfg.enableFallback = false;
+
+ ee.save(cfg,true);
+ } else {
+ Serial.println(F("EEPROM OK (magic/version)"));
+ }
+}
+Вариант B:принудительная перезапись “один раз”
+Если хотите гарантированно очистить мусорные строки (APN/SERVER),временно поставьте true,прошивте один раз,потом верните false:
+
+cpp Копировать
+const bool FORCE_EEPROM_INIT = false; // <- на один запуск поставьте true
+
+AT24C128Settings::Config cfg;
+
+if (ee.begin()) {
+ if (FORCE_EEPROM_INIT) {
+ Serial.println(F("FORCE EEPROM INIT"));
+
+ AT24C128Settings::defaults(cfg);
+ cfg.tzTargetHours = 2;
+ cfg.tzNtpHours = 0;
+ cfg.periodMs = 600000;
+ cfg.enableFallback = false;
+
+ ee.save(cfg,true);
+ }
+
+ // теперь читаем (strict=false чтобы было совместимо с внешними записями)
+ ee.load(cfg,false);
+} else {
+ Serial.println(F("EEPROM AT24C128 not found"));
+ AT24C128Settings::defaults(cfg);
+}
+Примечание
+ee.load(cfg,true) удобно именно как проверка “инициализировано ли по нашему формату”.
+ee.load(cfg,false) оставляйте в рабочем режиме,чтобы конфиг можно было менять внешними программами (без записи MAGIC/VERSION).
+Если хотите,я могу добавить в AT24C128Settings метод bool isInitialized() (проверка magic/version),чтобы код в setup() стал ещё короче.
+
+

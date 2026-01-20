@@ -1,0 +1,469 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Ver.STM32F407V_26_01_09_00.ino" />
+    <ClCompile Include="AbstractModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AbstractModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Adafruit_Si7021.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Adafruit_Si7021.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AlarmDispatcher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AlarmDispatcher.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AlertModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AlertModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AT24CX.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AT24CX.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="BigRusFont.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Buzzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Buzzer.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CO2Module.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CO2Module.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CommandBuffer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CommandBuffer.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CommandParser.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CommandParser.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CompositeCommandsModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CompositeCommandsModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Configuration_DEBUG.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Configuration_Shared.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Configuration_STM32.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Configuration_STM32_HARDWARE.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CoreTransport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CoreTransport.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DelayedEvents.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DelayedEvents.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DeltaModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DeltaModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DHTSupport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DHTSupport.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DoorModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DoorModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DS18B20Query.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DS18B20Query.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DynamicSensorsResetModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DynamicSensorsResetModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ECModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ECModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="EEPROMSettingsModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="EEPROMSettingsModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Events.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Events.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Globals.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HTTPInterfaces.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HttpModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HttpModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HumidityGlobals.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HumidityModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HumidityModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="IconsFont.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="InteropStream.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="InteropStream.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="IoT.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="IoT.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="IoTModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="IoTModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="itoa.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="itoa.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LogicManageModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LogicManageModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LogModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LogModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LoRa.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LoRa.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LuminosityModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LuminosityModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MCP23S17.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MCP23S17.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MCPModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MCPModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Memory.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Memory.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ModuleController.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ModuleController.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="OneWireSTM.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="OneWireSTM.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PDUClasses.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PDUClasses.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PHModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PHModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PinModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PinModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PowerManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PowerManager.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PushButton.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PushButton.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ReservationModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ReservationModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="RTCSupport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="RTCSupport.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="RusFont.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SceneModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SceneModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ScheduleModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ScheduleModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SensorFont.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SensorFont2.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Settings.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SevenSegNumFontMDS.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SevenSegNumFontPlus.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SHT1x.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SHT1x.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Si7021Support.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Si7021Support.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SmallRusFont.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SMSModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SMSModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SoilMoistureModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SoilMoistureModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="StatModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="StatModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TempSensors.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TempSensors.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFTMenu.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFTMenu.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFTModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFTModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFTRus.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFTRus.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFT_Buttons_Rus.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFT_Buttons_Rus.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFT_Includes.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFT_Touch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TFT_Touch.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TimerModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TimerModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TinyVector.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="UniversalSensors.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="UniversalSensors.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Utils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Utils.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Various_Symbols_32x32.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WaterflowModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WaterflowModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WateringModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WateringModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WaterTankModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WaterTankModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WeatherStation.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WeatherStation.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WiFiModule.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WiFiModule.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ZeroStreamListener.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ZeroStreamListener.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="__vm\.Ver.STM32F407V_26_01_09_00.vsarduino.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

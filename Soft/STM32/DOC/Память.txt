@@ -1,0 +1,1969 @@
+Ниже — рабочая схема,как сделать:
+
+периодическую проверку SIM800C и несколько попыток включения,если он “упал” (через ваш SIM800TimeAsync и PWRKEY);
+подключить AT24C128 (I2C EEPROM) и хранить в ней параметры NtpConfig + periodMs;
+“передачу” даты/времени в TFT-часть — через глобальные строки (их может читать/рисовать ваш Menu/TFT код).
+Отдельные файлы для памяти:AT24C128Store.h/.cpp.
+
+1) AT24C128:файлы EEPROM
+AT24C128Store.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class AT24C128Store {
+public:
+ struct Config {
+ // фиксированные поля (чтобы хранить в EEPROM)
+ char apn[32];
+ char user[32];
+ char pass[32];
+ char server[48];
+ int8_t tzHours; // -12..+14 обычно
+ uint8_t enableFallback; // 0/1
+ uint32_t periodMs; // например 600000
+
+ // служебные
+ uint32_t magic;
+ uint8_t version;
+ uint16_t crc;
+ };
+
+ explicit AT24C128Store(uint8_t i2cAddr = 0x50,TwoWire& w = Wire);
+
+ bool begin();
+ bool load(Config& cfg);
+ bool save(const Config& cfg);
+
+ static void setDefaults(Config& cfg);
+
+private:
+ TwoWire* _wire;
+ uint8_t _addr;
+
+ static constexpr uint16_t kSizeBytes = 16384; // 128 kbit
+ static constexpr uint8_t kPageSize = 64;
+ static constexpr uint16_t kBaseAddr = 0;
+
+ static constexpr uint32_t kMagic = 0x804C128A;
+ static constexpr uint8_t kVersion = 1;
+
+ bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+ bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+
+ bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool waitReady(uint32_t timeoutMs = 20);
+
+ static uint16_t crc16_ccitt(const uint8_t* data,size_t len);
+ static uint16_t calcCrc(const Config& cfg);
+};
+AT24C128Store.cpp
+cpp Копировать
+#include "AT24C128Store.h"
+
+AT24C128Store::AT24C128Store(uint8_t i2cAddr,TwoWire& w)
+:_wire(&w),_addr(i2cAddr) {}
+
+bool AT24C128Store::begin() {
+ // Wire.begin() вызывайте в вашем setup() (у вас уже есть)
+ // Проверим,что устройство отвечает
+ _wire->beginTransmission(_addr);
+ return (_wire->endTransmission(true) == 0);
+}
+
+void AT24C128Store::setDefaults(Config& cfg) {
+ memset(&cfg,0,sizeof(cfg));
+ strncpy(cfg.apn,"internet",sizeof(cfg.apn) - 1);
+ strncpy(cfg.user,"mts",sizeof(cfg.user) - 1);
+ strncpy(cfg.pass,"mts",sizeof(cfg.pass) - 1);
+ strncpy(cfg.server,"pool.ntp.org",sizeof(cfg.server)- 1);
+ cfg.tzHours = 3;
+ cfg.enableFallback = 1;
+ cfg.periodMs = 600000;
+
+ cfg.magic = kMagic;
+ cfg.version = kVersion;
+ cfg.crc = calcCrc(cfg);
+}
+
+bool AT24C128Store::load(Config& cfg) {
+ Config tmp;
+ if (!readBytes(kBaseAddr,(uint8_t*)&tmp,sizeof(tmp))) return false;
+
+ if (tmp.magic != kMagic) return false;
+ if (tmp.version != kVersion) return false;
+
+ uint16_t crc = calcCrc(tmp);
+ if (crc != tmp.crc) return false;
+
+ cfg = tmp;
+ return true;
+}
+
+bool AT24C128Store::save(const Config& cfgIn) {
+ Config tmp = cfgIn;
+ tmp.magic = kMagic;
+ tmp.version = kVersion;
+ tmp.crc = calcCrc(tmp);
+
+ // простая запись целиком
+ return writeBytes(kBaseAddr,(const uint8_t*)&tmp,sizeof(tmp));
+}
+
+// --- low level I2C ---
+
+bool AT24C128Store::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+ if (memAddr + len > kSizeBytes) return false;
+
+ // set address pointer
+ _wire->beginTransmission(_addr);
+ _wire->write((uint8_t)(memAddr >> 8));
+ _wire->write((uint8_t)(memAddr & 0xFF));
+ if (_wire->endTransmission(false) != 0) return false;
+
+ size_t got = _wire->requestFrom((int)_addr,(int)len,(int)true);
+ if (got != len) return false;
+
+ for (size_t i = 0; i < len; i++) out[i] = (uint8_t)_wire->read();
+ return true;
+}
+
+bool AT24C128Store::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+ if (memAddr + len > kSizeBytes) return false;
+
+ size_t off = 0;
+ while (off < len) {
+ uint16_t a = memAddr + (uint16_t)off;
+ uint8_t pageOff = (uint8_t)(a % kPageSize);
+ size_t chunk = min((size_t)(kPageSize - pageOff),len - off);
+
+ if (!writePage(a,data + off,chunk)) return false;
+ if (!waitReady(50)) return false; // tWR
+ off += chunk;
+ }
+ return true;
+}
+
+bool AT24C128Store::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+ _wire->beginTransmission(_addr);
+ _wire->write((uint8_t)(memAddr >> 8));
+ _wire->write((uint8_t)(memAddr & 0xFF));
+ _wire->write(data,len);
+ return (_wire->endTransmission(true) == 0);
+}
+
+bool AT24C128Store::waitReady(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while ((millis() - t0) < timeoutMs) {
+ _wire->beginTransmission(_addr);
+ if (_wire->endTransmission(true) == 0) return true;
+ delay(1);
+ }
+ return false;
+}
+
+// --- CRC ---
+uint16_t AT24C128Store::crc16_ccitt(const uint8_t* data,size_t len) {
+ uint16_t crc = 0xFFFF;
+ for (size_t i = 0; i < len; i++) {
+ crc ^= (uint16_t)data[i] << 8;
+ for (uint8_t b = 0; b < 8; b++) {
+ crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) :(uint16_t)(crc << 1);
+ }
+ }
+ return crc;
+}
+
+uint16_t AT24C128Store::calcCrc(const Config& cfg) {
+ // CRC считаем по всему,кроме crc (и можно включить magic/version — так даже лучше)
+ Config tmp = cfg;
+ tmp.crc = 0;
+ return crc16_ccitt((const uint8_t*)&tmp,sizeof(tmp));
+}
+2) Загрузка настроек из AT24C128 и применение к SIM800TimeAsync
+Добавьте глобальные объекты (в вашем .ino):
+
+cpp Копировать
+#include "AT24C128Store.h"
+
+AT24C128Store eeprom(0x50,Wire);
+AT24C128Store::Config cfg;
+
+// Для TFT:сюда будем складывать актуальные строки
+char gSimDate[11] = "00.00.0000"; // dd.mm.yyyy
+char gSimTime[9] = "00:00:00"; // hh:mm:ss
+volatile bool gSimTimeUpdated = false;
+В setup() после Wire.begin();:
+
+cpp Копировать
+if (!eeprom.begin()) {
+ Serial.println(F("AT24C128 not found on I2C (0x50)"));
+ AT24C128Store::setDefaults(cfg); // всё равно зададим дефолты
+} else {
+ if (!eeprom.load(cfg)) {
+ Serial.println(F("EEPROM config invalid -> write defaults"));
+ AT24C128Store::setDefaults(cfg);
+ eeprom.save(cfg);
+ } else {
+ Serial.println(F("EEPROM config loaded"));
+ }
+}
+
+// применяем к SIM800TimeAsync
+SIM800TimeAsync::NtpConfig ntp;
+ntp.apn = cfg.apn;
+ntp.user = cfg.user;
+ntp.pass = cfg.pass;
+ntp.server = cfg.server;
+ntp.tzHours = cfg.tzHours;
+ntp.enableFallback = (cfg.enableFallback != 0);
+
+sim.setNtpConfig(ntp);
+sim.setPeriodMs(cfg.periodMs);
+3) Периодическая проверка SIM800C + несколько попыток включения
+Без доработки SIM800TimeAsync можно сделать “надстройку” в loop():
+
+если FSM ушёл в STOPPED → каждые N секунд делать sim.start() (это и есть попытка),
+ограничить количество попыток,
+если модем “живой” (FSM не STOPPED) — сбрасывать счётчик.
+Добавьте в .ino:
+
+cpp Копировать
+static uint8_t simRestartAttempts = 0;
+static uint32_t lastRestartTryMs = 0;
+
+static const uint8_t SIM_MAX_RESTART_ATTEMPTS = 5;
+static const uint32_t SIM_RESTART_BACKOFF_MS = 10000; // 10 сек между попытками
+static const uint32_t SIM_HEALTH_PING_MS = 60000; // раз в минуту дернуть activity
+static uint32_t lastHealthPingMs = 0;
+В конце loop():
+
+cpp Копировать
+// 1) Если SIM не занят и давно не было активности — попросим внеочередной запрос времени
+// (это одновременно "пинг" и проверка работоспособности,но без блокировок)
+if (!sim.isBusy() && (millis() - lastHealthPingMs) > SIM_HEALTH_PING_MS) {
+ lastHealthPingMs = millis();
+ sim.requestTimeNow();
+}
+
+// 2) Автовосстановление,если FSM упал в STOPPED
+if (strcmp(sim.stateName(),"STOPPED") == 0) {
+ if (simRestartAttempts < SIM_MAX_RESTART_ATTEMPTS &&
+ (millis() - lastRestartTryMs) > SIM_RESTART_BACKOFF_MS) {
+
+ lastRestartTryMs = millis();
+ simRestartAttempts++;
+
+ Serial.print(F("SIM800 STOPPED -> restart attempt "));
+ Serial.println(simRestartAttempts);
+
+ sim.start(); // FSM сам попробует AT,потом PWRKEY и т.д.
+ }
+} else {
+ // модем “в работе” — сбросить счетчик
+ simRestartAttempts = 0;
+}
+Если нужно “жёстче” (например,иногда модем зависает и FSM не падает в STOPPED),лучше 
+добавить в SIM800TimeAsync отдельный health-state с AT ping. Но ваш вариант уже будет 
+восстанавливаться,когда следующая команда не получит ответа и FSM уйдёт в STOPPED.
+
+4) Передача даты/времени в TFT часть (без привязки к вашему Menu API)
+В месте,где вы уже обрабатываете sim.hasNewTime() (один раз в loop!),после parseCCLK сформируйте строки:
+
+cpp Копировать
+if (sim.hasNewTime()) {
+ String raw = sim.lastCCLKRaw();
+
+ int year,month,day,hour,minute,second,tzq;
+ if (SIM800TimeAsync::parseCCLK(raw,year,month,day,hour,minute,second,tzq)) {
+
+ // ЛОКАЛЬНОЕ время пишем в RTC (как вы решили)
+ // + вычислить dayOfWeek под ваш DS3231 (1..7,где 7=Sun)
+ uint8_t dow0 = dow0_sun(year,month,day);
+ uint8_t dsDow = (dow0 == 0) ? 7 :dow0;
+
+ rtc.setTime((uint8_t)second,(uint8_t)minute,(uint8_t)hour,
+ dsDow,(uint8_t)day,(uint8_t)month,(uint16_t)year);
+
+ // Готовим строки для TFT
+ snprintf(gSimDate,sizeof(gSimDate),"%02d.%02d.%04d",day,month,year);
+ snprintf(gSimTime,sizeof(gSimTime),"%02d:%02d:%02d",hour,minute,second);
+ gSimTimeUpdated = true;
+
+ // Далее ваш TFT/Menu код может читать gSimDate/gSimTime и рисовать
+ // Например,если у вас есть метод:
+ // menu_start.setExternalTime(gSimDate,gSimTime);
+ }
+}
+А в вашей отрисовке TFT (где удобно) делайте:
+
+cpp Копировать
+if (gSimTimeUpdated) {
+ gSimTimeUpdated = false;
+ // Нарисовать на экране:
+ // tft.drawString(gSimDate,x,y,font);
+ // tft.drawString(gSimTime,x,y+...,font);
+}
+Вопросы,чтобы довести до “поставил и работает”
+AT24C128 у вас реально по адресу 0x50? (иногда A0/A1/A2 меняют адрес)
+Вы хотите,чтобы настройки можно было менять из меню и сразу сохранять в EEPROM? 
+(добавлю функции cfgSet... + eeprom.save(cfg)
+и перезапуск/применение sim.setNtpConfig на лету)
+Для “проверки работы SIM800C” достаточно ли такого сценария:если FSM STOPPED → 
+перезапуск,иначе периодически requestTimeNow()? Или нужен именно “AT ping” без регистрации/CCLK?
+
+//**************************************************************************************
+
+Нужен отдельный AT‑ping,который периодически проверяет “жив ли модем” (без ожидания сети/CCLK),и при провале запускает автовосстановление (несколько попыток включения через PWRKEY). Плюс — из меню менять параметры и сразу сохранять в AT24C128,а затем применять к sim.
+
+Ниже даю:
+
+актуальный SIM800TimeAsync.h с AT‑ping и автоподъёмом;
+что добавить/изменить в SIM800TimeAsync.cpp (ключевые блоки);
+как сделать “из меню → сохранить в EEPROM → применить”.
+1) Актуальный SIM800TimeAsync.h (с AT‑ping + recovery)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class SIM800TimeAsync {
+public:
+ struct NtpConfig {
+ const char* apn = nullptr;
+public:
+ const char* user = "";
+ const char* pass = "";
+ const char* server = "pool.ntp.org";
+ int tzHours = 0;
+ bool enableFallback = false;
+ };
+
+ SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,bool pwrkeyActiveHigh = true);
+
+ void begin(uint32_t baud);
+ void setDebug(Stream* dbg,bool logAT = true);
+
+ void start(); // запустить FSM (не блокирует)
+ void tick(); // вызывать часто
+
+ void setPeriodMs(uint32_t periodMs);
+ void setNtpConfig(const NtpConfig& cfg);
+ void requestTimeNow();
+
+ // --- AT ping / health ---
+ void setHealthPingMs(uint32_t periodMs); // 0 = выключить
+ void setMaxRecoveryAttempts(uint8_t n); // попытки PWRKEY
+ uint32_t lastAtOkMs() const; // когда последний раз AT был OK
+ uint8_t recoveryAttemptsUsed() const;
+
+ bool isReady() const;
+ bool isBusy() const;
+ const char* stateName() const;
+
+ bool hasNewTime();
+ String lastCCLKRaw() const;
+ bool lastTimeValid(int minYear = 2020) const;
+
+ static bool parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours);
+
+private:
+ enum class State :uint8_t {
+ STOPPED,
+
+ // health
+ AT_PING,
+
+ // bring-up / init
+ PROBE_AT,
+ PWRKEY_PULSE,
+ WAIT_URC,
+ WAIT_AT_READY,
+ INIT_ATE0,
+ INIT_CMEE,
+ INIT_CLTS,
+ INIT_SAVE,
+
+ // normal
+ IDLE,
+ WAIT_NETWORK,
+ REQ_CCLK,
+
+ // NTP fallback
+ NTP_CGATT,
+ NTP_SAPBR_CFG1,
+ NTP_SAPBR_CFG_APN,
+ NTP_SAPBR_CFG_USER,
+ NTP_SAPBR_CFG_PWD,
+ NTP_SAPBR_OPEN,
+ NTP_CNTPCID,
+ NTP_CNTP_SET,
+ NTP_CNTP_START,
+ NTP_SAPBR_CLOSE,
+ REQ_CCLK_AFTER_NTP
+ };
+
+ HardwareSerial& _sim;
+ uint8_t _pwrkeyPin;
+ bool _pwrkeyActiveHigh;
+
+ Stream* _dbg = nullptr;
+ bool _logAT = true;
+
+ // schedulers
+ uint32_t _periodMs = 60000;
+ uint32_t _nextPollMs = 0;
+ bool _forcePoll = false;
+
+ uint32_t _healthPingMs = 30000;
+ uint32_t _nextPingMs = 0;
+
+ // recovery
+ uint8_t _maxRecoveryAttempts = 5;
+ uint8_t _recoveryUsed = 0;
+
+ // ntp config
+ NtpConfig _ntp;
+
+ // fsm
+ State _st = State::STOPPED;
+ uint32_t _stEnterMs = 0;
+
+ // URC flags
+ bool _seenRDY = false;
+ bool _seenCallReady = false;
+ bool _seenSMSReady = false;
+
+ // AT transaction
+ bool _atPending = false;
+ const char* _atExpect = nullptr;
+ uint32_t _atDeadlineMs = 0;
+ String _atResp;
+ String _lineBuf;
+
+ bool _atOk = false;
+ bool _atErr = false;
+
+ // time
+ String _lastCCLK;
+ bool _newTime = false;
+
+ // health
+ uint32_t _lastAtOkMs = 0;
+
+private:
+ void _enter(State s);
+ void _serviceState();
+
+ void _readUartNonBlocking();
+ void _handleLine(const String& line);
+
+ void _startAT(const char* cmd,const char* expect,uint32_t timeoutMs);
+ bool _atDoneTimeout() const;
+ bool _atMatchedExpect() const;
+
+ void _pwrkeyIdle();
+ void _pwrkeyPress();
+ void _pwrkeyRelease();
+
+ static bool _isCCLKValid(const String& resp,int minYear);
+};
+2) Что изменить в SIM800TimeAsync.cpp (AT‑ping + recovery)
+2.1. Планирование AT‑ping в IDLE
+В начале _serviceState() в ветке if (_st == State::IDLE) добавьте:
+
+cpp Копировать
+const uint32_t now = millis();
+
+// AT ping по расписанию (если включен)
+if (_healthPingMs > 0 && (int32_t)(now - _nextPingMs) >= 0) {
+ _nextPingMs = now + _healthPingMs;
+ _enter(State::AT_PING);
+ return;
+}
+
+// запрос времени по расписанию
+if (_forcePoll || (int32_t)(now - _nextPollMs) >= 0) {
+ _forcePoll = false;
+ _nextPollMs = now + _periodMs;
+ _enter(State::WAIT_NETWORK);
+ return;
+}
+return;
+В begin() (или start()) инициализируйте _nextPingMs = millis() + _healthPingMs;
+
+2.2. Само состояние AT_PING
+В switch (_st) добавьте:
+
+cpp Копировать
+case State::AT_PING:
+ if (!_atPending) {
+ _startAT("AT","OK",1500);
+ } else {
+ if (_atOk) {
+ _lastAtOkMs = millis();
+ _recoveryUsed = 0; // модем жив — сброс попыток
+ _enter(State::IDLE);
+ } else if (_atDoneTimeout()) {
+ // AT не ответил -> recovery
+ if (_recoveryUsed < _maxRecoveryAttempts) {
+ _recoveryUsed++;
+ _enter(State::PWRKEY_PULSE); // попробуем включить/поднять
+ } else {
+ _enter(State::STOPPED);
+ }
+ }
+ }
+ return;
+Это именно “AT ping” без сети/CCLK.
+
+2.3. Важно:_handleLine() должен копить все строки при _atPending
+У вас уже был баг,когда вы копили только +CCLK:. Должно быть так:
+
+cpp Копировать
+if (_atPending) {
+ if (line == "OK") _atOk = true;
+ else if (line == "ERROR") _atErr = true;
+
+ if (line.startsWith("+CCLK:")) _lastCCLK = line;
+
+ _atResp += line;
+ _atResp += "\n";
+}
+И в REQ_CCLK событие _newTime=true поднимать только когда увидели +CCLK: (у вас это уже сделано/почти сделано).
+
+2.4. Публичные методы health/recovery
+Добавьте в .cpp:
+
+cpp Копировать
+void SIM800TimeAsync::setHealthPingMs(uint32_t periodMs) {
+ _healthPingMs = periodMs;
+ _nextPingMs = millis() + _healthPingMs;
+}
+
+void SIM800TimeAsync::setMaxRecoveryAttempts(uint8_t n) { _maxRecoveryAttempts = n; }
+
+uint32_t SIM800TimeAsync::lastAtOkMs() const { return _lastAtOkMs; }
+uint8_t SIM800TimeAsync::recoveryAttemptsUsed() const { return _recoveryUsed; }
+3) Меню:изменили настройки → сохранить в AT24C128 → применить в SIM
+Вы уже используете AT24C128Store (0x50). Делайте так:
+
+3.1. Функция “применить cfg → sim”
+cpp Копировать
+static void applyCfgToSim(const AT24C128Store::Config& cfg) {
+ SIM800TimeAsync::NtpConfig ntp;
+ ntp.apn = cfg.apn;
+ ntp.user = cfg.user;
+ ntp.pass = cfg.pass;
+ ntp.server = cfg.server;
+ ntp.tzHours = cfg.tzHours;
+ ntp.enableFallback = (cfg.enableFallback != 0);
+
+ sim.setNtpConfig(ntp);
+ sim.setPeriodMs(cfg.periodMs);
+}
+3.2. Функция “сохранить из меню”
+Вызывайте её из обработчика меню (когда пользователь нажал “Сохранить”):
+
+cpp Копировать
+static bool saveMenuSettingsToEepromAndApply(
+ const char* apn,const char* user,const char* pass,
+ const char* server,int tzHours,bool enableFallback,
+ uint32_t periodMs)
+{
+ // обновляем cfg
+ memset(cfg.apn,0,sizeof(cfg.apn));
+ strncpy(cfg.apn,apn ? apn :"",sizeof(cfg.apn)-1);
+
+ memset(cfg.user,0,sizeof(cfg.user));
+ strncpy(cfg.user,user ? user :"",sizeof(cfg.user)-1);
+
+ memset(cfg.pass,0,sizeof(cfg.pass));
+ strncpy(cfg.pass,pass ? pass :"",sizeof(cfg.pass)-1);
+
+ memset(cfg.server,0,sizeof(cfg.server));
+ strncpy(cfg.server,server ? server :"",sizeof(cfg.server)-1);
+
+ cfg.tzHours = (int8_t)tzHours;
+ cfg.enableFallback = enableFallback ? 1 :0;
+ cfg.periodMs = periodMs;
+
+ if (!eeprom.save(cfg)) return false;
+
+ applyCfgToSim(cfg);
+
+ // при желании можно инициировать внеочередной ping/запрос
+ sim.requestTimeNow();
+ return true;
+}
+4) “Передача даты и времени в файлы TFT дисплея”
+Самый простой способ без переделки Menu/TFT:держать глобальные строки,которые TFT-часть читает/рисует при обновлении:
+
+cpp Копировать
+char gSimDate[11] = "00.00.0000";
+char gSimTime[9] = "00:00:00";
+volatile bool gSimTimeUpdated = false;
+В месте,где у вас обработка sim.hasNewTime() и подтверждённый парсинг +CCLK (локальное время),делайте:
+
+cpp Копировать
+snprintf(gSimDate,sizeof(gSimDate),"%02d.%02d.%04d",day,month,year);
+snprintf(gSimTime,sizeof(gSimTime),"%02d:%02d:%02d",hour,minute,second);
+gSimTimeUpdated = true;
+А в вашем коде отрисовки (где удобно):
+
+cpp Копировать
+if (gSimTimeUpdated) {
+ gSimTimeUpdated = false;
+ // menu_start или прямой tft.drawString(...)
+}
+Два уточнения перед тем,как я соберу вам “компилируемый комплект”
+В вашем меню есть готовые поля/экраны для ввода строк (APN/USER/PASS/SERVER) и чисел (tzHours/period)? Если да — какие методы/события у Menu для “пользователь нажал сохранить”?
+Период AT‑ping какой хотите:например 30 секунд или 60 секунд?
+Если ответите,я выдам:
+
+полный SIM800TimeAsync.cpp с AT‑ping/recovery уже встроенными,
+и пример интеграции с вашими Menu/Buttons (вызов saveMenuSettingsToEepromAndApply() из конкретного места вашей логики).
+ меню пока нет готовых полей/экранов для ввода строк. 60 секунд. Предусмотреть возможность записи в память из других программ. Можно предусмотреть фиксированные адреса в памяти для различных настроек.
+
+
+Рассуждения
+
+Ниже — вариант хранения настроек в AT24C128 (0x50) с фиксированными адресами,чтобы их можно было записывать/менять из других программ (без CRC‑контейнеров и сложных структур). Внутри Arduino вы читаете эти поля и применяете к SIM800TimeAsync. Также предусмотрен AT‑ping раз в 60 секунд (в SIM800TimeAsync через setHealthPingMs(60000)).
+
+1) Карта памяти AT24C128 (фиксированные адреса)
+AT24C128 = 16 КБ (адреса 0x0000..0x3FFF). Предлагаю такой layout:
+
+Поле	Адрес	Размер	Формат
+MAGIC "S8CF"	0x0000	4	0x53 0x38 0x43 0x46
+VERSION	0x0004	1	0x01
+enableFallback	0x0005	1	0/1
+tzHours	0x0006	1	int8_t (например 3)
+reserved	0x0007	1	0
+periodMs	0x0008	4	uint32_t LE (например 600000)
+reserved	0x000C..0x00FF	244	0
+apn	0x0100	32	ASCII,\0-terminated
+user	0x0120	32	ASCII,\0-terminated
+pass	0x0140	32	ASCII,\0-terminated
+server	0x0160	48	ASCII,\0-terminated
+Запись из других программ: просто записывайте строки с завершающим \0 (или забивайте остаток нулями). Числа — в little-endian.
+
+MAGIC/VERSION необязательны:библиотека умеет “мягко” загрузить даже если MAGIC не установлен.
+
+2) Файлы для памяти:.h и .cpp
+AT24C128Settings.h
+cpp Копировать 
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class AT24C128Settings {
+public:
+ static constexpr uint8_t I2C_ADDR = 0x50;
+
+ struct Config {
+ char apn[32];
+ char user[32];
+ char pass[32];
+ char server[48];
+ int8_t tzHours;
+ bool enableFallback;
+ uint32_t periodMs;
+ };
+
+ explicit AT24C128Settings(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+ bool begin();
+
+ // strict=true:требует MAGIC+VERSION
+ // strict=false:читает поля по фикс. адресам даже если MAGIC не задан (для "других программ")
+ bool load(Config& cfg,bool strict = false);
+
+ bool save(const Config& cfg,bool writeMagic = true);
+
+ static void defaults(Config& cfg);
+
+ // --- Низкоуровневые:для записи отдельных полей (удобно и из меню потом) ---
+ bool writeAPN(const char* s);
+ bool writeUSER(const char* s);
+ bool writePASS(const char* s);
+ bool writeSERVER(const char* s);
+ bool writeTzHours(int8_t tz);
+ bool writeEnableFallback(bool en);
+ bool writePeriodMs(uint32_t ms);
+
+ bool readAPN(char* out,size_t outSize);
+ bool readUSER(char* out,size_t outSize);
+ bool readPASS(char* out,size_t outSize);
+ bool readSERVER(char* out,size_t outSize);
+ bool readTzHours(int8_t& tz);
+ bool readEnableFallback(bool& en);
+ bool readPeriodMs(uint32_t& ms);
+
+ // Адреса (фиксированные,для внешних программ)
+ static constexpr uint16_t ADDR_MAGIC = 0x0000;
+ static constexpr uint16_t ADDR_VER = 0x0004;
+ static constexpr uint16_t ADDR_ENFALL = 0x0005;
+ static constexpr uint16_t ADDR_TZ = 0x0006;
+ static constexpr uint16_t ADDR_PERIOD = 0x0008;
+
+ static constexpr uint16_t ADDR_APN = 0x0100;
+ static constexpr uint16_t ADDR_USER = 0x0120;
+ static constexpr uint16_t ADDR_PASS = 0x0140;
+ static constexpr uint16_t ADDR_SERVER = 0x0160;
+
+private:
+ TwoWire* _w;
+ uint8_t _addr;
+
+ static constexpr uint8_t PAGE_SIZE = 64;
+ static constexpr uint32_t MAGIC = 0x46433853; // 'S''8''C''F' в LE при чтении uint32
+ static constexpr uint8_t VERSION = 1;
+
+ bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+ bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool waitReady(uint32_t timeoutMs = 50);
+
+ bool readU32(uint16_t memAddr,uint32_t& v);
+ bool writeU32(uint16_t memAddr,uint32_t v);
+
+ bool readI8(uint16_t memAddr,int8_t& v);
+ bool writeI8(uint16_t memAddr,int8_t v);
+
+ bool readU8(uint16_t memAddr,uint8_t& v);
+ bool writeU8(uint16_t memAddr,uint8_t v);
+
+ bool readFixedString(uint16_t memAddr,char* out,size_t outSize,size_t maxFieldSize);
+ bool writeFixedString(uint16_t memAddr,const char* s,size_t maxFieldSize);
+
+ bool isLikelyBlankString(const char* s);
+};
+AT24C128Settings.cpp
+cpp Копировать
+#include "AT24C128Settings.h"
+
+AT24C128Settings::AT24C128Settings(TwoWire& w,uint8_t addr) :_w(&w),_addr(addr) {}
+
+bool AT24C128Settings::begin() {
+ _w->beginTransmission(_addr);
+ return (_w->endTransmission(true) == 0);
+}
+
+void AT24C128Settings::defaults(Config& cfg) {
+ memset(&cfg,0,sizeof(cfg));
+ strncpy(cfg.apn,"internet",sizeof(cfg.apn)-1);
+ strncpy(cfg.user,"mts",sizeof(cfg.user)-1);
+ strncpy(cfg.pass,"mts",sizeof(cfg.pass)-1);
+ strncpy(cfg.server,"pool.ntp.org",sizeof(cfg.server)-1);
+ cfg.tzHours = 3;
+ cfg.enableFallback = true;
+ cfg.periodMs = 600000;
+}
+
+bool AT24C128Settings::load(Config& cfg,bool strict) {
+ defaults(cfg);
+
+ uint32_t mg = 0;
+ uint8_t ver = 0;
+
+ bool haveMagic = readU32(ADDR_MAGIC,mg) && (mg == MAGIC);
+ bool haveVer = readU8(ADDR_VER,ver) && (ver == VERSION);
+
+ if (strict && !(haveMagic && haveVer)) return false;
+
+ // читаем поля независимо (это и есть совместимость "с другими программами")
+ (void)readFixedString(ADDR_APN,cfg.apn,sizeof(cfg.apn),32);
+ (void)readFixedString(ADDR_USER,cfg.user,sizeof(cfg.user),32);
+ (void)readFixedString(ADDR_PASS,cfg.pass,sizeof(cfg.pass),32);
+ (void)readFixedString(ADDR_SERVER,cfg.server,sizeof(cfg.server),48);
+
+ int8_t tz;
+ if (readI8(ADDR_TZ,tz)) cfg.tzHours = tz;
+
+ uint8_t en;
+ if (readU8(ADDR_ENFALL,en)) cfg.enableFallback = (en != 0);
+
+ uint32_t p;
+ if (readU32(ADDR_PERIOD,p) && p >= 1000 && p <= 86400000UL) cfg.periodMs = p;
+
+ // если строки пустые/мусор — оставляем дефолты
+ if (isLikelyBlankString(cfg.apn)) strncpy(cfg.apn,"internet",sizeof(cfg.apn)-1);
+ if (isLikelyBlankString(cfg.server)) strncpy(cfg.server,"pool.ntp.org",sizeof(cfg.server)-1);
+
+ return true;
+}
+
+bool AT24C128Settings::save(const Config& cfg,bool writeMagic) {
+ if (writeMagic) {
+ (void)writeU32(ADDR_MAGIC,MAGIC);
+ (void)writeU8(ADDR_VER,VERSION);
+ }
+
+ if (!writeU8(ADDR_ENFALL,cfg.enableFallback ? 1 :0)) return false;
+ if (!writeI8(ADDR_TZ,cfg.tzHours)) return false;
+ if (!writeU32(ADDR_PERIOD,cfg.periodMs)) return false;
+
+ if (!writeFixedString(ADDR_APN,cfg.apn,32)) return false;
+ if (!writeFixedString(ADDR_USER,cfg.user,32)) return false;
+ if (!writeFixedString(ADDR_PASS,cfg.pass,32)) return false;
+ if (!writeFixedString(ADDR_SERVER,cfg.server,48)) return false;
+
+ return true;
+}
+
+// ----- helpers:single fields -----
+bool AT24C128Settings::writeAPN(const char* s) { return writeFixedString(ADDR_APN,s,32); }
+bool AT24C128Settings::writeUSER(const char* s){ return writeFixedString(ADDR_USER,s,32); }
+bool AT24C128Settings::writePASS(const char* s){ return writeFixedString(ADDR_PASS,s,32); }
+bool AT24C128Settings::writeSERVER(const char* s){ return writeFixedString(ADDR_SERVER,s,48); }
+bool AT24C128Settings::writeTzHours(int8_t tz){ return writeI8(ADDR_TZ,tz); }
+bool AT24C128Settings::writeEnableFallback(bool en){ return writeU8(ADDR_ENFALL,en?1:0); }
+bool AT24C128Settings::writePeriodMs(uint32_t ms){ return writeU32(ADDR_PERIOD,ms); }
+
+bool AT24C128Settings::readAPN(char* out,size_t outSize){ return readFixedString(ADDR_APN,out,outSize,32); }
+bool AT24C128Settings::readUSER(char* out,size_t outSize){ return readFixedString(ADDR_USER,out,outSize,32); }
+bool AT24C128Settings::readPASS(char* out,size_t outSize){ return readFixedString(ADDR_PASS,out,outSize,32); }
+bool AT24C128Settings::readSERVER(char* out,size_t outSize){ return readFixedString(ADDR_SERVER,out,outSize,48); }
+bool AT24C128Settings::readTzHours(int8_t& tz){ return readI8(ADDR_TZ,tz); }
+bool AT24C128Settings::readEnableFallback(bool& en){ uint8_t v; if(!readU8(ADDR_ENFALL,v)) return false; en = (v!=0); return true; }
+bool AT24C128Settings::readPeriodMs(uint32_t& ms){ return readU32(ADDR_PERIOD,ms); }
+
+// ----- low level -----
+bool AT24C128Settings::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ if (_w->endTransmission(false) != 0) return false;
+
+ size_t got = _w->requestFrom((int)_addr,(int)len,(int)true);
+ if (got != len) return false;
+ for (size_t i=0;i<len;i++) out[i] = (uint8_t)_w->read();
+ return true;
+}
+
+bool AT24C128Settings::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+ size_t off = 0;
+ while (off < len) {
+ uint16_t a = memAddr + (uint16_t)off;
+ uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+ size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+ if (!writePage(a,data + off,chunk)) return false;
+ if (!waitReady(50)) return false;
+ off += chunk;
+ }
+ return true;
+}
+
+bool AT24C128Settings::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ _w->write(data,len);
+ return (_w->endTransmission(true) == 0);
+}
+
+bool AT24C128Settings::waitReady(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while ((millis() - t0) < timeoutMs) {
+ _w->beginTransmission(_addr);
+ if (_w->endTransmission(true) == 0) return true;
+ delay(1);
+ }
+ return false;
+}
+
+bool AT24C128Settings::readU32(uint16_t memAddr,uint32_t& v) {
+ uint8_t b[4];
+ if (!readBytes(memAddr,b,4)) return false;
+ v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+ return true;
+}
+
+bool AT24C128Settings::writeU32(uint16_t memAddr,uint32_t v) {
+ uint8_t b[4] = {
+ (uint8_t)(v & 0xFF),
+ (uint8_t)((v >> 8) & 0xFF),
+ (uint8_t)((v >> 16) & 0xFF),
+ (uint8_t)((v >> 24) & 0xFF)
+ };
+ return writeBytes(memAddr,b,4);
+}
+
+bool AT24C128Settings::readI8(uint16_t memAddr,int8_t& v) {
+ uint8_t b;
+ if (!readBytes(memAddr,&b,1)) return false;
+ v = (int8_t)b;
+ return true;
+}
+bool AT24C128Settings::writeI8(uint16_t memAddr,int8_t v) {
+ uint8_t b = (uint8_t)v;
+ return writeBytes(memAddr,&b,1);
+}
+
+bool AT24C128Settings::readU8(uint16_t memAddr,uint8_t& v) {
+ return readBytes(memAddr,&v,1);
+}
+bool AT24C128Settings::writeU8(uint16_t memAddr,uint8_t v) {
+ return writeBytes(memAddr,&v,1);
+}
+
+bool AT24C128Settings::readFixedString(uint16_t memAddr,char* out,size_t outSize,size_t maxFieldSize) {
+ if (!out || outSize == 0) return false;
+ memset(out,0,outSize);
+
+ // читаем ровно maxFieldSize
+ uint8_t buf[64]; // хватит для 48
+ if (maxFieldSize > sizeof(buf)) return false;
+ if (!readBytes(memAddr,buf,maxFieldSize)) return false;
+
+ // копируем до '\0'
+ size_t n = 0;
+ while (n < maxFieldSize && n + 1 < outSize) {
+ char c = (char)buf[n];
+ if (c == '\0') break;
+ out[n] = c;
+ n++;
+ }
+ out[n] = '\0';
+ return true;
+}
+
+bool AT24C128Settings::writeFixedString(uint16_t memAddr,const char* s,size_t maxFieldSize) {
+ uint8_t buf[64];
+ if (maxFieldSize > sizeof(buf)) return false;
+ memset(buf,0,maxFieldSize);
+
+ if (s && s[0]) {
+ // копируем,оставляя место под '\0'
+ size_t n = min(strlen(s),(size_t)(maxFieldSize - 1));
+ memcpy(buf,s,n);
+ buf[n] = '\0';
+ }
+ return writeBytes(memAddr,buf,maxFieldSize);
+}
+
+bool AT24C128Settings::isLikelyBlankString(const char* s) {
+ if (!s) return true;
+ // пусто или стерто (0xFF часто при "пустой" EEPROM)
+ if (s[0] == '\0') return true;
+ if ((uint8_t)s[0] == 0xFF) return true;
+ return false;
+}
+3) Применение настроек к SIM800TimeAsync + AT ping 60 секунд
+В вашем setup() после Wire.begin():
+
+cpp Копировать
+#include "AT24C128Settings.h"
+AT24C128Settings ee(Wire,0x50);
+AT24C128Settings::Config cfg;
+
+...
+
+ee.begin();
+ee.load(cfg,false); // strict=false:читает даже если MAGIC не прописан внешней программой
+
+SIM800TimeAsync::NtpConfig ntp;
+ntp.apn = cfg.apn;
+ntp.user = cfg.user;
+ntp.pass = cfg.pass;
+ntp.server = cfg.server;
+ntp.tzHours = cfg.tzHours;
+ntp.enableFallback = cfg.enableFallback;
+
+sim.setNtpConfig(ntp);
+sim.setPeriodMs(cfg.periodMs);
+
+// AT ping раз в 60 секунд
+sim.setHealthPingMs(60000);
+sim.setMaxRecoveryAttempts(5);
+
+sim.start();
+4) Запись настроек “из других программ”
+Достаточно I2C записи в EEPROM:
+
+Адрес устройства:0x50
+Первые 2 байта в посылке:memAddrHi,memAddrLo
+Далее данные (учтите page=64,между page-записями нужен wait tWR ~5–10 ms или polling ACK)
+Пример:чтобы записать APN internet:
+
+memAddr = 0x0100
+данные:{'i','n','t','e','r','n','e','t',0} + можно добить нулями до 32 байт
+5) “Передача даты и времени в TFT”
+Так как у вас пока нет экранов ввода,самый простой интерфейс для TFT-модулей:
+
+Создайте отдельный заголовок,например TimeFeed.h:
+
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// обновляется в обработчике sim.hasNewTime() или rtc.getTime()
+extern char gDateStr[11]; // "dd.mm.yyyy"
+extern char gTimeStr[9]; // "hh:mm:ss"
+extern volatile bool gTimeStrUpdated;
+В одном .cpp/.ino определите:
+
+cpp Копировать
+char gDateStr[11] = "00.00.0000";
+char gTimeStr[9] = "00:00:00";
+volatile bool gTimeStrUpdated = false;
+И при обновлении времени (после parseCCLK или после чтения rtc) заполняйте gDateStr/gTimeStr,а 
+TFT часть просто рисует их когда gTimeStrUpdated==true.
+
+Что мне нужно от вас для точного “вклеивания”
+Покажите ваш текущий SIM800TimeAsync.cpp (версию с AT‑ping,которую вы сейчас используете)
+ или скажите:уже внедрён AT_PING/Recovery или ещё нет? Если ещё нет — я дам полностью готовый SIM800TimeAsync.cpp 
+с состоянием AT_PING (60 сек) и попытками PWRKEY_PULSE (5 раз).
+
+//---------------------------------------------------------------------------------------
+
+Ниже — полностью готовый SIM800TimeAsync.cpp с:
+
+неблокирующей FSM как у вас;
+AT‑ping (AT health check) раз в 60 секунд (включается через setHealthPingMs(60000); по умолчанию 60000);
+автовосстановлением:если AT не отвечает — выполняются несколько попыток включения через PWRKEY_PULSE (кол-во задаётся setMaxRecoveryAttempts(n),по умолчанию 5);
+STOPPED не “вечный”:раз в 60 секунд делает авто‑попытку подняться.
+Важно:этот .cpp требует актуального SIM800TimeAsync.h с:
+
+состоянием AT_PING в enum State,
+полями _healthPingMs,_nextPingMs,_lastAtOkMs,_maxRecoveryAttempts,_recoveryUsed,
+методами setHealthPingMs,setMaxRecoveryAttempts,lastAtOkMs,recoveryAttemptsUsed().
+Если у вас заголовок ещё без этих добавлений — скажите,я дам готовый .h под этот .cpp.
+
+SIM800TimeAsync.cpp
+cpp Копировать
+#include "SIM800TimeAsync.h"
+
+SIM800TimeAsync::SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,bool pwrkeyActiveHigh)
+ :_sim(sim)
+ ,_pwrkeyPin(pwrkeyPin)
+ ,_pwrkeyActiveHigh(pwrkeyActiveHigh)
+{}
+
+void SIM800TimeAsync::begin(uint32_t baud) {
+ pinMode(_pwrkeyPin,OUTPUT);
+ _pwrkeyIdle(); // не "держать кнопку"
+ _sim.begin(baud);
+
+ const uint32_t now = millis();
+ _nextPollMs = now + _periodMs;
+ _nextPingMs = now + _healthPingMs;
+}
+
+void SIM800TimeAsync::setDebug(Stream* dbg,bool logAT) {
+ _dbg = dbg;
+ _logAT = logAT;
+}
+
+void SIM800TimeAsync::setPeriodMs(uint32_t periodMs) {
+ _periodMs = periodMs;
+ _nextPollMs = millis() + _periodMs;
+}
+
+void SIM800TimeAsync::setNtpConfig(const NtpConfig& cfg) {
+ _ntp = cfg;
+}
+
+void SIM800TimeAsync::setHealthPingMs(uint32_t periodMs) {
+ _healthPingMs = periodMs;
+ _nextPingMs = millis() + _healthPingMs;
+}
+
+void SIM800TimeAsync::setMaxRecoveryAttempts(uint8_t n) {
+ _maxRecoveryAttempts = n;
+}
+
+uint32_t SIM800TimeAsync::lastAtOkMs() const {
+ return _lastAtOkMs;
+}
+
+uint8_t SIM800TimeAsync::recoveryAttemptsUsed() const {
+ return _recoveryUsed;
+}
+
+void SIM800TimeAsync::start() {
+ _recoveryUsed = 0;
+ _enter(State::PROBE_AT);
+}
+
+void SIM800TimeAsync::requestTimeNow() {
+ _forcePoll = true;
+}
+
+bool SIM800TimeAsync::isReady() const {
+ return _st == State::IDLE
+ || _st == State::WAIT_NETWORK
+ || _st == State::REQ_CCLK
+ || (uint8_t)_st > (uint8_t)State::INIT_SAVE;
+}
+
+bool SIM800TimeAsync::isBusy() const {
+ return _st != State::IDLE && _st != State::STOPPED;
+}
+
+const char* SIM800TimeAsync::stateName() const {
+ switch (_st) {
+ case State::STOPPED:return "STOPPED";
+
+ case State::AT_PING:return "AT_PING";
+
+ case State::PROBE_AT:return "PROBE_AT";
+ case State::PWRKEY_PULSE:return "PWRKEY_PULSE";
+ case State::WAIT_URC:return "WAIT_URC";
+ case State::WAIT_AT_READY:return "WAIT_AT_READY";
+ case State::INIT_ATE0:return "INIT_ATE0";
+ case State::INIT_CMEE:return "INIT_CMEE";
+ case State::INIT_CLTS:return "INIT_CLTS";
+ case State::INIT_SAVE:return "INIT_SAVE";
+ case State::IDLE:return "IDLE";
+ case State::WAIT_NETWORK:return "WAIT_NETWORK";
+ case State::REQ_CCLK:return "REQ_CCLK";
+ case State::NTP_CGATT:return "NTP_CGATT";
+ case State::NTP_SAPBR_CFG1:return "NTP_SAPBR_CFG1";
+ case State::NTP_SAPBR_CFG_APN:return "NTP_SAPBR_CFG_APN";
+ case State::NTP_SAPBR_CFG_USER:return "NTP_SAPBR_CFG_USER";
+ case State::NTP_SAPBR_CFG_PWD:return "NTP_SAPBR_CFG_PWD";
+ case State::NTP_SAPBR_OPEN:return "NTP_SAPBR_OPEN";
+ case State::NTP_CNTPCID:return "NTP_CNTPCID";
+ case State::NTP_CNTP_SET:return "NTP_CNTP_SET";
+ case State::NTP_CNTP_START:return "NTP_CNTP_START";
+ case State::NTP_SAPBR_CLOSE:return "NTP_SAPBR_CLOSE";
+ case State::REQ_CCLK_AFTER_NTP:return "REQ_CCLK_AFTER_NTP";
+ }
+ return "?";
+}
+
+bool SIM800TimeAsync::hasNewTime() {
+ bool v = _newTime;
+ _newTime = false;
+ return v;
+}
+
+String SIM800TimeAsync::lastCCLKRaw() const {
+ return _lastCCLK;
+}
+
+bool SIM800TimeAsync::lastTimeValid(int minYear) const {
+ return _isCCLKValid(_lastCCLK,minYear);
+}
+
+void SIM800TimeAsync::tick() {
+ _readUartNonBlocking();
+ _serviceState();
+}
+
+// ---------------- debug ----------------
+void SIM800TimeAsync::_log(const __FlashStringHelper* s) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->println(s);
+}
+
+void SIM800TimeAsync::_logKV(const __FlashStringHelper* k,const String& v) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(k); _dbg->println(v);
+}
+
+void SIM800TimeAsync::_logATLine(const __FlashStringHelper* prefix,const String& s) {
+ if (!_dbg || !_logAT) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(prefix); _dbg->println(s);
+}
+
+// ---------------- state ----------------
+void SIM800TimeAsync::_enter(State s) {
+ // Сброс AT-транзакции при переходе состояния
+ _atPending = false;
+ _atExpect = nullptr;
+ _atResp = "";
+ _atDeadlineMs = 0;
+ _atOk = false;
+ _atErr = false;
+
+ _st = s;
+ _stEnterMs = millis();
+
+ if (_dbg) {
+ _dbg->print('['); _dbg->print(_stEnterMs); _dbg->print("] ");
+ _dbg->print(F("STATE -> "));
+ _dbg->println(stateName());
+ }
+}
+
+void SIM800TimeAsync::_serviceState() {
+ const uint32_t now = millis();
+
+ // Планировщик (только в IDLE)
+ if (_st == State::IDLE) {
+
+ // 1) AT ping (health check)
+ if (_healthPingMs > 0 && (int32_t)(now - _nextPingMs) >= 0) {
+ _nextPingMs = now + _healthPingMs;
+ _enter(State::AT_PING);
+ return;
+ }
+
+ // 2) Запрос времени по расписанию
+ if (_forcePoll || (int32_t)(now - _nextPollMs) >= 0) {
+ _forcePoll = false;
+ _nextPollMs = now + _periodMs;
+ _enter(State::WAIT_NETWORK);
+ return;
+ }
+
+ return;
+ }
+
+ switch (_st) {
+
+ case State::STOPPED:
+ // авто-повтор раз в 60 секунд
+ if ((now - _stEnterMs) > 60000) {
+ _recoveryUsed = 0;
+ _enter(State::PROBE_AT);
+ }
+ return;
+
+ // ---- health ping ----
+ case State::AT_PING:
+ if (!_atPending) {
+ _startAT("AT","OK",1500);
+ } else {
+ if (_atOk) {
+ _recoveryUsed = 0; // модем жив
+ _enter(State::IDLE);
+ } else if (_atDoneTimeout()) {
+ // AT не ответил -> попытки "включить/поднять" через PWRKEY
+ if (_recoveryUsed < _maxRecoveryAttempts) {
+ _recoveryUsed++;
+ _enter(State::PWRKEY_PULSE);
+ } else {
+ _enter(State::STOPPED);
+ }
+ }
+ }
+ return;
+
+ // ---- bring-up / init ----
+ case State::PROBE_AT:
+ if (!_atPending) {
+ _startAT("AT","OK",1500);
+ } else {
+ if (_atOk) {
+ _recoveryUsed = 0;
+ _enter(State::INIT_ATE0);
+ } else if (_atDoneTimeout()) {
+ // Если AT не отвечает — пробуем PWRKEY (с учётом лимита попыток)
+ if (_recoveryUsed < _maxRecoveryAttempts) {
+ _recoveryUsed++;
+ _enter(State::PWRKEY_PULSE);
+ } else {
+ _enter(State::STOPPED);
+ }
+ }
+ }
+ return;
+
+ case State::PWRKEY_PULSE:
+ // “нажатие” без delay:50мс idle,затем ~1.25с press
+ if (now - _stEnterMs < 50) {
+ _pwrkeyIdle();
+ } else if (now - _stEnterMs < 1300) {
+ _pwrkeyPress();
+ } else {
+ _pwrkeyRelease();
+ _seenRDY = _seenCallReady = _seenSMSReady = false;
+ _enter(State::WAIT_URC);
+ }
+ return;
+
+ case State::WAIT_URC:
+ // ждём URC до 8 сек,но даже если не увидим - потом проверим AT
+ if (_seenRDY || _seenCallReady || _seenSMSReady || (now - _stEnterMs) > 8000) {
+ _enter(State::WAIT_AT_READY);
+ }
+ return;
+
+ case State::WAIT_AT_READY:
+ if (!_atPending) {
+ _startAT("AT","OK",12000);
+ } else {
+ if (_atOk) {
+ _recoveryUsed = 0;
+ _enter(State::INIT_ATE0);
+ } else if (_atDoneTimeout()) {
+ // ещё одна попытка PWRKEY,если не исчерпали лимит
+ if (_recoveryUsed < _maxRecoveryAttempts) {
+ _recoveryUsed++;
+ _enter(State::PWRKEY_PULSE);
+ } else {
+ _enter(State::STOPPED);
+ }
+ }
+ }
+ return;
+
+ case State::INIT_ATE0:
+ if (!_atPending) _startAT("ATE0","OK",1500);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_CMEE);
+ return;
+
+ case State::INIT_CMEE:
+ if (!_atPending) _startAT("AT+CMEE=2","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_CLTS);
+ return;
+
+ case State::INIT_CLTS:
+ if (!_atPending) _startAT("AT+CLTS=1","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_SAVE);
+ return;
+
+ case State::INIT_SAVE:
+ if (!_atPending) _startAT("AT&W","OK",3000);
+ else if (_atOk || _atDoneTimeout()) {
+ // после init сбросим лимит попыток,и сразу вернёмся в IDLE
+ _recoveryUsed = 0;
+ _enter(State::IDLE);
+ }
+ return;
+
+ // ---- normal flow ----
+ case State::WAIT_NETWORK:
+ if (!_atPending) {
+ _startAT("AT+CREG?","+CREG:",1500);
+ } else {
+ if (_atDoneTimeout()) {
+ // общий таймаут ожидания сети:60с
+ if (now - _stEnterMs > 60000) {
+ _enter(State::IDLE);
+ } else {
+ // повторим без блокировки
+ _atPending = false;
+ _atResp = "";
+ _atOk = _atErr = false;
+ }
+ } else if (_atMatchedExpect()) {
+ if (_atResp.indexOf(",1") >= 0 || _atResp.indexOf(",5") >= 0) {
+ _enter(State::REQ_CCLK);
+ } else {
+ // ещё не зарегистрирован — повторим
+ _atPending = false;
+ _atResp = "";
+ _atOk = _atErr = false;
+ }
+ }
+ }
+ return;
+
+ case State::REQ_CCLK:
+ if (!_atPending) {
+ // очистим предыдущую строку времени,чтобы не "прилипала"
+ _lastCCLK = "";
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ // для CCLK считаем успехом только наличие +CCLK:
+ if (_atMatchedExpect()) {
+ if (_lastCCLK.length() == 0) _lastCCLK = _atResp; // запасной вариант
+
+ if (_lastCCLK.indexOf("+CCLK:") >= 0) _newTime = true;
+
+ if (!_isCCLKValid(_lastCCLK,2020) && _ntp.enableFallback && _ntp.apn && _ntp.apn[0]) {
+ _enter(State::NTP_CGATT);
+ } else {
+ _enter(State::IDLE);
+ }
+ } else if (_atDoneTimeout()) {
+ _enter(State::IDLE);
+ }
+ }
+ return;
+
+ // -------- NTP fallback (не блокирует) --------
+ case State::NTP_CGATT:
+ if (!_atPending) _startAT("AT+CGATT?","+CGATT:",2000);
+ else {
+ if (_atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_CLOSE);
+ return;
+ }
+ if (_atMatchedExpect()) {
+ if (_atResp.indexOf("+CGATT:1") >= 0) {
+ _enter(State::NTP_SAPBR_CFG1);
+ } else {
+ // попробуем приаттачиться
+ _atPending = false;
+ _startAT("AT+CGATT=1","OK",5000);
+ }
+ }
+ }
+ return;
+
+ case State::NTP_SAPBR_CFG1:
+ if (!_atPending) _startAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_SAPBR_CFG_APN);
+ return;
+
+ case State::NTP_SAPBR_CFG_APN:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"APN\",\"") + _ntp.apn + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter((_ntp.user && _ntp.user[0]) ? State::NTP_SAPBR_CFG_USER
+ :((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN));
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_USER:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"USER\",\"") + _ntp.user + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_PWD:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"PWD\",\"") + _ntp.pass + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_OPEN:
+ if (!_atPending) _startAT("AT+SAPBR=1,1","OK",45000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_CNTPCID);
+ return;
+
+ case State::NTP_CNTPCID:
+ if (!_atPending) _startAT("AT+CNTPCID=1","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_CNTP_SET);
+ return;
+
+ case State::NTP_CNTP_SET:{
+ if (!_atPending) {
+ String cmd = String("AT+CNTP=\"") + (_ntp.server ? _ntp.server :"pool.ntp.org") + "\"," + String(_ntp.tzHours);
+ _startAT(cmd.c_str(),"OK",3000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter(State::NTP_CNTP_START);
+ }
+ return;
+ }
+
+ case State::NTP_CNTP_START:
+ // ждём +CNTP:<code>
+ if (!_atPending) _startAT("AT+CNTP","+CNTP:",20000);
+ else {
+ if (_atMatchedExpect() || _atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_CLOSE);
+ }
+ }
+ return;
+
+ case State::NTP_SAPBR_CLOSE:
+ if (!_atPending) _startAT("AT+SAPBR=0,1","OK",8000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::REQ_CCLK_AFTER_NTP);
+ return;
+
+ case State::REQ_CCLK_AFTER_NTP:
+ if (!_atPending) {
+ _lastCCLK = "";
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ if (_atMatchedExpect()) {
+ if (_lastCCLK.indexOf("+CCLK:") >= 0) _newTime = true;
+ }
+ _enter(State::IDLE);
+ }
+ return;
+ }
+}
+
+// ---------------- UART + URC ----------------
+void SIM800TimeAsync::_readUartNonBlocking() {
+ while (_sim.available()) {
+ char c = (char)_sim.read();
+ if (c == '\r') continue;
+
+ if (c == '\n') {
+ if (_lineBuf.length()) {
+ _handleLine(_lineBuf);
+ _lineBuf = "";
+ }
+ } else {
+ if (_lineBuf.length() < 160) _lineBuf += c;
+ }
+ }
+}
+
+void SIM800TimeAsync::_handleLine(const String& line) {
+ // URC признаки
+ if (line.indexOf("RDY") >= 0) _seenRDY = true;
+ if (line.indexOf("Call Ready") >= 0) _seenCallReady = true;
+ if (line.indexOf("SMS Ready") >= 0) _seenSMSReady = true;
+
+ // Лог входящих строк
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F("<< "));
+ _dbg->println(line);
+ }
+
+ // AT-транзакция:копим ВСЕ строки,чтобы OK/ERROR не терялись
+ if (_atPending) {
+ if (line == "OK") {
+ _atOk = true;
+ _lastAtOkMs = millis();
+ } else if (line == "ERROR") {
+ _atErr = true;
+ }
+
+ if (line.startsWith("+CCLK:")) {
+ _lastCCLK = line; // "чистая" строка времени
+ }
+
+ _atResp += line;
+ _atResp += "\n";
+ }
+}
+
+// ---------------- AT helpers ----------------
+void SIM800TimeAsync::_startAT(const char* cmd,const char* expect,uint32_t timeoutMs) {
+ _atResp = "";
+ _atExpect = expect;
+ _atPending = true;
+ _atDeadlineMs = millis() + timeoutMs;
+ _atOk = false;
+ _atErr = false;
+
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F(">> "));
+ _dbg->println(cmd);
+ }
+
+ _sim.print(cmd);
+ _sim.print("\r");
+}
+
+bool SIM800TimeAsync::_atDoneTimeout() const {
+ if (!_atPending) return false;
+ return (int32_t)(millis() - _atDeadlineMs) >= 0;
+}
+
+bool SIM800TimeAsync::_atMatchedExpect() const {
+ if (!_atPending || !_atExpect) return false;
+ return _atResp.indexOf(_atExpect) >= 0;
+}
+
+// ---------------- PWRKEY helpers ----------------
+void SIM800TimeAsync::_pwrkeyIdle() {
+#if defined(INPUT_PULLDOWN)
+ pinMode(_pwrkeyPin,INPUT_PULLDOWN);
+#else
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? LOW :HIGH);
+#endif
+}
+
+void SIM800TimeAsync::_pwrkeyPress() {
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? HIGH :LOW);
+}
+
+void SIM800TimeAsync::_pwrkeyRelease() {
+ _pwrkeyIdle();
+}
+
+// ---------------- time parse/valid ----------------
+bool SIM800TimeAsync::parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours) {
+
+ int q1 = resp.indexOf('\"');
+ int q2 = resp.indexOf('\"',q1 + 1);
+ if (q1 < 0 || q2 < 0) return false;
+
+ String v = resp.substring(q1 + 1,q2); // yy/MM/dd,hh:mm:ss±zz
+ if (v.length() < 17) return false;
+
+ int yy = v.substring(0,2).toInt();
+ month = v.substring(3,5).toInt();
+ day = v.substring(6,8).toInt();
+ hour = v.substring(9,11).toInt();
+ minute = v.substring(12,14).toInt();
+ second = v.substring(15,17).toInt();
+ year = 2000 + yy;
+
+ tzQuarterHours = 0;
+ if (v.length() >= 20) {
+ char sign = v.charAt(17);
+ int zz = v.substring(18).toInt(); // четверти часа
+ tzQuarterHours = (sign == '-') ? -zz :zz;
+ }
+ return true;
+}
+
+bool SIM800TimeAsync::_isCCLKValid(const String& resp,int minYear) {
+ int y,mo,d,h,mi,s,tzq;
+ if (!parseCCLK(resp,y,mo,d,h,mi,s,tzq)) return false;
+ if (y < minYear) return false;
+ if (mo < 1 || mo > 12) return false;
+ if (d < 1 || d > 31) return false;
+ if (h < 0 || h > 23) return false;
+ if (mi < 0 || mi > 59) return false;
+ if (s < 0 || s > 59) return false;
+ return true;
+}
+Как использовать (напоминание)
+В setup():
+
+cpp Копировать
+sim.begin(9600);
+sim.setHealthPingMs(60000); // AT ping 60 сек
+sim.setMaxRecoveryAttempts(5); // 5 попыток PWRKEY
+sim.start();
+Если хотите — следующим шагом я соберу вам готовый комплект интеграции 
+с AT24C128Settings (загрузка при старте + функции записи отдельных полей по
+ фиксированным адресам + “apply to sim”),и минимальный интерфейс “передать время в TFT” через глобальные строки.
+ 
+ //--------------------------------------------+++++++++++++++++++++++++++++++++++++++
+ 
+ Ниже — актуальный SIM800TimeAsync.h (совместим с выданным мной “полностью готовым SIM800TimeAsync.cpp” с AT‑ping/recovery) и готовый комплект интеграции с AT24C128 (0x50) по фиксированным адресам,с возможностью записи из других программ,и передачей даты/времени в TFT‑часть через общие строки.
+
+1) SIM800TimeAsync.h (актуальный)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// Неблокирующая FSM для SIM800C:
+// - включение через PWRKEY (через NPN на землю)
+// - периодический AT ping (health check) по расписанию
+// - периодический запрос времени AT+CCLK?
+// - fallback на NTP по GPRS (AT+CNTP),если время невалидно
+class SIM800TimeAsync {
+public:
+ struct NtpConfig {
+ const char* apn = nullptr; // APN обязателен для NTP fallback
+ const char* user = ""; // опционально
+ const char* pass = ""; // опционально
+ const char* server = "pool.ntp.org";
+ int tzHours = 0; // для AT+CNTP в часах
+ bool enableFallback = false;
+ };
+
+ SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,bool pwrkeyActiveHigh = true);
+
+ void begin(uint32_t baud);
+ void setDebug(Stream* dbg,bool logAT = true);
+
+ void start(); // запустить FSM (не блокирует)
+ void tick(); // вызывать часто в loop()
+
+ void setPeriodMs(uint32_t periodMs); // период запроса времени
+ void setNtpConfig(const NtpConfig& cfg);
+ void requestTimeNow(); // внеочередной запрос времени
+
+ // --- AT ping / recovery ---
+ void setHealthPingMs(uint32_t periodMs); // 0 = выключить
+ void setMaxRecoveryAttempts(uint8_t n); // попытки PWRKEY при отсутствии ответа
+ uint32_t lastAtOkMs() const; // когда последний раз был OK на AT (любой)
+ uint8_t recoveryAttemptsUsed() const;
+
+ bool isReady() const;
+ bool isBusy() const;
+ const char* stateName() const;
+
+ bool hasNewTime(); // true один раз после обновления (+CCLK)
+ String lastCCLKRaw() const; // строка "+CCLK:..."
+ bool lastTimeValid(int minYear = 2020) const;
+
+ // Парсер +CCLK:"yy/MM/dd,hh:mm:ss±zz"
+ static bool parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours);
+
+private:
+ enum class State :uint8_t {
+ STOPPED,
+
+ // health
+ AT_PING,
+
+ // bring-up / init
+ PROBE_AT,
+ PWRKEY_PULSE,
+ WAIT_URC,
+ WAIT_AT_READY,
+ INIT_ATE0,
+ INIT_CMEE,
+ INIT_CLTS,
+ INIT_SAVE,
+
+ // normal
+ IDLE,
+ WAIT_NETWORK,
+ REQ_CCLK,
+
+ // NTP fallback
+ NTP_CGATT,
+ NTP_SAPBR_CFG1,
+ NTP_SAPBR_CFG_APN,
+ NTP_SAPBR_CFG_USER,
+ NTP_SAPBR_CFG_PWD,
+ NTP_SAPBR_OPEN,
+ NTP_CNTPCID,
+ NTP_CNTP_SET,
+ NTP_CNTP_START,
+ NTP_SAPBR_CLOSE,
+ REQ_CCLK_AFTER_NTP
+ };
+
+ HardwareSerial& _sim;
+ uint8_t _pwrkeyPin;
+ bool _pwrkeyActiveHigh;
+
+ Stream* _dbg = nullptr;
+ bool _logAT = true;
+
+ // schedulers
+ uint32_t _periodMs = 60000;
+ uint32_t _nextPollMs = 0;
+ bool _forcePoll = false;
+
+ uint32_t _healthPingMs = 60000;
+ uint32_t _nextPingMs = 0;
+
+ // recovery
+ uint8_t _maxRecoveryAttempts = 5;
+ uint8_t _recoveryUsed = 0;
+
+ // ntp config
+ NtpConfig _ntp;
+
+ // fsm
+ State _st = State::STOPPED;
+ uint32_t _stEnterMs = 0;
+
+ // URC flags
+ bool _seenRDY = false;
+ bool _seenCallReady = false;
+ bool _seenSMSReady = false;
+
+ // AT transaction
+ bool _atPending = false;
+ const char* _atExpect = nullptr;
+ uint32_t _atDeadlineMs = 0;
+ String _atResp;
+ String _lineBuf;
+
+ bool _atOk = false;
+ bool _atErr = false;
+
+ // time
+ String _lastCCLK;
+ bool _newTime = false;
+
+ // health
+ uint32_t _lastAtOkMs = 0;
+
+private:
+ void _log(const __FlashStringHelper* s);
+ void _logKV(const __FlashStringHelper* k,const String& v);
+ void _logATLine(const __FlashStringHelper* prefix,const String& s);
+
+ void _enter(State s);
+ void _serviceState();
+
+ void _readUartNonBlocking();
+ void _handleLine(const String& line);
+
+ void _startAT(const char* cmd,const char* expect,uint32_t timeoutMs);
+ bool _atDoneTimeout() const;
+ bool _atMatchedExpect() const;
+
+ void _pwrkeyIdle();
+ void _pwrkeyPress();
+ void _pwrkeyRelease();
+
+ static bool _isCCLKValid(const String& resp,int minYear);
+};
+2) AT24C128 настройки (фиксированные адреса,совместимо с “другими программами”)
+Используйте файлы из моего предыдущего сообщения:
+
+AT24C128Settings.h
+AT24C128Settings.cpp
+Они уже:
+
+работают с 0x50,
+имеют фиксированные адреса (ADDR_APN,ADDR_USER,ADDR_PASS,ADDR_SERVER,ADDR_TZ,ADDR_ENFALL,ADDR_PERIOD),
+умеют load(strict=false) — т.е. читают поля даже если MAGIC/VERSION не записан внешней программой.
+3) “Передача времени” в TFT файлы (минимальный интерфейс)
+TimeFeed.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// Эти строки обновляются при получении времени от SIM800/RTC.
+// TFT/Menu часть может читать их и рисовать.
+extern char gDateStr[11]; // "dd.mm.yyyy"
+extern char gTimeStr[9]; // "hh:mm:ss"
+extern volatile bool gTimeUpdated; // флаг обновления
+TimeFeed.cpp
+cpp Копировать
+#include "TimeFeed.h"
+
+char gDateStr[11] = "00.00.0000";
+char gTimeStr[9] = "00:00:00";
+volatile bool gTimeUpdated = false;
+4) Готовая интеграция в ваш .ino
+Ниже — “скелет” интеграции:загрузка настроек из EEPROM → применение к sim → AT‑ping 60 сек → запрос времени раз в cfg.periodMs → обновление RTC локальным временем → обновление строк для TFT.
+
+cpp Копировать
+#include <Wire.h>
+#include "SIM800TimeAsync.h"
+#include "AT24C128Settings.h"
+#include "TimeFeed.h"
+#include "RTCSupport.h"
+
+// UART4 на STM32F103 обычно Serial4 (PC11 RX,PC10 TX)
+#define MODEM Serial4
+
+static const uint8_t PWRKEY_PIN = PE0; // через NPN на землю
+static const bool PWRKEY_ACTIVE_HIGH = true; // "нажать"=HIGH
+
+SIM800TimeAsync sim(MODEM,PWRKEY_PIN,PWRKEY_ACTIVE_HIGH);
+
+AT24C128Settings ee(Wire,0x50);
+AT24C128Settings::Config cfg;
+
+RealtimeClock rtc;
+
+// --- DOW для вашего DS3231/RTCSupport:dayOfWeek 1..7 (Mon..Sun)
+static uint8_t dow0_sun(int y,int m,int d) {
+ static int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ if (m < 3) y -= 1;
+ return (uint8_t)((y + y/4 - y/100 + y/400 + t[m-1] + d) % 7); // 0=Sun..6=Sat
+}
+static uint8_t ds3231DowFromDow0(uint8_t dow0) {
+ return (dow0 == 0) ? 7 :dow0; // Sun->7,Mon..Sat->1..6
+}
+
+static void applyCfgToSim(const AT24C128Settings::Config& c) {
+ SIM800TimeAsync::NtpConfig ntp;
+ ntp.apn = c.apn;
+ ntp.user = c.user;
+ ntp.pass = c.pass;
+ ntp.server = c.server;
+ ntp.tzHours = c.tzHours;
+ ntp.enableFallback = c.enableFallback;
+
+ sim.setNtpConfig(ntp);
+ sim.setPeriodMs(c.periodMs);
+}
+
+// Вызывать,когда настройки изменились (из меню/по UART и т.п.)
+static bool saveCfgAndApply(const AT24C128Settings::Config& c) {
+ if (!ee.save(c,true)) return false;
+ applyCfgToSim(c);
+ return true;
+}
+
+void setup() {
+ // Отпустить PWRKEY сразу
+ pinMode(PE0,OUTPUT);
+ digitalWrite(PE0,LOW);
+
+ Serial.begin(115200);
+ Wire.begin();
+ rtc.begin();
+
+ // EEPROM
+ if (!ee.begin()) {
+ Serial.println(F("AT24C128 not found (0x50),using defaults"));
+ AT24C128Settings::defaults(cfg);
+ } else {
+ // strict=false:поддержка записи "внешними программами" без MAGIC
+ ee.load(cfg,false);
+ }
+
+ // SIM debug (можно выключить)
+ sim.setDebug(&Serial,true);
+
+ sim.begin(9600);
+
+ // AT ping раз в 60 секунд
+ sim.setHealthPingMs(60000);
+ sim.setMaxRecoveryAttempts(5);
+
+ applyCfgToSim(cfg);
+
+ sim.start();
+}
+
+void loop() {
+ sim.tick();
+
+ // 1) если пришло время от SIM800 -> пишем ЛОКАЛЬНОЕ время в RTC и обновляем строки для TFT
+ if (sim.hasNewTime()) {
+ String raw = sim.lastCCLKRaw();
+
+ int year,month,day,hour,minute,second,tzq;
+ if (SIM800TimeAsync::parseCCLK(raw,year,month,day,hour,minute,second,tzq)) {
+
+ uint8_t dow0 = dow0_sun(year,month,day);
+ uint8_t dsDow = ds3231DowFromDow0(dow0);
+
+ rtc.setTime((uint8_t)second,(uint8_t)minute,(uint8_t)hour,
+ dsDow,(uint8_t)day,(uint8_t)month,(uint16_t)year);
+
+ // Строки для TFT (локальное время)
+ snprintf(gDateStr,sizeof(gDateStr),"%02d.%02d.%04d",day,month,year);
+ snprintf(gTimeStr,sizeof(gTimeStr),"%02d:%02d:%02d",hour,minute,second);
+ gTimeUpdated = true;
+ }
+ }
+
+ // 2) TFT/Menu часть может отрисовать если gTimeUpdated==true
+ // if (gTimeUpdated) { gTimeUpdated=false; ... draw ... }
+
+ // 3) Пример:если из другой части программы поменяли cfg,можно сохранить:
+ // (пока меню нет — просто пример вызова)
+ // cfg.periodMs = 600000;
+ // strncpy(cfg.apn,"internet",sizeof(cfg.apn)-1);
+ // saveCfgAndApply(cfg);
+}
+5) Как “предусмотреть запись в память из других программ”
+Благодаря фиксированным адресам (в AT24C128Settings.h) другая программа может менять настройки напрямую по I2C:
+
+periodMs (LE) по 0x0008 (4 байта)
+enableFallback по 0x0005 (1 байт)
+tzHours по 0x0006 (1 байт signed)
+строки:
+apn 0x0100 (32 байта)
+user 0x0120 (32 байта)
+pass 0x0140 (32 байта)
+server 0x0160 (48 байт)
+В вашем коде ee.load(cfg,false) прочитает их даже без MAGIC.
+
+Что ещё обычно добавляют (по желанию)
+Если нужно,могу добавить “горячую перезагрузку” настроек без меню:
+
+например,раз в N секунд перечитывать EEPROM и,если значения изменились — применять applyCfgToSim(cfg) 
+(это удобно,когда внешняя программа меняет EEPROM на лету).
+Скажите,нужно ли такое авто‑обновление из EEPROM,и как часто перечитывать (например,раз в 5 секунд/раз в минуту).
+
+//------------------------------------------------------------------
+
+
+

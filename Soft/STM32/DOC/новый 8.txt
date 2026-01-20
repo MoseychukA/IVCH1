@@ -1,0 +1,989 @@
+Ниже — полный готовый комплект SIM800TimeAsync.h и SIM800TimeAsync.cpp в одной версии,который включает:
+
+неблокирующую FSM (без delay()/ожиданий);
+AT‑ping (проверка “жив ли модем”) по расписанию;
+автовосстановление (несколько попыток через PWRKEY,если AT не отвечает);
+периодический запрос времени AT+CCLK? (после регистрации AT+CREG?);
+NTP fallback по GPRS через AT+CNTP (если включено и время невалидное);
+опрос статуса для дисплея:
+регистрация в сети (AT+CREG?)
+уровень сигнала (AT+CSQ)
+геттеры:networkRegistered(),rssiDbm(),signalBars() и т.д.
+Совместим с вашим окружением Arduino_STM32 (libmaple).
+
+SIM800TimeAsync.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class SIM800TimeAsync {
+public:
+ struct NtpConfig {
+ const char* apn = nullptr;
+ const char* user = "";
+ const char* pass = "";
+ const char* server = "pool.ntp.org";
+ int tzHours = 0; // для AT+CNTP (в часах)
+ bool enableFallback = false;
+ };
+
+ SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,bool pwrkeyActiveHigh = true);
+
+ void begin(uint32_t baud);
+ void setDebug(Stream* dbg,bool logAT = true);
+
+ void start(); // запустить FSM (не блокирует)
+ void tick(); // вызывать часто в loop()
+
+ // Период запроса времени (+CREG/+CCLK)
+ void setPeriodMs(uint32_t periodMs);
+ void setNtpConfig(const NtpConfig& cfg);
+ void requestTimeNow();
+
+ // --- AT ping / recovery ---
+ void setHealthPingMs(uint32_t periodMs); // 0=выкл
+ void setMaxRecoveryAttempts(uint8_t n); // попытки PWRKEY
+ uint32_t lastAtOkMs() const;
+ uint8_t recoveryAttemptsUsed() const;
+
+ // --- Status polling for display (CREG/CSQ) ---
+ void setStatusPollMs(uint32_t periodMs); // 0=выкл
+ bool networkRegistered() const; // true если CREG=1 или 5
+ uint8_t cregStat() const; // 0..5
+ int8_t csqRssi() const; // 0..31,99 unknown
+ uint8_t csqBer() const; // 0..7,99 unknown
+ int16_t rssiDbm() const; // 0 если unknown
+ uint8_t signalBars() const; // 0..5
+
+ bool isReady() const;
+ bool isBusy() const;
+ const char* stateName() const;
+
+ bool hasNewTime(); // true один раз после обновления
+ String lastCCLKRaw() const; // строка +CCLK:...
+ bool lastTimeValid(int minYear = 2020) const;
+
+ // +CCLK:"yy/MM/dd,hh:mm:ss±zz"
+ static bool parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours);
+
+private:
+ enum class State :uint8_t {
+ STOPPED,
+
+ // health
+ AT_PING,
+
+ // status
+ STAT_CREG,
+ STAT_CSQ,
+
+ // bring-up / init
+ PROBE_AT,
+ PWRKEY_PULSE,
+ WAIT_URC,
+ WAIT_AT_READY,
+ INIT_ATE0,
+ INIT_CMEE,
+ INIT_CLTS,
+ INIT_SAVE,
+
+ // normal
+ IDLE,
+ WAIT_NETWORK,
+ REQ_CCLK,
+
+ // NTP fallback
+ NTP_CGATT,
+ NTP_SAPBR_CFG1,
+ NTP_SAPBR_CFG_APN,
+ NTP_SAPBR_CFG_USER,
+ NTP_SAPBR_CFG_PWD,
+ NTP_SAPBR_OPEN,
+ NTP_CNTPCID,
+ NTP_CNTP_SET,
+ NTP_CNTP_START,
+ NTP_SAPBR_CLOSE,
+ REQ_CCLK_AFTER_NTP
+ };
+
+ HardwareSerial& _sim;
+ uint8_t _pwrkeyPin;
+ bool _pwrkeyActiveHigh;
+
+ Stream* _dbg = nullptr;
+ bool _logAT = true;
+
+ // schedulers
+ uint32_t _periodMs = 60000;
+ uint32_t _nextPollMs = 0;
+ bool _forcePoll = false;
+
+ uint32_t _healthPingMs = 60000;
+ uint32_t _nextPingMs = 0;
+
+ uint32_t _statusPollMs = 5000;
+ uint32_t _nextStatusMs = 0;
+
+ // recovery
+ uint8_t _maxRecoveryAttempts = 5;
+ uint8_t _recoveryUsed = 0;
+
+ // ntp config
+ NtpConfig _ntp;
+
+ // fsm
+ State _st = State::STOPPED;
+ uint32_t _stEnterMs = 0;
+
+ // URC flags
+ bool _seenRDY = false;
+ bool _seenCallReady = false;
+ bool _seenSMSReady = false;
+
+ // AT transaction
+ bool _atPending = false;
+ const char* _atExpect = nullptr;
+ uint32_t _atDeadlineMs = 0;
+ String _atResp;
+ String _lineBuf;
+
+ bool _atOk = false;
+ bool _atErr = false;
+
+ // time
+ String _lastCCLK;
+ bool _newTime = false;
+
+ // health
+ uint32_t _lastAtOkMs = 0;
+
+ // cached status
+ uint8_t _cregStat = 0; // 0..5
+ int8_t _csqRssi = 99;
+ uint8_t _csqBer = 99;
+
+private:
+ void _log(const __FlashStringHelper* s);
+ void _logKV(const __FlashStringHelper* k,const String& v);
+ void _logATLine(const __FlashStringHelper* prefix,const String& s);
+
+ void _enter(State s);
+ void _serviceState();
+
+ void _readUartNonBlocking();
+ void _handleLine(const String& line);
+
+ void _startAT(const char* cmd,const char* expect,uint32_t timeoutMs);
+ bool _atDoneTimeout() const;
+ bool _atMatchedExpect() const;
+
+ void _pwrkeyIdle();
+ void _pwrkeyPress();
+ void _pwrkeyRelease();
+
+ static bool _isCCLKValid(const String& resp,int minYear);
+};
+SIM800TimeAsync.cpp
+cpp Копировать
+#include "SIM800TimeAsync.h"
+
+SIM800TimeAsync::SIM800TimeAsync(HardwareSerial& sim,uint8_t pwrkeyPin,bool pwrkeyActiveHigh)
+ :_sim(sim),_pwrkeyPin(pwrkeyPin),_pwrkeyActiveHigh(pwrkeyActiveHigh) {}
+
+void SIM800TimeAsync::begin(uint32_t baud) {
+ pinMode(_pwrkeyPin,OUTPUT);
+ _pwrkeyIdle();
+ _sim.begin(baud);
+
+ const uint32_t now = millis();
+ _nextPollMs = now + _periodMs;
+ _nextPingMs = now + _healthPingMs;
+ _nextStatusMs = now + _statusPollMs;
+}
+
+void SIM800TimeAsync::setDebug(Stream* dbg,bool logAT) { _dbg = dbg; _logAT = logAT; }
+
+void SIM800TimeAsync::setPeriodMs(uint32_t periodMs) {
+ _periodMs = periodMs;
+ _nextPollMs = millis() + _periodMs;
+}
+
+void SIM800TimeAsync::setNtpConfig(const NtpConfig& cfg) { _ntp = cfg; }
+
+void SIM800TimeAsync::requestTimeNow() { _forcePoll = true; }
+
+void SIM800TimeAsync::setHealthPingMs(uint32_t periodMs) {
+ _healthPingMs = periodMs;
+ _nextPingMs = millis() + _healthPingMs;
+}
+
+void SIM800TimeAsync::setMaxRecoveryAttempts(uint8_t n) { _maxRecoveryAttempts = n; }
+
+uint32_t SIM800TimeAsync::lastAtOkMs() const { return _lastAtOkMs; }
+uint8_t SIM800TimeAsync::recoveryAttemptsUsed() const { return _recoveryUsed; }
+
+void SIM800TimeAsync::setStatusPollMs(uint32_t periodMs) {
+ _statusPollMs = periodMs;
+ _nextStatusMs = millis() + _statusPollMs;
+}
+
+bool SIM800TimeAsync::networkRegistered() const { return (_cregStat == 1 || _cregStat == 5); }
+uint8_t SIM800TimeAsync::cregStat() const { return _cregStat; }
+int8_t SIM800TimeAsync::csqRssi() const { return _csqRssi; }
+uint8_t SIM800TimeAsync::csqBer() const { return _csqBer; }
+
+int16_t SIM800TimeAsync::rssiDbm() const {
+ if (_csqRssi == 99 || _csqRssi < 0 || _csqRssi > 31) return 0;
+ return (int16_t)(-113 + 2 * _csqRssi);
+}
+
+uint8_t SIM800TimeAsync::signalBars() const {
+ if (_csqRssi == 99) return 0;
+ if (_csqRssi <= 2) return 0;
+ if (_csqRssi <= 9) return 1;
+ if (_csqRssi <= 14) return 2;
+ if (_csqRssi <= 19) return 3;
+ if (_csqRssi <= 25) return 4;
+ return 5;
+}
+
+void SIM800TimeAsync::start() {
+ _recoveryUsed = 0;
+ _enter(State::PROBE_AT);
+}
+
+bool SIM800TimeAsync::isReady() const {
+ return _st == State::IDLE || _st == State::WAIT_NETWORK || _st == State::REQ_CCLK
+ || (uint8_t)_st > (uint8_t)State::INIT_SAVE;
+}
+
+bool SIM800TimeAsync::isBusy() const { return _st != State::IDLE && _st != State::STOPPED; }
+
+const char* SIM800TimeAsync::stateName() const {
+ switch (_st) {
+ case State::STOPPED:return "STOPPED";
+ case State::AT_PING:return "AT_PING";
+ case State::STAT_CREG:return "STAT_CREG";
+ case State::STAT_CSQ:return "STAT_CSQ";
+ case State::PROBE_AT:return "PROBE_AT";
+ case State::PWRKEY_PULSE:return "PWRKEY_PULSE";
+ case State::WAIT_URC:return "WAIT_URC";
+ case State::WAIT_AT_READY:return "WAIT_AT_READY";
+ case State::INIT_ATE0:return "INIT_ATE0";
+ case State::INIT_CMEE:return "INIT_CMEE";
+ case State::INIT_CLTS:return "INIT_CLTS";
+ case State::INIT_SAVE:return "INIT_SAVE";
+ case State::IDLE:return "IDLE";
+ case State::WAIT_NETWORK:return "WAIT_NETWORK";
+ case State::REQ_CCLK:return "REQ_CCLK";
+ case State::NTP_CGATT:return "NTP_CGATT";
+ case State::NTP_SAPBR_CFG1:return "NTP_SAPBR_CFG1";
+ case State::NTP_SAPBR_CFG_APN:return "NTP_SAPBR_CFG_APN";
+ case State::NTP_SAPBR_CFG_USER:return "NTP_SAPBR_CFG_USER";
+ case State::NTP_SAPBR_CFG_PWD:return "NTP_SAPBR_CFG_PWD";
+ case State::NTP_SAPBR_OPEN:return "NTP_SAPBR_OPEN";
+ case State::NTP_CNTPCID:return "NTP_CNTPCID";
+ case State::NTP_CNTP_SET:return "NTP_CNTP_SET";
+ case State::NTP_CNTP_START:return "NTP_CNTP_START";
+ case State::NTP_SAPBR_CLOSE:return "NTP_SAPBR_CLOSE";
+ case State::REQ_CCLK_AFTER_NTP:return "REQ_CCLK_AFTER_NTP";
+ }
+ return "?";
+}
+
+bool SIM800TimeAsync::hasNewTime() { bool v = _newTime; _newTime = false; return v; }
+String SIM800TimeAsync::lastCCLKRaw() const { return _lastCCLK; }
+bool SIM800TimeAsync::lastTimeValid(int minYear) const { return _isCCLKValid(_lastCCLK,minYear); }
+
+void SIM800TimeAsync::tick() {
+ _readUartNonBlocking();
+ _serviceState();
+}
+
+// ---- debug ----
+void SIM800TimeAsync::_log(const __FlashStringHelper* s) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->println(s);
+}
+void SIM800TimeAsync::_logKV(const __FlashStringHelper* k,const String& v) {
+ if (!_dbg) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(k); _dbg->println(v);
+}
+void SIM800TimeAsync::_logATLine(const __FlashStringHelper* prefix,const String& s) {
+ if (!_dbg || !_logAT) return;
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(prefix); _dbg->println(s);
+}
+
+// ---- fsm ----
+void SIM800TimeAsync::_enter(State s) {
+ // reset AT transaction
+ _atPending = false;
+ _atExpect = nullptr;
+ _atResp = "";
+ _atDeadlineMs = 0;
+ _atOk = false;
+ _atErr = false;
+
+ _st = s;
+ _stEnterMs = millis();
+
+ if (_dbg) {
+ _dbg->print('['); _dbg->print(_stEnterMs); _dbg->print("] ");
+ _dbg->print(F("STATE -> "));
+ _dbg->println(stateName());
+ }
+}
+
+void SIM800TimeAsync::_serviceState() {
+ const uint32_t now = millis();
+
+ // IDLE scheduler
+ if (_st == State::IDLE) {
+
+ // 1) health ping
+ if (_healthPingMs > 0 && (int32_t)(now - _nextPingMs) >= 0) {
+ _nextPingMs = now + _healthPingMs;
+ _enter(State::AT_PING);
+ return;
+ }
+
+ // 2) time poll (do not starve by status polling)
+ if (_forcePoll || (int32_t)(now - _nextPollMs) >= 0) {
+ _forcePoll = false;
+ _nextPollMs = now + _periodMs;
+ _enter(State::WAIT_NETWORK);
+ return;
+ }
+
+ // 3) status poll
+ if (_statusPollMs > 0 && (int32_t)(now - _nextStatusMs) >= 0) {
+ _nextStatusMs = now + _statusPollMs;
+ _enter(State::STAT_CREG);
+ return;
+ }
+
+ return;
+ }
+
+ switch (_st) {
+
+ case State::STOPPED:
+ // auto retry every 60s
+ if ((now - _stEnterMs) > 60000) {
+ _recoveryUsed = 0;
+ _enter(State::PROBE_AT);
+ }
+ return;
+
+ // ---- health ----
+ case State::AT_PING:
+ if (!_atPending) {
+ _startAT("AT","OK",1500);
+ } else {
+ if (_atOk) {
+ _recoveryUsed = 0;
+ _enter(State::IDLE);
+ } else if (_atDoneTimeout()) {
+ if (_recoveryUsed < _maxRecoveryAttempts) {
+ _recoveryUsed++;
+ _enter(State::PWRKEY_PULSE);
+ } else {
+ _enter(State::STOPPED);
+ }
+ }
+ }
+ return;
+
+ // ---- status ----
+ case State::STAT_CREG:
+ if (!_atPending) {
+ _startAT("AT+CREG?","+CREG:",1500);
+ } else {
+ if (_atMatchedExpect()) {
+ int p = _atResp.indexOf("+CREG:");
+ if (p >= 0) {
+ int comma = _atResp.indexOf(',',p);
+ if (comma >= 0) {
+ int stat = _atResp.substring(comma + 1).toInt();
+ if (stat >= 0 && stat <= 5) _cregStat = (uint8_t)stat;
+ }
+ }
+ _enter(State::STAT_CSQ);
+ } else if (_atDoneTimeout()) {
+ _enter(State::STAT_CSQ);
+ }
+ }
+ return;
+
+ case State::STAT_CSQ:
+ if (!_atPending) {
+ _startAT("AT+CSQ","+CSQ:",1500);
+ } else {
+ if (_atMatchedExpect()) {
+ // +CSQ:<rssi>,<ber>
+ int p = _atResp.indexOf("+CSQ:");
+ if (p >= 0) {
+ int colon = _atResp.indexOf(':',p);
+ int comma = _atResp.indexOf(',',p);
+ if (colon >= 0 && comma >= 0 && comma > colon) {
+ int rssi = _atResp.substring(colon + 1,comma).toInt();
+ int ber = _atResp.substring(comma + 1).toInt();
+ _csqRssi = (int8_t)rssi;
+ _csqBer = (uint8_t)ber;
+ }
+ }
+ _enter(State::IDLE);
+ } else if (_atDoneTimeout()) {
+ _enter(State::IDLE);
+ }
+ }
+ return;
+
+ // ---- bring-up / init ----
+ case State::PROBE_AT:
+ if (!_atPending) {
+ _startAT("AT","OK",1500);
+ } else {
+ if (_atOk) {
+ _recoveryUsed = 0;
+ _enter(State::INIT_ATE0);
+ } else if (_atDoneTimeout()) {
+ if (_recoveryUsed < _maxRecoveryAttempts) {
+ _recoveryUsed++;
+ _enter(State::PWRKEY_PULSE);
+ } else {
+ _enter(State::STOPPED);
+ }
+ }
+ }
+ return;
+
+ case State::PWRKEY_PULSE:
+ // 50ms idle then press up to 1.25s
+ if (now - _stEnterMs < 50) _pwrkeyIdle();
+ else if (now - _stEnterMs < 1300) _pwrkeyPress();
+ else {
+ _pwrkeyRelease();
+ _seenRDY = _seenCallReady = _seenSMSReady = false;
+ _enter(State::WAIT_URC);
+ }
+ return;
+
+ case State::WAIT_URC:
+ if (_seenRDY || _seenCallReady || _seenSMSReady || (now - _stEnterMs) > 8000) {
+ _enter(State::WAIT_AT_READY);
+ }
+ return;
+
+ case State::WAIT_AT_READY:
+ if (!_atPending) {
+ _startAT("AT","OK",12000);
+ } else {
+ if (_atOk) {
+ _recoveryUsed = 0;
+ _enter(State::INIT_ATE0);
+ } else if (_atDoneTimeout()) {
+ if (_recoveryUsed < _maxRecoveryAttempts) {
+ _recoveryUsed++;
+ _enter(State::PWRKEY_PULSE);
+ } else {
+ _enter(State::STOPPED);
+ }
+ }
+ }
+ return;
+
+ case State::INIT_ATE0:
+ if (!_atPending) _startAT("ATE0","OK",1500);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_CMEE);
+ return;
+
+ case State::INIT_CMEE:
+ if (!_atPending) _startAT("AT+CMEE=2","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_CLTS);
+ return;
+
+ case State::INIT_CLTS:
+ if (!_atPending) _startAT("AT+CLTS=1","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::INIT_SAVE);
+ return;
+
+ case State::INIT_SAVE:
+ if (!_atPending) _startAT("AT&W","OK",3000);
+ else if (_atOk || _atDoneTimeout()) {
+ _recoveryUsed = 0;
+ _enter(State::IDLE);
+ }
+ return;
+
+ // ---- time flow ----
+ case State::WAIT_NETWORK:
+ if (!_atPending) {
+ _startAT("AT+CREG?","+CREG:",1500);
+ } else {
+ if (_atDoneTimeout()) {
+ if (now - _stEnterMs > 60000) _enter(State::IDLE);
+ else {
+ _atPending = false;
+ _atResp = "";
+ _atOk = _atErr = false;
+ }
+ } else if (_atMatchedExpect()) {
+ // cache CREG from this answer too
+ int p = _atResp.indexOf("+CREG:");
+ if (p >= 0) {
+ int comma = _atResp.indexOf(',',p);
+ if (comma >= 0) {
+ int stat = _atResp.substring(comma + 1).toInt();
+ if (stat >= 0 && stat <= 5) _cregStat = (uint8_t)stat;
+ }
+ }
+
+ if (networkRegistered()) _enter(State::REQ_CCLK);
+ else {
+ _atPending = false;
+ _atResp = "";
+ _atOk = _atErr = false;
+ }
+ }
+ }
+ return;
+
+ case State::REQ_CCLK:
+ if (!_atPending) {
+ _lastCCLK = "";
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ if (_atMatchedExpect()) {
+ if (_lastCCLK.length() == 0) _lastCCLK = _atResp; // fallback
+ if (_lastCCLK.indexOf("+CCLK:") >= 0) _newTime = true;
+
+ if (!_isCCLKValid(_lastCCLK,2020) && _ntp.enableFallback && _ntp.apn && _ntp.apn[0]) {
+ _enter(State::NTP_CGATT);
+ } else {
+ _enter(State::IDLE);
+ }
+ } else if (_atDoneTimeout()) {
+ _enter(State::IDLE);
+ }
+ }
+ return;
+
+ // ---- NTP fallback ----
+ case State::NTP_CGATT:
+ if (!_atPending) _startAT("AT+CGATT?","+CGATT:",2000);
+ else {
+ if (_atDoneTimeout()) { _enter(State::NTP_SAPBR_CLOSE); return; }
+ if (_atMatchedExpect()) {
+ if (_atResp.indexOf("+CGATT:1") >= 0) _enter(State::NTP_SAPBR_CFG1);
+ else { _atPending = false; _startAT("AT+CGATT=1","OK",5000); }
+ }
+ }
+ return;
+
+ case State::NTP_SAPBR_CFG1:
+ if (!_atPending) _startAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_SAPBR_CFG_APN);
+ return;
+
+ case State::NTP_SAPBR_CFG_APN:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"APN\",\"") + _ntp.apn + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter((_ntp.user && _ntp.user[0]) ? State::NTP_SAPBR_CFG_USER
+ :((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN));
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_USER:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"USER\",\"") + _ntp.user + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter((_ntp.pass && _ntp.pass[0]) ? State::NTP_SAPBR_CFG_PWD :State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_CFG_PWD:{
+ if (!_atPending) {
+ String cmd = String("AT+SAPBR=3,1,\"PWD\",\"") + _ntp.pass + "\"";
+ _startAT(cmd.c_str(),"OK",2000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter(State::NTP_SAPBR_OPEN);
+ }
+ return;
+ }
+
+ case State::NTP_SAPBR_OPEN:
+ if (!_atPending) _startAT("AT+SAPBR=1,1","OK",45000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_CNTPCID);
+ return;
+
+ case State::NTP_CNTPCID:
+ if (!_atPending) _startAT("AT+CNTPCID=1","OK",2000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::NTP_CNTP_SET);
+ return;
+
+ case State::NTP_CNTP_SET:{
+ if (!_atPending) {
+ String cmd = String("AT+CNTP=\"") + (_ntp.server ? _ntp.server :"pool.ntp.org") + "\"," + String(_ntp.tzHours);
+ _startAT(cmd.c_str(),"OK",3000);
+ } else if (_atOk || _atDoneTimeout()) {
+ _enter(State::NTP_CNTP_START);
+ }
+ return;
+ }
+
+ case State::NTP_CNTP_START:
+ if (!_atPending) _startAT("AT+CNTP","+CNTP:",20000);
+ else {
+ if (_atMatchedExpect() || _atDoneTimeout()) _enter(State::NTP_SAPBR_CLOSE);
+ }
+ return;
+
+ case State::NTP_SAPBR_CLOSE:
+ if (!_atPending) _startAT("AT+SAPBR=0,1","OK",8000);
+ else if (_atOk || _atDoneTimeout()) _enter(State::REQ_CCLK_AFTER_NTP);
+ return;
+
+ case State::REQ_CCLK_AFTER_NTP:
+ if (!_atPending) {
+ _lastCCLK = "";
+ _startAT("AT+CCLK?","+CCLK:",2000);
+ } else {
+ if (_atMatchedExpect()) {
+ if (_lastCCLK.indexOf("+CCLK:") >= 0) _newTime = true;
+ }
+ _enter(State::IDLE);
+ }
+ return;
+ }
+}
+
+// ---- UART ----
+void SIM800TimeAsync::_readUartNonBlocking() {
+ while (_sim.available()) {
+ char c = (char)_sim.read();
+ if (c == '\r') continue;
+
+ if (c == '\n') {
+ if (_lineBuf.length()) {
+ _handleLine(_lineBuf);
+ _lineBuf = "";
+ }
+ } else {
+ if (_lineBuf.length() < 160) _lineBuf += c;
+ }
+ }
+}
+
+void SIM800TimeAsync::_handleLine(const String& line) {
+ // URC hints
+ if (line.indexOf("RDY") >= 0) _seenRDY = true;
+ if (line.indexOf("Call Ready") >= 0) _seenCallReady = true;
+ if (line.indexOf("SMS Ready") >= 0) _seenSMSReady = true;
+
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F("<< "));
+ _dbg->println(line);
+ }
+
+ if (_atPending) {
+ if (line == "OK") { _atOk = true; _lastAtOkMs = millis(); }
+ else if (line == "ERROR") _atErr = true;
+
+ if (line.startsWith("+CCLK:")) _lastCCLK = line;
+
+ _atResp += line;
+ _atResp += "\n";
+ }
+}
+
+// ---- AT helpers ----
+void SIM800TimeAsync::_startAT(const char* cmd,const char* expect,uint32_t timeoutMs) {
+ _atResp = "";
+ _atExpect = expect;
+ _atPending = true;
+ _atDeadlineMs = millis() + timeoutMs;
+ _atOk = false;
+ _atErr = false;
+
+ if (_dbg && _logAT) {
+ _dbg->print('['); _dbg->print(millis()); _dbg->print("] ");
+ _dbg->print(F(">> "));
+ _dbg->println(cmd);
+ }
+
+ _sim.print(cmd);
+ _sim.print("\r");
+}
+
+bool SIM800TimeAsync::_atDoneTimeout() const {
+ if (!_atPending) return false;
+ return (int32_t)(millis() - _atDeadlineMs) >= 0;
+}
+
+bool SIM800TimeAsync::_atMatchedExpect() const {
+ if (!_atPending || !_atExpect) return false;
+ return _atResp.indexOf(_atExpect) >= 0;
+}
+
+// ---- PWRKEY ----
+void SIM800TimeAsync::_pwrkeyIdle() {
+ // Для NPN->GND важно,чтобы "кнопка" не была удержана.
+#if defined(INPUT_PULLDOWN)
+ pinMode(_pwrkeyPin,INPUT_PULLDOWN);
+#else
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? LOW :HIGH);
+#endif
+}
+
+void SIM800TimeAsync::_pwrkeyPress() {
+ pinMode(_pwrkeyPin,OUTPUT);
+ digitalWrite(_pwrkeyPin,_pwrkeyActiveHigh ? HIGH :LOW);
+}
+
+void SIM800TimeAsync::_pwrkeyRelease() { _pwrkeyIdle(); }
+
+// ---- time parse/valid ----
+bool SIM800TimeAsync::parseCCLK(const String& resp,
+ int& year,int& month,int& day,
+ int& hour,int& minute,int& second,
+ int& tzQuarterHours) {
+
+ int q1 = resp.indexOf('\"');
+ int q2 = resp.indexOf('\"',q1 + 1);
+ if (q1 < 0 || q2 < 0) return false;
+
+ String v = resp.substring(q1 + 1,q2); // yy/MM/dd,hh:mm:ss±zz
+ if (v.length() < 17) return false;
+
+ int yy = v.substring(0,2).toInt();
+ month = v.substring(3,5).toInt();
+ day = v.substring(6,8).toInt();
+ hour = v.substring(9,11).toInt();
+ minute = v.substring(12,14).toInt();
+ second = v.substring(15,17).toInt();
+ year = 2000 + yy;
+
+ tzQuarterHours = 0;
+ if (v.length() >= 20) {
+ char sign = v.charAt(17);
+ int zz = v.substring(18).toInt(); // четверти часа
+ tzQuarterHours = (sign == '-') ? -zz :zz;
+ }
+ return true;
+}
+
+bool SIM800TimeAsync::_isCCLKValid(const String& resp,int minYear) {
+ int y,mo,d,h,mi,s,tzq;
+ if (!parseCCLK(resp,y,mo,d,h,mi,s,tzq)) return false;
+ if (y < minYear) return false;
+ if (mo < 1 || mo > 12) return false;
+ if (d < 1 || d > 31) return false;
+ if (h < 0 || h > 23) return false;
+ if (mi < 0 || mi > 59) return false;
+ if (s < 0 || s > 59) return false;
+ return true;
+}
+Как включить статус на дисплее (пример в .ino)
+После sim.begin(9600);:
+
+cpp Копировать
+sim.setHealthPingMs(60000);
+sim.setStatusPollMs(5000); // например 5 секунд
+sim.setMaxRecoveryAttempts(5);
+В loop() (где рисуете TFT):
+
+cpp Копировать
+char st[48];
+snprintf(st,sizeof(st),"NET:%d RSSI:%ddBm [%u]",
+ sim.networkRegistered() ? 1 :0,
+ (int)sim.rssiDbm(),
+ (unsigned)sim.signalBars());
+
+tft.drawString(st,5,5,2);
+Если хотите — я также дам готовый NetFeed.h/.cpp (как для TimeFeed),чтобы дисплейная часть
+ читала уже подготовленные значения и перерисовывалась только при изменении.
+ 
+ //--------------------------------------------------------------------------
+ 
+ NetFeed.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// Данные для отображения на дисплее (обновляйте из loop() по данным SIM800TimeAsync)
+extern volatile bool gNetUpdated;
+
+// Сеть
+extern bool gNetRegistered; // true если CREG=1 или 5
+extern uint8_t gCregStat; // 0..5 (как в +CREG)
+
+// Сигнал
+extern int16_t gRssiDbm; // 0 если unknown
+extern uint8_t gSignalBars; // 0..5
+extern int8_t gCsqRssi; // 0..31,99=unknown
+extern uint8_t gCsqBer; // 0..7,99=unknown
+
+// Утилита:обновить кэш из SIM800TimeAsync (возвращает true если что-то изменилось)
+class SIM800TimeAsync;
+bool NetFeed_UpdateFromSim(const SIM800TimeAsync& sim);
+NetFeed.cpp
+cpp Копировать
+#include "NetFeed.h"
+#include "SIM800TimeAsync.h"
+
+volatile bool gNetUpdated = false;
+
+bool gNetRegistered = false;
+uint8_t gCregStat = 0;
+
+int16_t gRssiDbm = 0;
+uint8_t gSignalBars = 0;
+int8_t gCsqRssi = 99;
+uint8_t gCsqBer = 99;
+
+bool NetFeed_UpdateFromSim(const SIM800TimeAsync& sim)
+{
+ bool changed = false;
+
+ bool netReg = sim.networkRegistered();
+ uint8_t creg = sim.cregStat();
+
+ int16_t dbm = sim.rssiDbm();
+ uint8_t bars = sim.signalBars();
+ int8_t rssi = sim.csqRssi();
+ uint8_t ber = sim.csqBer();
+
+ if (gNetRegistered != netReg) { gNetRegistered = netReg; changed = true; }
+ if (gCregStat != creg) { gCregStat = creg; changed = true; }
+
+ if (gRssiDbm != dbm) { gRssiDbm = dbm; changed = true; }
+ if (gSignalBars != bars) { gSignalBars = bars; changed = true; }
+ if (gCsqRssi != rssi) { gCsqRssi = rssi; changed = true; }
+ if (gCsqBer != ber) { gCsqBer = ber; changed = true; }
+
+ if (changed) gNetUpdated = true;
+ return changed;
+}
+Как использовать в вашем .ino (пример)
+Добавьте #include "NetFeed.h" и в loop():
+
+cpp Копировать
+NetFeed_UpdateFromSim(sim);
+
+if (gNetUpdated) {
+ gNetUpdated = false;
+
+ char st[48];
+ snprintf(st,sizeof(st),"NET:%d CREG:%u RSSI:%ddBm [%u]",
+ gNetRegistered ? 1 :0,
+ (unsigned)gCregStat,
+ (int)gRssiDbm,
+ (unsigned)gSignalBars);
+
+ tft.drawString(st,5,5,2);
+}
+Так дисплей перерисуется только при изменении статуса сети/сигнала.
+
+//********************************************************************************
+
+Сделаем так,чтобы Menu.cpp сам “брал” данные сети/сощности сигнала и рисовал их,а .ino 
+только обновлял кэш (NetFeed) и дергал перерисовку при изменении.
+
+Самый простой и устойчивый вариант (без передачи ссылок на SIM800TimeAsync внутрь Menu) — 
+использовать NetFeed.h/.cpp как общий “поставщик” данных:
+
+loop() вызывает NetFeed_UpdateFromSim(sim);
+если gNetUpdated==true → вызываем метод menu_start.drawModemStatus();
+Menu.cpp включает NetFeed.h и использует gNetRegistered/gRssiDbm/gSignalBars/...
+Так Menu не зависит от SIM800 напрямую (никаких циклических include),и вы реально “вызываете параметры” из Menu.h/Menu.cpp.
+
+1) Правка Menu.h (добавить метод отрисовки статуса модема)
+Добавьте в объявление класса Menu (в public):
+
+cpp Копировать
+// Отрисовка статуса сети/сигнала (берёт данные из NetFeed)
+void drawModemStatus();
+Если у вас есть “тик”/перерисовка стартовой страницы — можно вызывать там,но лучше сделать отдельным методом.
+
+2) Правка Menu.cpp (подключить NetFeed и отрисовать)
+В начало Menu.cpp добавьте:
+
+cpp Копировать
+#include "NetFeed.h"
+И реализуйте метод:
+
+cpp Копировать
+void Menu::drawModemStatus()
+{
+ // Координаты/шрифт подберите под вашу верстку
+ const int x = 5;
+ const int y = 5; // например в верхней строке
+ const int font = 2;
+
+ char buf[48];
+
+ // Пример:NET:1 RSSI:-79dBm [4]
+ // Если RSSI неизвестен (gRssiDbm==0 и gCsqRssi==99) — показываем прочерк.
+ if (gCsqRssi == 99 || gRssiDbm == 0) {
+ snprintf(buf,sizeof(buf),"NET:%d CREG:%u RSSI:-- [0]",
+ gNetRegistered ? 1 :0,
+ (unsigned)gCregStat);
+ } else {
+ snprintf(buf,sizeof(buf),"NET:%d CREG:%u RSSI:%ddBm [%u]",
+ gNetRegistered ? 1 :0,
+ (unsigned)gCregStat,
+ (int)gRssiDbm,
+ (unsigned)gSignalBars);
+ }
+
+ // Рисуем (tft у вас хранится как указатель в Menu:Menu menu_start(&tft);)
+ // Если у вас другое имя — подставьте
+ tft->setTextColor(TFT_GREEN,TFT_BLACK);
+ tft->drawString(buf,x,y,font);
+}
+Если Menu хранит не tft,а иначе — подставьте правильный указатель/ссылку (_tft,display,и т.п.).
+
+3) Правка .ino:обновлять NetFeed и дергать Menu при изменении
+В .ino подключите:
+
+cpp Копировать
+#include "NetFeed.h"
+В loop() добавьте (после sim.tick(); и до тяжёлой графики):
+
+cpp Копировать
+NetFeed_UpdateFromSim(sim);
+
+if (gNetUpdated) {
+ gNetUpdated = false;
+
+ // Рисуем статус только когда он изменился
+ menu_start.drawModemStatus();
+}
+4) Важно:где именно рисовать (чтобы не “затиралось”)
+Если menu_start.drawStartPage() перерисовывает весь экран,он может затирать строку статуса. Тогда:
+
+либо вызывайте drawModemStatus() после каждой полной перерисовки страницы,
+либо выделите под статус фиксированную область и не очищайте её полностью.
+Практично:
+
+вызывать menu_start.drawModemStatus(); внутри Menu::drawStartPage() в конце,
+и дополнительно по gNetUpdated.
+Если покажете фрагмент Menu.h/Menu.cpp (как у вас хранится указатель на TFT_eSPI и как рисуются строки),
+я подставлю точные имена полей/методов и координаты 
+под вашу верстку,чтобы вы просто вставили готовый код без ручной подгонки.
+
+
