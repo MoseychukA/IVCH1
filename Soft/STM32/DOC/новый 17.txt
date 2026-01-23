@@ -1,0 +1,125 @@
+Ошибка потому,что в вашем .ino нет видимого объявления Ethernet (класса/глобального объекта
+ из Ethernet_Generic),т.к. вы сознательно убрали #include <Ethernet_Generic.h> из .ino,чтобы не словить multiple definition.
+
+Правильный выход:не использовать Ethernet.localIP() в .ino,а получать IP через ваш ntpLan 
+(внутри него Ethernet_Generic уже подключён),и уже строкой отдавать в NetFeed.
+
+Вариант 1 (рекомендую):добавить метод localIP() в NtpLanService_Generic
+1) Добавьте в NtpLanService_Generic.h (public)
+cpp Копировать
+IPAddress localIP() const;
+2) Реализация в NtpLanService_Generic.cpp
+Внутри Impl добавьте метод:
+
+cpp Копировать
+IPAddress localIP() const { return Ethernet.localIP(); }
+А внизу файла добавьте обёртку:
+
+cpp Копировать
+IPAddress NtpLanService_Generic::localIP() const
+{
+ return _impl ? _impl->localIP() :IPAddress(0,0,0,0);
+}
+Вариант 2:обновление IP в .ino через ntpLan.localIP()
+Теперь ваша функция updateIpFeed1Hz() в .ino будет такой:
+
+cpp Копировать
+static void updateIpFeed1Hz()
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ IPAddress ip = ntpLan.localIP(); // <-- вместо Ethernet.localIP()
+
+ char buf[16];
+ snprintf(buf,sizeof(buf),"%u.%u.%u.%u",ip[0],ip[1],ip[2],ip[3]);
+
+ bool ch = false;
+ if (strcmp(gIp1Str,buf) != 0) { strncpy(gIp1Str,buf,sizeof(gIp1Str)-1); gIp1Str[15]=0; ch = true; }
+
+ if (strcmp(gIp2Str,"0.0.0.0") != 0) { strncpy(gIp2Str,"0.0.0.0",15); gIp2Str[15]=0; ch = true; }
+
+ if (ch) gIpUpdated = true;
+}
+И всё будет компилироваться без включения Ethernet_Generic в .ino.
+
+Почему так правильно
+Ethernet_Generic у вас уже подключён только в NtpLanService_Generic.cpp. Если подключить его ещё и
+ в .ino,вы снова рискуете получить multiple definition (зависит от версии библиотеки). Поэтому доступ к IP делаем через сервис.
+
+Если хотите,могу добавить ещё методы:
+
+const char* linkReport() const
+const char* speedReport() const
+const char* duplexReport() const
+чтобы и статус линка тоже обновлять в NetFeed без прямого доступа к Ethernet из .ino.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Рассуждения
+
+Вы всё ещё компилируете старую строку:
+
+cpp Копировать
+IPAddress ip = Ethernet.localIP()
+Поэтому ошибка та же. В .ino нельзя обращаться к Ethernet,пока вы не подключили Ethernet_Generic 
+(а подключать его в .ino мы не хотим из‑за “multiple definition”). Нужно получать IP через ntpLan.
+
+Ниже — что сделать точно.
+
+1) Добавьте метод localIP() в NtpLanService_Generic
+1.1. NtpLanService_Generic.h (в public)
+Добавьте строку:
+
+cpp Копировать
+IPAddress localIP() const;
+1.2. NtpLanService_Generic.cpp
+Внутри struct NtpLanService_Generic::Impl добавьте метод:
+
+cpp Копировать
+IPAddress localIP() const { return Ethernet.localIP(); }
+Внизу файла,после printStatus1Hz() добавьте обёртку:
+
+cpp Копировать
+IPAddress NtpLanService_Generic::localIP() const
+{
+ return _impl ? _impl->localIP() :IPAddress(0,0,0,0);
+}
+2) Исправьте updateIpFeed1Hz() в .ino
+Замените проблемную строку полностью.
+
+Было (у вас):
+cpp Копировать
+IPAddress ip = Ethernet.localIP()
+Должно быть:
+cpp Копировать
+IPAddress ip = ntpLan.localIP();
+Полная правильная версия функции:
+
+cpp Копировать
+static void updateIpFeed1Hz()
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ IPAddress ip = ntpLan.localIP(); // <-- ВАЖНО:не Ethernet.localIP()
+ char buf[16];
+ snprintf(buf,sizeof(buf),"%u.%u.%u.%u",ip[0],ip[1],ip[2],ip[3]);
+
+ bool ch = false;
+ if (strcmp(gIp1Str,buf) != 0) { strncpy(gIp1Str,buf,sizeof(gIp1Str)-1); gIp1Str[15]=0; ch = true; }
+
+ if (strcmp(gIp2Str,"0.0.0.0") != 0) { strncpy(gIp2Str,"0.0.0.0",15); gIp2Str[15]=0; ch = true; }
+
+ if (ch) gIpUpdated = true;
+}
+3) Убедитесь,что .ino НЕ содержит #include <Ethernet_Generic.h>
+Иначе снова можно словить конфликты линковки.
+
+Если после этого появится ошибка “class NtpLanService_Generic has no member named localIP”,значит 
+вы добавили метод не во все места (п.1). Если хотите — пришлите ваши текущие 
+NtpLanService_Generic.h/.cpp после правок,я проверю по месту.

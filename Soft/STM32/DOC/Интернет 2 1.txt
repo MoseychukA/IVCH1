@@ -1,0 +1,4536 @@
+Требуется разработать программу второго канала интернет для текущего проекта.
+Создать локальный NTP server с синхронизацией с внешними серверами из интернет.
+Микроконтроллер STM32F103CBT6. Среда программирования Arduino IDE
+Модуль интернет W5500.
+PA4 SPI1_SS
+PA5 SPI1_SCK
+PA6 SPI1_MISO
+PA7 SPI1_MOSI
+
+Дополнительно организовать локальные запросы клиентов по UART2 (PA2, PA3) 
+и RS485 UART3 (PB10, PB11)
+
+Связь с центральным модулем на STM32F103VGT6 по протоколу I2C.
+Данные о текущем времени получать из центрального модуля DS3231
+
+Включить настройки дополнительного канала интернет в меню центрального модуля.
+
+Создать программу рабты с дополнительным каналом интернет на центральном модуле STM32F103VGT6 по протоколу I2C.
+Выполнять запросы центрального модуля о синхронизации от внешних серверов через дополнительный канал интернет.
+Отображать и выполнять настройки второго канала интернет в меню "Интернет2"
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — завершённый,понятный комплект для:
+
+модуля INTERNET2 на STM32F103CBT6 + W5500 (локальный NTP‑server,синхронизация с внешними NTP,UART2 + UART3(RS485),I2C‑Slave 0x42).
+центрального модуля на STM32F103VGT6 (I2C‑Master,отправка времени DS3231 в INTERNET2,запрос 
+синхронизации,чтение статуса/IP2,интеграция с меню “Интернет2”).
+Уточнения учтены:
+
+RS485:автопереключение → DE/RE не управляем.
+I2C:PB6/PB7,100 кГц
+DS3231 хранит локальное время → на I2C в INTERNET2 передаём UTC unix,потому что NTP работает в UTC.
+Часть A. INTERNET2 модуль (STM32F103CBT6) — файлы проекта
+A1) Internet2_Slave.ino
+cpp Копировать
+/*
+ Internet2 module
+ MCU:STM32F103CBT6
+ W5500:SPI1 PA4=SS,PA5=SCK,PA6=MISO,PA7=MOSI
+ UART2:PA2/PA3 (clients)
+ UART3 RS485:PB10/PB11 (clients,auto-direction)
+ I2C Slave:PB6/PB7 @100kHz,addr 0x42
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+
+#include "I2CInternet2Proto.h"
+#include "W5500NtpServerClient.h"
+#include "TimeSerialServices.h"
+
+static const uint8_t I2C_ADDR = 0x42;
+
+W5500NtpServerClient net2;
+I2CInternet2Proto proto(net2);
+
+// UART clients
+HardwareSerial& U2 = Serial2; // PA3 RX,PA2 TX (STM32duino naming may swap; adjust if needed)
+HardwareSerial& U3 = Serial3; // PB11 RX,PB10 TX
+
+TimeSerialServices serialSvc(U2,U3,net2);
+
+void setup() {
+ Serial.begin(115200);
+ delay(200);
+ Serial.println("Internet2 slave start");
+
+ Wire.begin(I2C_ADDR);
+ Wire.setClock(100000);
+ Wire.onReceive(I2CInternet2Proto::onReceiveThunk);
+ Wire.onRequest(I2CInternet2Proto::onRequestThunk);
+ I2CInternet2Proto::instance = &proto;
+
+ U2.begin(115200);
+ U3.begin(115200);
+
+ net2.begin(); // старт Ethernet + UDP
+ proto.resetReg(); // по умолчанию STATUS
+
+ Serial.println("Internet2 slave ready");
+}
+
+void loop() {
+ net2.tick();
+ serialSvc.tick();
+}
+A2) I2CInternet2Proto.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include "W5500NtpServerClient.h"
+
+// I2C slave protocol @0x42
+// Reg write:first byte is reg
+// 0x10 SET_TIME_UTC:u32 unixUtc LE + u16 ms LE
+// 0x20 NETCFG:u8 dhcp + ip[4]+mask[4]+gw[4]+dns[4]+upstream[4]+u32 periodMs
+// 0x30 CMD:u8 cmd (1=sync now)
+// Read:0x80 STATUS (16 bytes)
+class I2CInternet2Proto {
+public:
+ static I2CInternet2Proto* instance;
+
+ explicit I2CInternet2Proto(W5500NtpServerClient& n) :_n(n) {}
+
+ static void onReceiveThunk(int n) { if (instance) instance->onReceive(n); }
+ static void onRequestThunk() { if (instance) instance->onRequest(); }
+
+ void resetReg() { _reg = 0x80; }
+
+ void onReceive(int n);
+ void onRequest();
+
+private:
+ W5500NtpServerClient& _n;
+ uint8_t _reg = 0x80;
+
+ void handleSetTime();
+ void handleNetCfg();
+ void handleCmd();
+
+ void writeStatus();
+};
+A3) I2CInternet2Proto.cpp
+cpp Копировать
+#include "I2CInternet2Proto.h"
+
+I2CInternet2Proto* I2CInternet2Proto::instance = nullptr;
+
+static uint32_t readU32LE(TwoWire& w) {
+ uint32_t v = 0;
+ v |= (uint32_t)(uint8_t)w.read();
+ v |= (uint32_t)(uint8_t)w.read() << 8;
+ v |= (uint32_t)(uint8_t)w.read() << 16;
+ v |= (uint32_t)(uint8_t)w.read() << 24;
+ return v;
+}
+static uint16_t readU16LE(TwoWire& w) {
+ uint16_t v = 0;
+ v |= (uint16_t)(uint8_t)w.read();
+ v |= (uint16_t)(uint8_t)w.read() << 8;
+ return v;
+}
+
+void I2CInternet2Proto::onReceive(int n) {
+ if (n <= 0) return;
+
+ _reg = (uint8_t)Wire.read(); // first byte = reg
+ n--;
+
+ switch (_reg) {
+ case 0x10:handleSetTime(); break;
+ case 0x20:handleNetCfg(); break;
+ case 0x30:handleCmd(); break;
+ default:
+ while (Wire.available()) Wire.read();
+ break;
+ }
+}
+
+void I2CInternet2Proto::handleSetTime() {
+ if (Wire.available() < 4) { while (Wire.available()) Wire.read(); return; }
+ uint32_t unixUtc = readU32LE(Wire);
+ uint16_t ms = 0;
+ if (Wire.available() >= 2) ms = readU16LE(Wire);
+ _n.setMasterTimeUtc(unixUtc,ms);
+ while (Wire.available()) Wire.read();
+}
+
+void I2CInternet2Proto::handleNetCfg() {
+ if (Wire.available() < (1 + 4*5 + 4)) { while (Wire.available()) Wire.read(); return; }
+
+ W5500NtpServerClient::NetCfg c;
+ c.dhcp = (uint8_t)Wire.read();
+
+ for (int i=0;i<4;i++) c.ip[i] = (uint8_t)Wire.read();
+ for (int i=0;i<4;i++) c.mask[i] = (uint8_t)Wire.read();
+ for (int i=0;i<4;i++) c.gw[i] = (uint8_t)Wire.read();
+ for (int i=0;i<4;i++) c.dns[i] = (uint8_t)Wire.read();
+ for (int i=0;i<4;i++) c.upstream[i] = (uint8_t)Wire.read();
+
+ c.periodMs = readU32LE(Wire);
+
+ _n.applyNetCfg(c);
+ while (Wire.available()) Wire.read();
+}
+
+void I2CInternet2Proto::handleCmd() {
+ if (Wire.available() < 1) { while (Wire.available()) Wire.read(); return; }
+ uint8_t cmd = (uint8_t)Wire.read();
+ if (cmd == 1) _n.requestSyncNow();
+ while (Wire.available()) Wire.read();
+}
+
+void I2CInternet2Proto::onRequest() {
+ // Master does:write(reg) then requestFrom
+ if (_reg == 0x80) writeStatus();
+ else writeStatus();
+}
+
+void I2CInternet2Proto::writeStatus() {
+ auto st = _n.status();
+
+ uint8_t buf[16] = {0};
+ buf[0] = 1; // protoVer
+
+ buf[1] = 0;
+ if (st.linkUp) buf[1] |= (1<<0);
+ if (st.dhcp) buf[1] |= (1<<1);
+ if (st.haveMasterTime) buf[1] |= (1<<2);
+ if (st.syncInProgress) buf[1] |= (1<<3);
+
+ buf[2]=st.ip[0]; buf[3]=st.ip[1]; buf[4]=st.ip[2]; buf[5]=st.ip[3];
+
+ int32_t off = st.lastOffsetSec;
+ buf[6]=(uint8_t)off; buf[7]=(uint8_t)(off>>8); buf[8]=(uint8_t)(off>>16); buf[9]=(uint8_t)(off>>24);
+
+ uint32_t ntp = st.lastNtpUtc;
+ buf[10]=(uint8_t)ntp; buf[11]=(uint8_t)(ntp>>8); buf[12]=(uint8_t)(ntp>>16); buf[13]=(uint8_t)(ntp>>24);
+
+ buf[14] = st.lastSyncOk ? 1 :0;
+ buf[15] = 0;
+
+ Wire.write(buf,sizeof(buf));
+}
+A4) W5500NtpServerClient.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class W5500NtpServerClient {
+public:
+ struct NetCfg {
+ uint8_t dhcp = 1;
+ uint8_t ip[4] = {192,168,75,232};
+ uint8_t mask[4] = {255,255,255,0};
+ uint8_t gw[4] = {192,168,75,1};
+ uint8_t dns[4] = {8,8,8,8};
+
+ uint8_t upstream[4] = {162,159,200,123}; // внешний NTP IP
+ uint32_t periodMs = 3600000UL;
+ };
+
+ struct Status {
+ bool linkUp=false;
+ bool dhcp=true;
+ bool haveMasterTime=false;
+ bool syncInProgress=false;
+
+ uint8_t ip[4] = {0,0,0,0};
+
+ bool lastSyncOk=false;
+ uint32_t lastNtpUtc=0;
+ int32_t lastOffsetSec=0;
+ uint32_t lastSyncMs=0;
+ };
+
+ void begin();
+ void tick();
+
+ void applyNetCfg(const NetCfg& cfg);
+ void requestSyncNow();
+
+ // from master:unix utc + ms
+ void setMasterTimeUtc(uint32_t unixUtc,uint16_t ms);
+
+ // "server time" (derived from master time)
+ uint32_t nowUtc() const;
+
+ Status status() const { return _st; }
+
+ // UART clients
+ void printNowTo(Stream& s) const;
+
+private:
+ NetCfg _cfg{};
+ mutable Status _st{};
+
+ uint32_t _baseUnix=0;
+ uint32_t _baseMillis=0;
+ uint16_t _baseMs=0;
+
+ uint32_t _nextSyncMs=0;
+ bool _syncReq=false;
+
+ // internals
+ void ethBegin();
+ bool linkUp() const;
+
+ void tickNtpServer();
+ void tickNtpClient();
+
+ uint32_t syncUpstreamOnce(); // returns unix utc or 0
+};
+A5) W5500NtpServerClient.cpp
+cpp Копировать
+#include "W5500NtpServerClient.h"
+
+#include <SPI.h>
+#include <IPAddress.h>
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+
+#define USE_THIS_SS_PIN PA4
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+static EthernetUDP udpSrv;
+static EthernetUDP udpCli;
+
+static const uint16_t NTP_PORT = 123;
+static uint32_t unixToNtp1900(uint32_t u){ return u + 2208988800UL; }
+static uint32_t ntp1900ToUnix(uint32_t n){ return n - 2208988800UL; }
+
+bool W5500NtpServerClient::linkUp() const {
+ const char* s = Ethernet.linkReport();
+ return (s && strcmp(s,"LINK")==0);
+}
+
+void W5500NtpServerClient::begin() {
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+ SPI_New.begin();
+
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ ethBegin();
+
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ _nextSyncMs = millis() + 1000;
+}
+
+void W5500NtpServerClient::ethBegin() {
+ uint8_t mac[6] = {0xDE,0xAD,0xBE,0xEF,0x02,0x02};
+
+ if (_cfg.dhcp && linkUp()) {
+ int ok = Ethernet.begin(mac,&SPI_New,3000,1000);
+ if (!ok) _cfg.dhcp = 0;
+ } else {
+ _cfg.dhcp = 0;
+ }
+
+ if (!_cfg.dhcp) {
+ Ethernet.begin(mac,
+ IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+ IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+ IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+ IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+ }
+}
+
+void W5500NtpServerClient::applyNetCfg(const NetCfg& cfg) {
+ _cfg = cfg;
+ ethBegin();
+ udpSrv.stop(); udpCli.stop();
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+}
+
+void W5500NtpServerClient::setMasterTimeUtc(uint32_t unixUtc,uint16_t ms) {
+ _baseUnix = unixUtc;
+ _baseMillis = millis();
+ _baseMs = ms;
+ _st.haveMasterTime = (unixUtc != 0);
+}
+
+uint32_t W5500NtpServerClient::nowUtc() const {
+ if (_baseUnix == 0) return 0;
+ uint32_t dt = (millis() - _baseMillis) / 1000UL;
+ return _baseUnix + dt;
+}
+
+void W5500NtpServerClient::requestSyncNow() { _syncReq = true; }
+
+void W5500NtpServerClient::tick() {
+ _st.linkUp = linkUp();
+ _st.dhcp = (_cfg.dhcp != 0);
+
+ IPAddress ip = Ethernet.localIP();
+ _st.ip[0]=ip[0]; _st.ip[1]=ip[1]; _st.ip[2]=ip[2]; _st.ip[3]=ip[3];
+
+ tickNtpServer();
+
+ if (!_st.linkUp) return;
+
+ if (_cfg.dhcp) Ethernet.maintain();
+
+ uint32_t now = millis();
+ if (_syncReq || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncReq = false;
+ _nextSyncMs = now + _cfg.periodMs;
+ tickNtpClient();
+ }
+}
+
+void W5500NtpServerClient::tickNtpServer() {
+ int packetSize = udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = udpSrv.read(req,48);
+ if (n < 48) return;
+
+ uint32_t unixUtc = nowUtc();
+ if (unixUtc == 0) return;
+
+ uint32_t txSec1900 = unixToNtp1900(unixUtc);
+
+ uint8_t resp[48] = {0};
+ resp[0] = (0<<6) | (4<<3) | 4;
+ resp[1]=1; resp[2]=6; resp[3]=(uint8_t)-20;
+ resp[12]='L'; resp[13]='O'; resp[14]='C'; resp[15]='2';
+
+ memcpy(&resp[24],&req[40],8);
+
+ resp[40]=(txSec1900>>24)&0xFF; resp[41]=(txSec1900>>16)&0xFF; resp[42]=(txSec1900>>8)&0xFF; resp[43]=txSec1900&0xFF;
+
+ udpSrv.beginPacket(udpSrv.remoteIP(),udpSrv.remotePort());
+ udpSrv.write(resp,48);
+ udpSrv.endPacket();
+}
+
+uint32_t W5500NtpServerClient::syncUpstreamOnce() {
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ pkt[0]=0b11100011; pkt[1]=0; pkt[2]=6; pkt[3]=0xEC;
+
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+
+ uint32_t t0 = millis();
+ while (millis() - t0 < 1200) {
+ int sz = udpCli.parsePacket();
+ if (sz >= 48) {
+ uint8_t resp[48];
+ int n = udpCli.read(resp,48);
+ if (n < 48) return 0;
+
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 < 2208988800UL) return 0;
+ return ntp1900ToUnix(sec1900);
+ }
+ delay(1);
+ }
+ return 0;
+}
+
+void W5500NtpServerClient::tickNtpClient() {
+ if (!_st.haveMasterTime) return;
+
+ _st.syncInProgress = true;
+ uint32_t ntpUtc = syncUpstreamOnce();
+ _st.syncInProgress = false;
+
+ _st.lastSyncMs = millis();
+ if (ntpUtc == 0) { _st.lastSyncOk=false; return; }
+
+ uint32_t curUtc = nowUtc();
+ _st.lastNtpUtc = ntpUtc;
+ _st.lastOffsetSec = (int32_t)ntpUtc - (int32_t)curUtc;
+ _st.lastSyncOk = true;
+}
+
+void W5500NtpServerClient::printNowTo(Stream& s) const {
+ uint32_t u = nowUtc();
+ auto st = status();
+ s.print("UNIX:"); s.println((unsigned long)u);
+ s.print("IP:"); s.print(st.ip[0]); s.print('.'); s.print(st.ip[1]); s.print('.'); s.print(st.ip[2]); s.print('.'); s.println(st.ip[3]);
+ s.print("SYNC_OK:"); s.println(st.lastSyncOk ? 1 :0);
+ s.print("OFFS:"); s.println(st.lastOffsetSec);
+}
+A6) TimeSerialServices.h/.cpp (UART2 + UART3/RS485)
+TimeSerialServices.h
+
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include "W5500NtpServerClient.h"
+
+class TimeSerialServices {
+public:
+ TimeSerialServices(HardwareSerial& u2,HardwareSerial& u3,W5500NtpServerClient& n)
+ :_u2(u2),_u3(u3),_n(n) {}
+
+ void tick();
+
+private:
+ HardwareSerial& _u2;
+ HardwareSerial& _u3;
+ W5500NtpServerClient& _n;
+
+ String _b2,_b3;
+
+ void poll(HardwareSerial& s,String& b);
+ void handle(HardwareSerial& s,const String& line);
+};
+TimeSerialServices.cpp
+
+cpp Копировать
+#include "TimeSerialServices.h"
+
+void TimeSerialServices::tick() {
+ poll(_u2,_b2);
+ poll(_u3,_b3);
+}
+
+void TimeSerialServices::poll(HardwareSerial& s,String& b) {
+ while (s.available()) {
+ char c=(char)s.read();
+ if (c=='\r') continue;
+ if (c=='\n') {
+ if (b.length()) { handle(s,b); b=""; }
+ } else {
+ if (b.length() < 80) b += c;
+ }
+ }
+}
+
+void TimeSerialServices::handle(HardwareSerial& s,const String& line) {
+ if (line == "TIME?" || line == "TIME") {
+ _n.printNowTo(s);
+ return;
+ }
+ if (line == "SYNC!") {
+ _n.requestSyncNow();
+ s.println("OK");
+ return;
+ }
+ s.println("ERR");
+}
+Часть B. Центральный модуль (STM32F103VGT6) — поддержка INTERNET2 по I2C
+B1) Драйвер I2C Master:Internet2Client.h/.cpp
+(используйте файлы из предыдущего сообщения “Internet2Client”,они уже подходят; ниже — версия,совместимая и со STM32duino,и с Arduino_STM32)
+
+Internet2Client.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include <IPAddress.h>
+
+class Internet2Client {
+public:
+ struct Status {
+ uint8_t protoVer=0;
+ uint8_t flags=0;
+ IPAddress ip = IPAddress(0,0,0,0);
+ int32_t lastOffsetSec=0;
+ uint32_t lastNtpUtc=0;
+ bool lastSyncOk=false;
+ };
+
+ explicit Internet2Client(TwoWire& w=Wire,uint8_t addr=0x42) :_w(&w),_addr(addr) {}
+
+ bool begin();
+
+ bool setTimeUnixUtc(uint32_t unixUtc,uint16_t ms=0);
+
+ bool applyNetCfg(bool dhcp,IPAddress ip,IPAddress mask,IPAddress gw,IPAddress dns,
+ IPAddress ntpUpstream,uint32_t periodMs);
+
+ bool requestSyncNow();
+ bool readStatus(Status& out);
+
+private:
+ TwoWire* _w;
+ uint8_t _addr;
+
+ bool writeReg(uint8_t reg,const uint8_t* data,size_t len);
+ bool readReg(uint8_t reg,uint8_t* data,size_t len);
+};
+Internet2Client.cpp
+cpp Копировать
+#include "Internet2Client.h"
+
+static uint8_t endTxNoStop(TwoWire* w)
+{
+#if defined(ARDUINO_ARCH_STM32)
+ // STM32duino:endTransmission(false) supported
+ return w->endTransmission(false);
+#else
+ // Arduino_STM32(libmaple):often no bool arg; fallback to normal stop
+ return w->endTransmission();
+#endif
+}
+
+bool Internet2Client::begin() {
+ _w->beginTransmission(_addr);
+ return (_w->endTransmission() == 0);
+}
+
+bool Internet2Client::writeReg(uint8_t reg,const uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write(reg);
+ for (size_t i=0;i<len;i++) _w->write(data[i]);
+ return (_w->endTransmission() == 0);
+}
+
+bool Internet2Client::readReg(uint8_t reg,uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write(reg);
+ if (endTxNoStop(_w) != 0) return false;
+
+ size_t got = _w->requestFrom((int)_addr,(int)len);
+ if (got != len) return false;
+ for (size_t i=0;i<len;i++) data[i] = (uint8_t)_w->read();
+ return true;
+}
+
+bool Internet2Client::setTimeUnixUtc(uint32_t unixUtc,uint16_t ms) {
+ uint8_t b[6];
+ b[0]=(uint8_t)(unixUtc); b[1]=(uint8_t)(unixUtc>>8); b[2]=(uint8_t)(unixUtc>>16); b[3]=(uint8_t)(unixUtc>>24);
+ b[4]=(uint8_t)(ms); b[5]=(uint8_t)(ms>>8);
+ return writeReg(0x10,b,sizeof(b));
+}
+
+bool Internet2Client::applyNetCfg(bool dhcp,IPAddress ip,IPAddress mask,IPAddress gw,IPAddress dns,
+ IPAddress ntpUpstream,uint32_t periodMs) {
+ uint8_t b[1+4*5+4];
+ b[0] = dhcp?1:0;
+ int k=1;
+ auto putIp=[&](IPAddress a){ b[k++]=a[0]; b[k++]=a[1]; b[k++]=a[2]; b[k++]=a[3]; };
+ putIp(ip); putIp(mask); putIp(gw); putIp(dns); putIp(ntpUpstream);
+ b[k++]=(uint8_t)periodMs; b[k++]=(uint8_t)(periodMs>>8); b[k++]=(uint8_t)(periodMs>>16); b[k++]=(uint8_t)(periodMs>>24);
+ return writeReg(0x20,b,sizeof(b));
+}
+
+bool Internet2Client::requestSyncNow() {
+ uint8_t cmd=1;
+ return writeReg(0x30,&cmd,1);
+}
+
+bool Internet2Client::readStatus(Status& out) {
+ uint8_t b[16];
+ if (!readReg(0x80,b,sizeof(b))) return false;
+
+ out.protoVer = b[0];
+ out.flags = b[1];
+ out.ip = IPAddress(b[2],b[3],b[4],b[5]);
+
+ out.lastOffsetSec = (int32_t)((uint32_t)b[6] | ((uint32_t)b[7]<<8) | ((uint32_t)b[8]<<16) | ((uint32_t)b[9]<<24));
+ out.lastNtpUtc = (uint32_t)b[10] | ((uint32_t)b[11]<<8) | ((uint32_t)b[12]<<16) | ((uint32_t)b[13]<<24);
+ out.lastSyncOk = (b[14] != 0);
+ return true;
+}
+B2) Конвертация DS3231 (локальное) ↔ unix UTC (нужно для Internet2)
+Добавьте в центральный .ino (или отдельный .cpp) функции:
+
+cpp Копировать
+static int32_t daysFromCivil(int y,int m,int d) {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+}
+static void civilFromDays(int32_t z,int& y,int& m,int& d) {
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+}
+static int64_t toEpochSeconds(int y,int mo,int d,int h,int mi,int s) {
+ int32_t days = daysFromCivil(y,mo,d);
+ return (int64_t)days*86400LL + (int64_t)h*3600LL + (int64_t)mi*60LL + (int64_t)s;
+}
+static void fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s) {
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+ if (rem < 0) { rem += 86400LL; days -= 1; }
+ civilFromDays((int32_t)days,y,mo,d);
+ h = (int)(rem / 3600LL); rem %= 3600LL;
+ mi = (int)(rem / 60LL);
+ s = (int)(rem % 60LL);
+}
+
+// DS3231 local -> unix UTC by tzTargetHours
+static uint32_t unixUtcFromRtcLocal(const RTCTime& t,int8_t tzTargetHours) {
+ int64_t local = toEpochSeconds(t.year,t.month,t.dayOfMonth,t.hour,t.minute,t.second);
+ int64_t utc = local - (int64_t)tzTargetHours * 3600LL;
+ if (utc < 0) utc = 0;
+ return (uint32_t)utc;
+}
+
+// unix UTC -> DS3231 local by tzTargetHours
+static void rtcLocalFromUnixUtc(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& out) {
+ int64_t local = (int64_t)unixUtc + (int64_t)tzTargetHours * 3600LL;
+ int y,mo,d,h,mi,s;
+ fromEpochSeconds(local,y,mo,d,h,mi,s);
+ out.year=(uint16_t)y; out.month=(uint8_t)mo; out.dayOfMonth=(uint8_t)d;
+ out.hour=(uint8_t)h; out.minute=(uint8_t)mi; out.second=(uint8_t)s;
+ // dayOfWeek как в вашем RTCSupport:1..7 (Mon..Sun)
+ static int tt[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ int yy=y; if(mo<3) yy-=1;
+ uint8_t dow0 = (uint8_t)((yy + yy/4 - yy/100 + yy/400 + tt[mo-1] + d) % 7); // 0=Sun
+ out.dayOfWeek = (dow0==0)?7:dow0;
+}
+B3) Центральный .ino:что нужно добавить для работы Internet2
+Глобально:
+
+cpp Копировать
+Internet2Client internet2(Wire,0x42);
+В setup():
+
+cpp Копировать
+Wire.begin();
+Wire.setClock(100000);
+
+internet2.begin();
+В loop() раз в 2 сек отправляйте время (UTC) на Internet2:
+
+cpp Копировать
+static uint32_t tSend=0;
+if (millis()-tSend > 2000) {
+ tSend = millis();
+ RTCTime nowLocal = rtc.getTime();
+ uint32_t unixUtc = unixUtcFromRtcLocal(nowLocal,cfg.tzTargetHours);
+ internet2.setTimeUnixUtc(unixUtc,0);
+}
+Раз в 1 сек обновляйте IP2 для HOME:
+
+cpp Копировать
+static uint32_t tIp=0;
+if (millis()-tIp > 1000) {
+ tIp = millis();
+ Internet2Client::Status st;
+ if (internet2.readStatus(st)) {
+ snprintf(gIp2Str,sizeof(gIp2Str),"%u.%u.%u.%u",st.ip[0],st.ip[1],st.ip[2],st.ip[3]);
+ gIpUpdated = true;
+ }
+}
+B4) “Запрос синхронизации через Internet2”
+Когда нужно синхронизироваться (по планировщику/по кнопке/по меню):
+
+internet2.requestSyncNow();
+через ~1–2 секунды прочитать статус:
+если st.lastSyncOk → взять st.lastNtpUtc и обновить DS3231 (локальным):
+cpp Копировать
+Internet2Client::Status st;
+if (internet2.readStatus(st) && st.lastSyncOk && st.lastNtpUtc != 0) {
+ RTCTime tLocal;
+ rtcLocalFromUnixUtc(st.lastNtpUtc,cfg.tzTargetHours,tLocal);
+ rtc.setTime(tLocal.second,tLocal.minute,tLocal.hour,tLocal.dayOfWeek,tLocal.dayOfMonth,tLocal.month,tLocal.year);
+}
+Часть C. Меню центрального:Internet2 настройки и применение на I2C
+У вас уже есть страница “Интернет2”,которая сохраняет LanIfStore::IF2. Теперь нужно добавить применение по I2C при нажатии SAVE.
+
+C1) В центральном .ino добавьте функцию:
+cpp Копировать
+void applyInternet2FromStore()
+{
+ LanIfStore::IfConfig c;
+ lanStore.load(LanIfStore::IF2,c,false);
+
+ // NTP upstream по индексу (тот же порядок что в Menu)
+ IPAddress up;
+ switch (c.ntpIdx % 5) {
+ case 0:up = IPAddress(162,159,200,123); break;
+ case 1:up = IPAddress(162,159,200,1); break;
+ case 2:up = IPAddress(129,6,15,28); break;
+ case 3:up = IPAddress(132,163,96,1); break;
+ default:up = IPAddress(216,239,35,0); break;
+ }
+
+ uint32_t periodMs;
+ switch (c.periodIdx % 6) {
+ case 0:periodMs = 60000UL; break;
+ case 1:periodMs = 600000UL; break;
+ case 2:periodMs = 1800000UL; break;
+ case 3:periodMs = 3600000UL; break;
+ case 4:periodMs = 21600000UL; break;
+ default:periodMs = 43200000UL; break;
+ }
+
+ internet2.applyNetCfg(
+ c.dhcp != 0,
+ IPAddress(c.ip[0],c.ip[1],c.ip[2],c.ip[3]),
+ IPAddress(c.mask[0],c.mask[1],c.mask[2],c.mask[3]),
+ IPAddress(c.gw[0],c.gw[1],c.gw[2],c.gw[3]),
+ IPAddress(c.dns[0],c.dns[1],c.dns[2],c.dns[3]),
+ up,
+ periodMs
+ );
+
+ // сразу дать модулю актуальное время
+ RTCTime nowLocal = rtc.getTime();
+ uint32_t unixUtc = unixUtcFromRtcLocal(nowLocal,cfg.tzTargetHours);
+ internet2.setTimeUnixUtc(unixUtc,0);
+}
+C2) В Menu.cpp на странице Internet2 (Page3) при SAVE вызвать applyInternet2FromStore()
+Если у вас сейчас Page3 по SW4 только сохраняет и выходит — добавьте вызов:
+
+объявление вверху Menu.cpp:
+cpp Копировать
+extern void applyInternet2FromStore();
+в обработчике SW4 для Internet2:
+cpp Копировать
+applyInternet2FromStore();
+Что ещё я могу допаковать “под ключ”
+Интеграция в TimeSyncPlanner:добавить источник “Internet2” (I2C),чтобы планировщик сам делал requestSyncNow() и обновлял DS3231 по lastNtpUtc.
+Авто‑обновление Internet2 времени:не раз в 2 сек,а только когда DS3231 изменился/после синхронизаций.
+RS485 протокол (если захотите не “TIME?” строкой,а бинарный).
+Если пришлёте ваш текущий TimeSyncPlanner.h/.cpp (или хотя бы его интерфейс),я внесу туда Internet2 без ломки остальной логики.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — обновлённые полные файлы TimeSyncPlanner.h/.cpp,которые добавляют поддержку INTERNET2 (второй канал через I2C‑модуль W5500):
+
+планировщик по приоритету:GPS → INTERNET2 → INTERNET (SIM800 NTP) → GSM (SIM800 CCLK)
+при INTERNET2:
+отправляет команду requestSyncNow() по I2C
+опрашивает статус readStatus()
+при успешном ответе берёт lastNtpUtc и устанавливает DS3231 локальным временем (с учётом cfg.tzTargetHours)
+DS3231 у вас хранит локальное время — учтено
+добавлен метод tickPushTimeToInternet2() (раз в 2 сек) — сам отправляет текущий UTC unix во второй модуль,чтобы он мог обслуживать локальные NTP‑клиенты даже без внешней синхронизации.
+Важно:для INTERNET2 требуется ваш Internet2Client.h/.cpp (I2C‑master драйвер),который мы делали ранее.
+
+Также вам нужно добавить в SyncSourcesStore::Data новые поля:
+
+net2Enable (0/1)
+net2PeriodIdx (0..5) И обновить SyncSourcesStore сохранение/загрузку. Если пока не хотите менять структуру EEPROM — можно временно “подвязать” net2Enable/net2PeriodIdx к существующим полям,но правильно — добавить новые.
+TimeSyncPlanner.h (полный,обновлённый)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+#include "SIM800TimeAsync.h"
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+#include "RTCSupport.h"
+#include "GPSNmeaParser.h"
+#include "Internet2Client.h" // <-- ДОБАВЛЕНО
+
+class TimeSyncPlanner {
+public:
+	// Новый конструктор:с поддержкой Internet2
+	TimeSyncPlanner(SIM800TimeAsync& sim,
+		GPSNmeaParser& gps,
+		RealtimeClock& rtc,
+		AT24C128Settings::Config& cfg,
+		SyncSourcesStore::Data& src,
+		Internet2Client* internet2 = nullptr);
+
+	void begin();
+	void tick();
+
+	void onSettingsChanged();
+	void onTimeUpdated(); // вызывайте после установки времени от SIM800 (как у вас)
+
+	void triggerImmediate();
+
+private:
+	SIM800TimeAsync& _sim;
+	GPSNmeaParser& _gps;
+	RealtimeClock& _rtc;
+	AT24C128Settings::Config& _cfg;
+	SyncSourcesStore::Data& _src;
+	Internet2Client* _internet2 = nullptr;
+
+	uint32_t _nextGpsMs = 0;
+	uint32_t _nextNetMs = 0; // SIM800 NTP
+	uint32_t _nextGsmMs = 0; // SIM800 CCLK
+	uint32_t _nextNet2Ms = 0; // Internet2 over I2C
+
+	bool _immediatePending = false;
+
+	// Internet2 state
+	bool _net2Pending = false;
+	uint32_t _net2ReqStartedMs = 0;
+	uint32_t _net2LastSeenNtpUtc = 0;
+
+	// push DS3231 time to Internet2
+	uint32_t _nextPushNet2Ms = 0;
+
+private:
+	static uint32_t periodMsFromIdx(uint8_t idx);
+	static uint32_t catchUpNext(uint32_t now,uint32_t next,uint32_t period);
+
+	static uint8_t dow0_sun(int y,int m,int d);
+	static uint8_t ds3231DowFromDow0(uint8_t dow0);
+
+	// UTC<->Local helpers
+	static int64_t toEpochSeconds(int y,int mo,int d,int h,int mi,int s);
+	static void fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s);
+	static void utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours);
+
+	// DS3231(local) -> unix UTC using cfg.tzTargetHours
+	uint32_t rtcLocalToUnixUtc(const RTCTime& t) const;
+
+	// unix UTC -> DS3231(local) using cfg.tzTargetHours
+	void setRtcFromUnixUtc(uint32_t unixUtc);
+
+	// Periodic send DS3231 time to Internet2 (so it can serve NTP locally)
+	void tickPushTimeToInternet2(uint32_t now);
+
+	bool tryStartGps(uint32_t now,bool immediate);
+	bool tryStartNet(uint32_t now,bool immediate); // SIM800 NTP
+	bool tryStartGsm(uint32_t now,bool immediate); // SIM800 CCLK
+	bool tryStartNet2(uint32_t now,bool immediate); // Internet2 I2C
+};
+TimeSyncPlanner.cpp (полный,обновлённый)
+cpp Копировать
+#include "TimeSyncPlanner.h"
+
+TimeSyncPlanner::TimeSyncPlanner(SIM800TimeAsync& sim,
+	GPSNmeaParser& gps,
+	RealtimeClock& rtc,
+	AT24C128Settings::Config& cfg,
+	SyncSourcesStore::Data& src,
+	Internet2Client* internet2)
+	:_sim(sim),_gps(gps),_rtc(rtc),_cfg(cfg),_src(src),_internet2(internet2)
+{}
+
+uint32_t TimeSyncPlanner::periodMsFromIdx(uint8_t idx) {
+	static const uint32_t kPeriodsMs[6] = {
+	60000UL,600000UL,1800000UL,3600000UL,21600000UL,43200000UL
+	};
+	return kPeriodsMs[idx % 6];
+}
+
+uint32_t TimeSyncPlanner::catchUpNext(uint32_t now,uint32_t next,uint32_t period) {
+	if (period == 0) return now + 60000UL;
+	if ((int32_t)(now - next) < 0) return next;
+	uint32_t diff = now - next;
+	uint32_t steps = diff / period + 1;
+	return next + steps * period;
+}
+
+void TimeSyncPlanner::begin() {
+	uint32_t now = millis();
+	_nextGpsMs = now + periodMsFromIdx(_src.gpsPeriodIdx);
+	_nextNetMs = now + periodMsFromIdx(_src.netPeriodIdx);
+	_nextGsmMs = now + periodMsFromIdx(_src.gsmPeriodIdx);
+
+	// INTERNET2 (если поля ещё не добавлены в Data — см. примечание ниже)
+	_nextNet2Ms = now + periodMsFromIdx(_src.net2PeriodIdx);
+
+	_nextPushNet2Ms = now + 2000;
+}
+
+void TimeSyncPlanner::onSettingsChanged() {
+	uint32_t now = millis();
+	_nextGpsMs = catchUpNext(now,_nextGpsMs,periodMsFromIdx(_src.gpsPeriodIdx));
+	_nextNetMs = catchUpNext(now,_nextNetMs,periodMsFromIdx(_src.netPeriodIdx));
+	_nextGsmMs = catchUpNext(now,_nextGsmMs,periodMsFromIdx(_src.gsmPeriodIdx));
+	_nextNet2Ms = catchUpNext(now,_nextNet2Ms,periodMsFromIdx(_src.net2PeriodIdx));
+}
+
+void TimeSyncPlanner::onTimeUpdated() {
+	// После изменения RTC полезно быстрее отправить время в Internet2
+	_nextPushNet2Ms = millis();
+}
+
+void TimeSyncPlanner::triggerImmediate() { _immediatePending = true; }
+
+// ---------- main tick ----------
+void TimeSyncPlanner::tick() {
+	uint32_t now = millis();
+
+	// push DS3231 time to Internet2 every 2s
+	tickPushTimeToInternet2(now);
+
+	// Если ждём результат Internet2 — опрашиваем статус
+	if (_internet2 && _net2Pending) {
+		Internet2Client::Status st;
+		if (_internet2->readStatus(st)) {
+			// Success when lastSyncOk and lastNtpUtc changed
+			if (st.lastSyncOk && st.lastNtpUtc != 0 && st.lastNtpUtc != _net2LastSeenNtpUtc) {
+				_net2LastSeenNtpUtc = st.lastNtpUtc;
+				setRtcFromUnixUtc(st.lastNtpUtc);
+				_net2Pending = false;
+				onTimeUpdated();
+				return;
+			}
+		}
+		// таймаут ожидания результата (например 3 секунды)
+		if (now - _net2ReqStartedMs > 3000) {
+			_net2Pending = false;
+		}
+	}
+
+	// Немедленный запуск (один раз) по приоритету
+	if (_immediatePending) {
+		if (tryStartGps(now,true) || tryStartNet2(now,true) || tryStartNet(now,true) || tryStartGsm(now,true)) {
+			_immediatePending = false;
+		}
+		return;
+	}
+
+	// Обычное расписание:GPS -> NET2 -> NET(sim) -> GSM(sim)
+	(void)tryStartGps(now,false);
+	if (tryStartNet2(now,false)) return;
+	if (tryStartNet(now,false)) return;
+	(void)tryStartGsm(now,false);
+}
+
+// ---------- GPS ----------
+bool TimeSyncPlanner::tryStartGps(uint32_t now,bool immediate) {
+	if (!_src.gpsEnable) return false;
+
+	uint32_t period = periodMsFromIdx(_src.gpsPeriodIdx);
+	if (!immediate && (int32_t)(now - _nextGpsMs) < 0) return false;
+
+	_nextGpsMs = immediate ? (now + period) :catchUpNext(now,_nextGpsMs,period);
+
+	int y,mo,d,h,mi,s;
+	if (!_gps.getUtc(y,mo,d,h,mi,s)) return false;
+	if (!_gps.hasFix()) return false;
+
+	int tzq_target = (int)_cfg.tzTargetHours * 4;
+	utcToLocal(y,mo,d,h,mi,s,tzq_target);
+
+	uint8_t dsDow = ds3231DowFromDow0(dow0_sun(y,mo,d));
+	_rtc.setTime((uint8_t)s,(uint8_t)mi,(uint8_t)h,dsDow,(uint8_t)d,(uint8_t)mo,(uint16_t)y);
+
+	return true;
+}
+
+// ---------- Internet (SIM800 NTP) ----------
+bool TimeSyncPlanner::tryStartNet(uint32_t now,bool immediate) {
+	if (!_src.netEnable) return false;
+	if (_sim.isBusy()) return false;
+
+	uint32_t period = periodMsFromIdx(_src.netPeriodIdx);
+	if (!immediate && (int32_t)(now - _nextNetMs) < 0) return false;
+
+	_nextNetMs = immediate ? (now + period) :catchUpNext(now,_nextNetMs,period);
+
+	_sim.requestNtpNow();
+	return true;
+}
+
+// ---------- GSM (SIM800 CCLK) ----------
+bool TimeSyncPlanner::tryStartGsm(uint32_t now,bool immediate) {
+	if (!_src.gsmEnable) return false;
+	if (_sim.isBusy()) return false;
+
+	uint32_t period = periodMsFromIdx(_src.gsmPeriodIdx);
+	if (!immediate && (int32_t)(now - _nextGsmMs) < 0) return false;
+
+	_nextGsmMs = immediate ? (now + period) :catchUpNext(now,_nextGsmMs,period);
+
+	_sim.requestTimeNow();
+	return true;
+}
+
+// ---------- Internet2 (I2C module) ----------
+bool TimeSyncPlanner::tryStartNet2(uint32_t now,bool immediate) {
+	if (!_internet2) return false;
+	if (!_src.net2Enable) return false;
+
+	// если уже ждём ответ — не стартуем заново
+	if (_net2Pending) return false;
+
+	uint32_t period = periodMsFromIdx(_src.net2PeriodIdx);
+	if (!immediate && (int32_t)(now - _nextNet2Ms) < 0) return false;
+
+	_nextNet2Ms = immediate ? (now + period) :catchUpNext(now,_nextNet2Ms,period);
+
+	// инициируем sync
+	_internet2->requestSyncNow();
+
+	// запомним,чтобы отследить новый результат
+	Internet2Client::Status st;
+	if (_internet2->readStatus(st)) _net2LastSeenNtpUtc = st.lastNtpUtc;
+
+	_net2Pending = true;
+	_net2ReqStartedMs = now;
+	return true;
+}
+
+// ---------- DS3231(local) <-> unix UTC ----------
+uint32_t TimeSyncPlanner::rtcLocalToUnixUtc(const RTCTime& t) const {
+	int64_t local = toEpochSeconds((int)t.year,(int)t.month,(int)t.dayOfMonth,(int)t.hour,(int)t.minute,(int)t.second);
+	int64_t utc = local - (int64_t)_cfg.tzTargetHours * 3600LL;
+	if (utc < 0) utc = 0;
+	return (uint32_t)utc;
+}
+
+void TimeSyncPlanner::setRtcFromUnixUtc(uint32_t unixUtc) {
+	int64_t local = (int64_t)unixUtc + (int64_t)_cfg.tzTargetHours * 3600LL;
+
+	int y,mo,d,h,mi,s;
+	fromEpochSeconds(local,y,mo,d,h,mi,s);
+
+	uint8_t dsDow = ds3231DowFromDow0(dow0_sun(y,mo,d));
+	_rtc.setTime((uint8_t)s,(uint8_t)mi,(uint8_t)h,dsDow,(uint8_t)d,(uint8_t)mo,(uint16_t)y);
+}
+
+void TimeSyncPlanner::tickPushTimeToInternet2(uint32_t now) {
+	if (!_internet2) return;
+
+	if ((int32_t)(now - _nextPushNet2Ms) < 0) return;
+	_nextPushNet2Ms = now + 2000;
+
+	RTCTime tLocal = _rtc.getTime();
+	uint32_t unixUtc = rtcLocalToUnixUtc(tLocal);
+
+	_internet2->setTimeUnixUtc(unixUtc,0);
+}
+
+// ---- date/time helpers ----
+uint8_t TimeSyncPlanner::dow0_sun(int y,int m,int d) {
+	static int t[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+	if (m < 3) y -= 1;
+	return (uint8_t)((y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7);
+}
+uint8_t TimeSyncPlanner::ds3231DowFromDow0(uint8_t dow0) { return (dow0 == 0) ? 7 :dow0; }
+
+int64_t TimeSyncPlanner::toEpochSeconds(int y,int mo,int d,int h,int mi,int s) {
+	auto daysFromCivil = [](int y,int m,int d)->int32_t {
+		y -= (m <= 2);
+		const int era = (y >= 0 ? y :y - 399) / 400;
+		const unsigned yoe = (unsigned)(y - era * 400);
+		const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+		const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+		return (int32_t)(era * 146097 + (int)doe - 719468);
+	};
+	int32_t days = daysFromCivil(y,mo,d);
+	return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+void TimeSyncPlanner::fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s) {
+	auto civilFromDays = [](int32_t z,int& y,int& m,int& d) {
+		z += 719468;
+		const int era = (z >= 0 ? z :z - 146096) / 146097;
+		const unsigned doe = (unsigned)(z - era * 146097);
+		const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+		y = (int)yoe + era * 400;
+		const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+		const unsigned mp = (5 * doy + 2) / 153;
+		d = (int)(doy - (153 * mp + 2) / 5 + 1);
+		m = (int)(mp + (mp < 10 ? 3 :-9));
+		y += (m <= 2);
+	};
+	int64_t days = t / 86400LL;
+	int64_t rem = t % 86400LL;
+	if (rem < 0) { rem += 86400LL; days -= 1; }
+	civilFromDays((int32_t)days,y,mo,d);
+	h = (int)(rem / 3600LL); rem %= 3600LL;
+	mi = (int)(rem / 60LL);
+	s = (int)(rem % 60LL);
+}
+
+void TimeSyncPlanner::utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours) {
+	const int offsetMin = tzQuarterHours * 15;
+	int64_t epochUTC = toEpochSeconds(y,mo,d,h,mi,s);
+	int64_t epochLocal = epochUTC + (int64_t)offsetMin * 60LL;
+	fromEpochSeconds(epochLocal,y,mo,d,h,mi,s);
+}
+Что нужно сделать в вашем проекте,чтобы это собралось
+1) Добавить поля в SyncSourcesStore::Data
+В SyncSourcesStore::Data добавьте:
+
+cpp Копировать
+uint8_t net2Enable = 1;
+uint8_t net2PeriodIdx = 3; // 1 час,например
+и обновите save/load в SyncSourcesStore (добавить эти 2 байта в EEPROM‑структуру). Если хотите — пришлите SyncSourcesStore.h/.cpp,я верну готовые правки.
+
+2) Создать объект Internet2Client в центральном .ino и передать в планировщик
+В центральном .ino:
+
+cpp Копировать
+Internet2Client internet2(Wire,0x42);
+TimeSyncPlanner planner(sim,gps,rtc,cfg,syncData,&internet2);
+и в setup():
+
+cpp Копировать
+Wire.begin();
+Wire.setClock(100000);
+internet2.begin();
+3) В меню “Интернет2” на SAVE применяйте настройки в модуль (как вы делали applyInternet2FromStore())
+Это отдельно от планировщика (планировщик только запускает синхронизацию).
+
+Если пришлёте SyncSourcesStore.h/.cpp,я обновлю его под net2Enable/net2PeriodIdx и дам готовый патч для
+ Menu.cpp,чтобы в “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” появились пункты включения/периода для Internet2 (если вы хотите 
+ управлять этим источником именно оттуда).
+ 
+ //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ У вас сейчас TimeSyncPlanner уже ожидает поля:
+
+_src.net2Enable
+_src.net2PeriodIdx
+но в SyncSourcesStore::Data этих полей нет,поэтому дальше проект либо не соберётся,либо вы не сможете управлять INTERNET2 из планировщика.
+
+Ниже — полные исправленные файлы SyncSourcesStore.h/.cpp:
+
+добавлены поля net2Enable/net2PeriodIdx
+поднята версия EEPROM VERSION = 2
+loadLoose() стал обратно‑совместимым:если в EEPROM лежит старая версия (VERSION=1),он прочитает старый формат и подставит дефолты для net2
+Адрес блока в EEPROM не меняется (BASE=0x0200).
+
+SyncSourcesStore.h (полный,обновлённый)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class SyncSourcesStore {
+public:
+	static constexpr uint8_t I2C_ADDR = 0x50;
+
+	struct Data {
+		uint8_t gpsEnable; // 0/1
+		uint8_t gpsPeriodIdx; // 0..5
+
+		uint8_t netEnable; // 0/1 (SIM800 NTP)
+		uint8_t netProviderIdx;// 0..4 (NTP server index)
+		uint8_t netPeriodIdx; // 0..5
+
+		uint8_t gsmEnable; // 0/1 (SIM800 CCLK)
+		uint8_t gsmProviderIdx;// 0..4 (оператор)
+		uint8_t gsmPeriodIdx; // 0..5
+
+		// --- NEW:Internet2 over I2C/W5500 module ---
+		uint8_t net2Enable; // 0/1
+		uint8_t net2PeriodIdx; // 0..5
+	};
+
+	explicit SyncSourcesStore(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+	bool begin();
+	void defaults(Data& d);
+
+	// strict (magic/ver must match current VERSION)
+	bool load(Data& d);
+
+	// best effort:
+	// - if no magic -> defaults (return false)
+	// - if old version -> migrate to new (return true)
+	bool loadLoose(Data& d);
+
+	bool save(const Data& d);
+
+	// фикс. адреса (для внешних программ)
+	static constexpr uint16_t BASE = 0x0200;
+	static constexpr uint16_t ADDR_MAGIC = BASE + 0; // u16
+	static constexpr uint16_t ADDR_VER = BASE + 2; // u8
+	static constexpr uint16_t ADDR_DATA = BASE + 4; // Data bytes
+
+	// (опционально) фикс адреса отдельных полей внутри Data
+	static constexpr uint16_t ADDR_gpsEnable = ADDR_DATA + 0;
+	static constexpr uint16_t ADDR_gpsPeriodIdx = ADDR_DATA + 1;
+	static constexpr uint16_t ADDR_netEnable = ADDR_DATA + 2;
+	static constexpr uint16_t ADDR_netProviderIdx= ADDR_DATA + 3;
+	static constexpr uint16_t ADDR_netPeriodIdx = ADDR_DATA + 4;
+	static constexpr uint16_t ADDR_gsmEnable = ADDR_DATA + 5;
+	static constexpr uint16_t ADDR_gsmProviderIdx= ADDR_DATA + 6;
+	static constexpr uint16_t ADDR_gsmPeriodIdx = ADDR_DATA + 7;
+	static constexpr uint16_t ADDR_net2Enable = ADDR_DATA + 8;
+	static constexpr uint16_t ADDR_net2PeriodIdx = ADDR_DATA + 9;
+
+private:
+	TwoWire* _w;
+	uint8_t _addr;
+
+	static constexpr uint16_t MAGIC = 0x5359; // 'SY'
+	static constexpr uint8_t VERSION = 2; // было 1,стало 2
+	static constexpr uint8_t PAGE_SIZE = 64;
+
+	// размер старой структуры (VERSION=1) — 8 байт
+	static constexpr uint8_t OLD_SIZE_V1 = 8;
+
+	bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+	bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool waitReady(uint32_t timeoutMs = 50);
+
+	bool readU8(uint16_t memAddr,uint8_t& v);
+	bool writeU8(uint16_t memAddr,uint8_t v);
+	bool readU16(uint16_t memAddr,uint16_t& v);
+	bool writeU16(uint16_t memAddr,uint16_t v);
+};
+SyncSourcesStore.cpp (полный,обновлённый + миграция v1→v2)
+cpp Копировать
+#include "SyncSourcesStore.h"
+
+SyncSourcesStore::SyncSourcesStore(TwoWire& w,uint8_t addr) :_w(&w),_addr(addr) {}
+
+bool SyncSourcesStore::begin() {
+	_w->beginTransmission(_addr);
+	return (_w->endTransmission() == 0);
+}
+
+void SyncSourcesStore::defaults(Data& d) {
+	d.gpsEnable = 0; d.gpsPeriodIdx = 0;
+
+	d.netEnable = 0; d.netProviderIdx = 0; d.netPeriodIdx = 0;
+
+	d.gsmEnable = 1; d.gsmProviderIdx = 0; d.gsmPeriodIdx = 0;
+
+	// NEW defaults:
+	d.net2Enable = 0; // по умолчанию выключен (включите в меню)
+	d.net2PeriodIdx = 3; // 1 час
+}
+
+bool SyncSourcesStore::load(Data& d) {
+	defaults(d);
+
+	uint16_t mg = 0;
+	uint8_t ver = 0;
+	if (!readU16(ADDR_MAGIC,mg) || mg != MAGIC) return false;
+	if (!readU8(ADDR_VER,ver) || ver != VERSION) return false;
+
+	return readBytes(ADDR_DATA,(uint8_t*)&d,sizeof(d));
+}
+
+bool SyncSourcesStore::loadLoose(Data& d) {
+	defaults(d);
+
+	uint16_t mg = 0;
+	if (!readU16(ADDR_MAGIC,mg) || mg != MAGIC) {
+		// EEPROM пустая/неинициализирована
+		return false;
+	}
+
+	uint8_t ver = 0;
+	if (!readU8(ADDR_VER,ver)) return false;
+
+	if (ver == VERSION) {
+		// текущая версия
+		return readBytes(ADDR_DATA,(uint8_t*)&d,sizeof(d));
+	}
+
+	if (ver == 1) {
+		// --- миграция со старого формата (8 байт) ---
+		uint8_t b[OLD_SIZE_V1];
+		if (!readBytes(ADDR_DATA,b,sizeof(b))) return false;
+
+		d.gpsEnable = b[0];
+		d.gpsPeriodIdx = b[1];
+
+		d.netEnable = b[2];
+		d.netProviderIdx= b[3];
+		d.netPeriodIdx = b[4];
+
+		d.gsmEnable = b[5];
+		d.gsmProviderIdx= b[6];
+		d.gsmPeriodIdx = b[7];
+
+		// новые поля оставляем дефолтами:
+		d.net2Enable = 0;
+		d.net2PeriodIdx = 3;
+
+		return true;
+	}
+
+	// неизвестная версия — оставить defaults
+	return false;
+}
+
+bool SyncSourcesStore::save(const Data& d) {
+	if (!writeU16(ADDR_MAGIC,MAGIC)) return false;
+	if (!writeU8(ADDR_VER,VERSION)) return false;
+	return writeBytes(ADDR_DATA,(const uint8_t*)&d,sizeof(d));
+}
+
+// ---- low level (libmaple compatible) ----
+bool SyncSourcesStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	if (_w->endTransmission() != 0) return false;
+
+	uint8_t got = _w->requestFrom((uint8_t)_addr,(int)len);
+	if (got != (uint8_t)len) return false;
+
+	for (size_t i = 0; i < len; i++) out[i] = (uint8_t)_w->read();
+	return true;
+}
+
+bool SyncSourcesStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+	size_t off = 0;
+	while (off < len) {
+		uint16_t a = memAddr + (uint16_t)off;
+		uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+		size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+		if (!writePage(a,data + off,chunk)) return false;
+		if (!waitReady(50)) return false;
+		off += chunk;
+	}
+	return true;
+}
+
+bool SyncSourcesStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	_w->write((uint8_t*)data,(int)len); // libmaple требует non-const
+	return (_w->endTransmission() == 0);
+}
+
+bool SyncSourcesStore::waitReady(uint32_t timeoutMs) {
+	uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs) {
+		_w->beginTransmission(_addr);
+		if (_w->endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool SyncSourcesStore::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool SyncSourcesStore::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+
+bool SyncSourcesStore::readU16(uint16_t memAddr,uint16_t& v) {
+	uint8_t b[2];
+	if (!readBytes(memAddr,b,2)) return false;
+	v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+	return true;
+}
+bool SyncSourcesStore::writeU16(uint16_t memAddr,uint16_t v) {
+	uint8_t b[2] = { (uint8_t)(v & 0xFF),(uint8_t)((v >> 8) & 0xFF) };
+	return writeBytes(memAddr,b,2);
+}
+Что нужно сделать после замены файлов
+В вашем setup() вы уже делаете:
+cpp Копировать
+syncStore.loadLoose(syncData);
+После первого сохранения через меню (syncStore.save(syncData)) в EEPROM запишется VERSION=2 и новые поля.
+
+В меню “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” вы пока не добавляли управление net2Enable/net2PeriodIdx. Можно:
+добавить отдельный пункт/подменю для Internet2,
+либо временно включить syncData.net2Enable=1; в коде.
+Если хотите — я дам точный патч в ваш Menu.cpp (Page1) чтобы появился пункт INTERNET2:ON/OFF + PERIOD и он сохранялся в EEPROM.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+Ниже — точный патч для вашего Menu.cpp (Page1),чтобы добавить управление INTERNET2 (I2C‑канал) в “ИСТОЧНИКИ СИНХРОНИЗАЦИИ”.
+
+Что добавляем:
+
+В списке источников (MODE_LIST) появляется пункт INTERNET2
+В подменю MODE_NET2:настройки Enable + Period + (опционально) TZ target / TZ NTP (оставим как у остальных)
+Управление как у вас:
+
+LIST:SW2/ SW3 выбор,SW1 вход,SW4 HOME
+SUBMENU:SW1 NEXT,SW2 “-”,SW3 “+”,SW4 SAVE+BACK
+1) Патч:таблица menu[5][5]
+Найдите в Menu.cpp:
+
+cpp Копировать
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","GSM","",""},
+ ...
+};
+Замените первую строку на:
+
+cpp Копировать
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","INTERNET2","GSM",""},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+Если хотите русское название — замените "INTERNET2" на "ИНТЕРНЕТ2".
+
+2) Патч:в class Page1 добавить новый режим MODE_NET2
+2.1. В enum Mode добавьте MODE_NET2
+Найдите:
+
+cpp Копировать
+enum Mode :uint8_t { MODE_LIST = 0,MODE_GPS = 1,MODE_NET = 2,MODE_GSM = 3 };
+Замените на:
+
+cpp Копировать
+enum Mode :uint8_t { MODE_LIST = 0,MODE_GPS = 1,MODE_NET = 2,MODE_NET2 = 3,MODE_GSM = 4 };
+2.2. В paramCount() добавить режим MODE_NET2
+Найдите:
+
+cpp Копировать
+uint8_t paramCount() const {
+ if (_mode == MODE_GPS) return 4;
+ if (_mode == MODE_NET) return 5;
+ if (_mode == MODE_GSM) return 5;
+ return 0;
+}
+Замените на:
+
+cpp Копировать
+uint8_t paramCount() const {
+ if (_mode == MODE_GPS) return 4; // enable,period,TZ target,TZ NTP
+ if (_mode == MODE_NET) return 5; // enable,ntpIdx,period,TZ target,TZ NTP
+ if (_mode == MODE_NET2) return 4; // enable,period,TZ target,TZ NTP
+ if (_mode == MODE_GSM) return 5; // enable,operator,period,TZ target,TZ NTP
+ return 0;
+}
+2.3. В drawStatic() добавить заголовок для MODE_NET2
+Найдите:
+
+cpp Копировать
+else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+else if (_mode == MODE_GSM) d->drawString("GSM (SIM800)",X,Y_TITLE);
+Сделайте:
+
+cpp Копировать
+else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+else if (_mode == MODE_NET2) d->drawString("INTERNET2 (I2C)",X,Y_TITLE);
+else if (_mode == MODE_GSM) d->drawString("GSM (SIM800)",X,Y_TITLE);
+2.4. В onButtonPressed() в MODE_LIST добавить вход в INTERNET2
+Найдите место,где выбирается режим по _sel:
+
+cpp Копировать
+if (_sel == 0) _mode = MODE_GPS;
+else if (_sel == 1) _mode = MODE_NET;
+else if (_sel == 2) _mode = MODE_GSM;
+else return;
+Замените на:
+
+cpp Копировать
+if (_sel == 0) _mode = MODE_GPS;
+else if (_sel == 1) _mode = MODE_NET;
+else if (_sel == 2) _mode = MODE_NET2;
+else if (_sel == 3) _mode = MODE_GSM;
+else return;
+2.5. В buildLine() добавить строки для MODE_NET2
+Найдите функцию buildLine(...) и после блока _mode == MODE_NET добавьте:
+
+cpp Копировать
+if (_mode == MODE_NET2) {
+ if (i == 0) snprintf(out,n,"1) NET2:%s",_tmp.net2Enable ? "ON" :"OFF");
+ else if (i == 1) snprintf(out,n,"2) PER:%s",kPeriodsName[_tmp.net2PeriodIdx % 6]);
+ else if (i == 2) snprintf(out,n,"3) TZ target:%d",(int)_tzTargetTmp);
+ else snprintf(out,n,"4) TZ NTP:%d",(int)_tzNtpTmp);
+ return;
+}
+2.6. В changeParam() добавить обработку MODE_NET2
+В функции changeParam(int delta) добавьте блок до GSM:
+
+cpp Копировать
+if (_mode == MODE_NET2) {
+ if (_param == 0) _tmp.net2Enable = _tmp.net2Enable ? 0 :1;
+ else if (_param == 1) _tmp.net2PeriodIdx = (uint8_t)((_tmp.net2PeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ else if (_param == 2) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+ else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+ return;
+}
+3) Патч:Сохранение (commitSave) — уже сохранит net2 поля
+В вашем commitSave() уже есть:
+
+cpp Копировать
+syncData = _tmp;
+syncStore.save(syncData);
+После обновления SyncSourcesStore (VERSION=2) это автоматически сохранит net2Enable/net2PeriodIdx. Больше ничего не нужно.
+
+Важно:проверьте размеры/циклы списков
+Вы используете “прокрутку” LIST по модулю 5 ((_sel + 4) % 5). Теперь фактически активных пунктов 4 (GPS/NET/NET2/GSM). Если оставите 5 — последний пункт будет пустым,но не сломает.
+
+Если хотите строго 4 пункта — скажите,я дам патч на % 4 и перерисовку только 4 строк.
+
+Если пришлёте ваш актуальный Menu.cpp (Page1 целиком),я могу вернуть уже “слитый” файл без ручной вставки (чтобы не промахнуться по местам).
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — точный патч только для Page1 в вашем текущем Menu.cpp (который вы прислали),чтобы добавить INTERNET2 в “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” и управлять полями syncData.net2Enable/net2PeriodIdx.
+
+Условие:вы уже заменили SyncSourcesStore.h/.cpp на версию с net2Enable/net2PeriodIdx (VERSION=2). Иначе этот патч не соберётся.
+
+ПАТЧ 1 — таблица menu[5][5]
+Найдите:
+
+cpp Копировать
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","GSM","",""},
+Замените на:
+
+cpp Копировать
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","ИНТЕРНЕТ2","GSM",""},
+ПАТЧ 2 — Page1:enum Mode
+Найдите в class Page1:
+
+cpp Копировать
+enum Mode :uint8_t { MODE_LIST = 0,MODE_GPS = 1,MODE_NET = 2,MODE_GSM = 3 };
+Замените на:
+
+cpp Копировать
+enum Mode :uint8_t { MODE_LIST = 0,MODE_GPS = 1,MODE_NET = 2,MODE_NET2 = 3,MODE_GSM = 4 };
+ПАТЧ 3 — Page1:paramCount()
+Найдите:
+
+cpp Копировать
+uint8_t paramCount() const {
+ if (_mode == MODE_GPS) return 4;
+ if (_mode == MODE_NET) return 5;
+ if (_mode == MODE_GSM) return 5;
+ return 0;
+}
+Замените на:
+
+cpp Копировать
+uint8_t paramCount() const {
+ if (_mode == MODE_GPS) return 4; // enable,period,TZ target,TZ NTP
+ if (_mode == MODE_NET) return 5; // enable,ntpIdx,period,TZ target,TZ NTP
+ if (_mode == MODE_NET2) return 4; // enable,period,TZ target,TZ NTP
+ if (_mode == MODE_GSM) return 5; // enable,operator,period,TZ target,TZ NTP
+ return 0;
+}
+ПАТЧ 4 — Page1:вход в режим (MODE_LIST → ENTER)
+Найдите:
+
+cpp Копировать
+if (_sel == 0) _mode = MODE_GPS;
+else if (_sel == 1) _mode = MODE_NET;
+else if (_sel == 2) _mode = MODE_GSM;
+else return;
+Замените на:
+
+cpp Копировать
+if (_sel == 0) _mode = MODE_GPS;
+else if (_sel == 1) _mode = MODE_NET;
+else if (_sel == 2) _mode = MODE_NET2;
+else if (_sel == 3) _mode = MODE_GSM;
+else return;
+ПАТЧ 5 — Page1:drawStatic() заголовок
+Найдите:
+
+cpp Копировать
+else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+else if (_mode == MODE_GSM) d->drawString("GSM (SIM800)",X,Y_TITLE);
+Замените на:
+
+cpp Копировать
+else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+else if (_mode == MODE_NET2) d->drawString("ИНТЕРНЕТ2 (I2C)",X,Y_TITLE);
+else if (_mode == MODE_GSM) d->drawString("GSM (SIM800)",X,Y_TITLE);
+ПАТЧ 6 — Page1:calcHash() добавить MODE_NET2
+Найдите блок:
+
+cpp Копировать
+else if (_mode == MODE_GSM) {
+ mix(_tmp.gsmEnable); mix(_tmp.gsmProviderIdx); mix(_tmp.gsmPeriodIdx);
+ mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+}
+Перед ним вставьте:
+
+cpp Копировать
+else if (_mode == MODE_NET2) {
+ mix(_tmp.net2Enable);
+ mix(_tmp.net2PeriodIdx);
+ mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+}
+ПАТЧ 7 — Page1:buildLine() добавить MODE_NET2
+Найдите конец блока if (_mode == MODE_NET) { ... return; } и сразу после него вставьте:
+
+cpp Копировать
+if (_mode == MODE_NET2) {
+ if (i == 0) snprintf(out,n,"1) NET2:%s",_tmp.net2Enable ? "ON" :"OFF");
+ else if (i == 1) snprintf(out,n,"2) PER:%s",kPeriodsName[_tmp.net2PeriodIdx % 6]);
+ else if (i == 2) snprintf(out,n,"3) TZ target:%d",(int)_tzTargetTmp);
+ else snprintf(out,n,"4) TZ NTP:%d",(int)_tzNtpTmp);
+ return;
+}
+ПАТЧ 8 — Page1:changeParam() добавить MODE_NET2
+В функции changeParam(int delta) найдите блок if (_mode == MODE_NET) { ... return; } и после него вставьте:
+
+cpp Копировать
+if (_mode == MODE_NET2) {
+ if (_param == 0) _tmp.net2Enable = _tmp.net2Enable ? 0 :1;
+ else if (_param == 1) _tmp.net2PeriodIdx = (uint8_t)((_tmp.net2PeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ else if (_param == 2) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+ else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+ return;
+}
+Проверка после патча
+В меню “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” в списке будет:
+GPS
+ИНТЕРНЕТ
+ИНТЕРНЕТ2
+GSM
+Внутри INTERNET2 будут параметры:
+NET2 ON/OFF
+период
+TZ target
+TZ NTP
+При SAVE изменения попадут в syncData и сохранятся через syncStore.save(syncData).
+Если хотите,я сделаю следующий шаг:в Page3 “ИНТЕРНЕТ2” (настройки IP/DHCP/NTP) при SAVE вызывать applyInternet2FromStore(),чтобы
+ настройки сразу уходили по I2C во второй модуль.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — точный следующий шаг для Page3 “ИНТЕРНЕТ2”:при нажатии SW4 (SAVE+HOME) не только сохранять LanIfStore::IF2,но и сразу применять настройки во второй модуль по I2C через функцию applyInternet2FromStore().
+
+1) Menu.cpp:добавить extern для applyInternet2FromStore()
+Вверху вашего Menu.cpp,где уже есть:
+
+cpp Копировать
+extern void applyInternet1FromStore(); // применить INTERNET1 (в .ino)
+добавьте строку:
+
+cpp Копировать
+extern void applyInternet2FromStore(); // применить INTERNET2 (I2C) (в .ino)
+2) Menu.cpp:Page3 (ИНТЕРНЕТ2) — вызвать applyInternet2FromStore() при SAVE
+Найдите в class Page3 метод:
+
+cpp Копировать
+void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW4) { // SAVE+HOME
+ lanStore.save(LanIfStore::IF2,_cfg,true);
+ _m->backToStart();
+ return;
+ }
+ ...
+}
+Замените этот кусок на:
+
+cpp Копировать
+void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW4) { // SAVE+HOME
+ lanStore.save(LanIfStore::IF2,_cfg,true);
+
+ // НОВОЕ:применить настройки во 2-й интернет модуль по I2C
+ applyInternet2FromStore();
+
+ _m->backToStart();
+ return;
+ }
+ ...
+}
+3) ВАЖНО:добавить реализацию applyInternet2FromStore() в центральный .ino
+Если её ещё нет — добавьте в вашем центральном .ino (вне setup/loop) функцию с точно таким именем:
+
+cpp Копировать
+void applyInternet2FromStore()
+{
+ LanIfStore::IfConfig c;
+ lanStore.load(LanIfStore::IF2,c,false);
+
+ // upstream IP по индексу (тот же порядок что в Menu/Internet pages)
+ IPAddress up;
+ switch (c.ntpIdx % 5) {
+ case 0:up = IPAddress(162,159,200,123); break;
+ case 1:up = IPAddress(162,159,200,1); break;
+ case 2:up = IPAddress(129,6,15,28); break;
+ case 3:up = IPAddress(132,163,96,1); break;
+ default:up = IPAddress(216,239,35,0); break;
+ }
+
+ uint32_t periodMs;
+ switch (c.periodIdx % 6) {
+ case 0:periodMs = 60000UL; break;
+ case 1:periodMs = 600000UL; break;
+ case 2:periodMs = 1800000UL; break;
+ case 3:periodMs = 3600000UL; break;
+ case 4:periodMs = 21600000UL; break;
+ default:periodMs = 43200000UL; break;
+ }
+
+ // Отправить конфиг во 2-й модуль по I2C
+ internet2.applyNetCfg(
+ c.dhcp != 0,
+ IPAddress(c.ip[0],c.ip[1],c.ip[2],c.ip[3]),
+ IPAddress(c.mask[0],c.mask[1],c.mask[2],c.mask[3]),
+ IPAddress(c.gw[0],c.gw[1],c.gw[2],c.gw[3]),
+ IPAddress(c.dns[0],c.dns[1],c.dns[2],c.dns[3]),
+ up,
+ periodMs
+ );
+
+ // Сразу отправим текущее время (UTC) во 2-й модуль
+ RTCTime nowLocal = rtc.getTime();
+ uint32_t unixUtc = unixUtcFromRtcLocal(nowLocal,cfg.tzTargetHours); // функция должна быть у вас
+ internet2.setTimeUnixUtc(unixUtc,0);
+}
+Если у вас функция для расчёта unixUtcFromRtcLocal(...) ещё называется иначе — скажите,я подстрою под ваш текущий код.
+
+Проверка
+После этих правок:
+
+заходите в “НАСТРОЙКИ ИНТЕРНЕТ2”
+меняете DHCP/IP/Mask/GW/DNS/NTP/PER
+нажимаете SW4
+конфиг сохраняется в EEPROM и тут же уходит в модуль INTERNET2 по I2C.
+Если хотите,следующий шаг — добавить на странице INTERNET2 строку “STATUS:OK/NO / IP=…”
+ читая internet2.readStatus() (чтобы прямо в настройках видеть,виден ли модуль и какой у него IP).
+ 
+ //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+добавить на странице INTERNET1 строку “STATUS:OK/NO / IP=…”
+добавить на странице INTERNET2 строку “STATUS:OK/NO / IP=…”
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+// menu.cpp (полностью готовый)
+// Требования:
+// - HOME показывает IP1 и IP2 (gIp1Str/gIp2Str)
+// - "ВЫБОР МЕНЮ" показывает только пункты (без IP)
+// - Page1 "ИСТОЧНИКИ СИНХРОНИЗАЦИИ":GPS / INTERNET / INTERNET2 / GSM + TZ target/TZ NTP
+// - Page2 INTERNET1:настройка + STATUS:OK/NO IP=...
+// - Page3 INTERNET2:настройка + STATUS:OK/NO IP=... + SAVE вызывает applyInternet2FromStore()
+
+#include "Menu.h"
+#include <TFT_eSPI.h>
+#include <string.h>
+
+#include "TimeFeed.h" // gDateStr,gTimeStr,gTimeUpdated
+#include "NetFeed.h" // gNetRegistered,gRssiDbm,gSignalBars,gCsqRssi,gIp1Str,gIp2Str,...
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+#include "LanIfStore.h"
+
+#include "NtpLanService_Generic.h" // INTERNET1 status
+#include "Internet2Client.h" // INTERNET2 status
+
+// --- externs from .ino ---
+extern AT24C128Settings ee;
+extern AT24C128Settings::Config cfg;
+
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+
+extern TimeSyncPlanner planner;
+
+extern LanIfStore lanStore; // INTERNET store in EEPROM
+extern void applyInternet1FromStore(); // применить INTERNET1 (в .ino)
+extern void applyInternet2FromStore(); // применить INTERNET2 (I2C) (в .ino)
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GPS globals
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+extern uint16_t gGpsHdop_x100;
+extern uint8_t gGpsSnrAvg;
+extern uint8_t gGpsSnrMax;
+extern uint32_t gGpsLastRmcMs;
+extern uint32_t gGpsLastGgaMs;
+extern uint32_t gGpsLastGsvMs;
+
+// Fonts
+#include "zTimesNRItalic18.h"
+#include "zTimesNRItalic24.h"
+#include "zTimesNRItalic28.h"
+#include "zTimesNRItalic36.h"
+#include "zCalibri36.h"
+#include "zTimesNR28.h"
+#include "zTimesNR14.h"
+#include "zTimesNR18.h"
+#include "zTimesNR24.h"
+
+#define AA_FONT_CALI zCalibri36
+#define AA_FONT_TIME18I zTimesNRItalic18
+#define AA_FONT_TIME24I zTimesNRItalic24
+#define AA_FONT_TIME28I zTimesNRItalic28
+#define AA_FONT_TIME36I zTimesNRItalic36
+#define AA_FONT_TIME28 zTimesNR28
+#define AA_FONT_TIME18 zTimesNR18
+#define AA_FONT_TIME24 zTimesNR24
+
+// ---------------- HOME layout for 320x170 ----------------
+static const int Y_HOME = 10;
+
+static const int Y_IP1 = 32;
+static const int Y_IP2 = 52;
+
+static const int Y_DATE = 72;
+static const int Y_NET = 94;
+static const int Y_SIG = 116;
+
+static const int Y_VER = 140;
+
+// --- NTP upstream list (только IP,индекс 0..4) ---
+static const char* kNtpIpStr[5] = {
+ "162.159.200.123",
+ "162.159.200.1",
+ "129.6.15.28",
+ "132.163.96.1",
+ "216.239.35.0"
+};
+
+// --- Period names (idx 0..5) ---
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// --- GSM provider names ---
+static const char* kGsmProviders[5] = { "МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2" };
+
+// Таблица строк для Page1->MODE_LIST (page=0,row=item)
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","ИНТЕРНЕТ2","GSM",""},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+
+// -------------------- Base for pages --------------------
+class PageBase :public IMenuPage {
+public:
+	explicit PageBase(Menu* m) :_m(m) {}
+protected:
+	Menu* _m = nullptr;
+	TFT_eSPI* tft() const { return _m ? _m->display() :nullptr; }
+};
+
+// -------------------- Helpers for GPS info --------------------
+static void formatGpsLine1(char* out,size_t n)
+{
+	snprintf(out,n,"Sat:%u/%u Fix:%s HDOP:%.2f",
+		(unsigned)gGpsSatsUsed,
+		(unsigned)gGpsSatsView,
+		gGpsFix ? "Y" :"N",
+		(double)gGpsHdop_x100 / 100.0);
+}
+
+static void formatGpsLine2(char* out,size_t n)
+{
+	uint32_t now = millis();
+	uint32_t ageR = (gGpsLastRmcMs == 0) ? 99999UL :(now - gGpsLastRmcMs);
+	uint32_t ageG = (gGpsLastGgaMs == 0) ? 99999UL :(now - gGpsLastGgaMs);
+	uint32_t ageV = (gGpsLastGsvMs == 0) ? 99999UL :(now - gGpsLastGsvMs);
+
+	auto toTenth = [](uint32_t ms)->uint32_t { return (ms + 50) / 100; };
+	uint32_t r = toTenth(ageR);
+	uint32_t g = toTenth(ageG);
+	uint32_t v = toTenth(ageV);
+
+	snprintf(out,n,"Sig:%u/%u R:%u.%us G:%u.%us V:%u.%us",
+		(unsigned)gGpsSnrAvg,
+		(unsigned)gGpsSnrMax,
+		(unsigned)(r / 10),(unsigned)(r % 10),
+		(unsigned)(g / 10),(unsigned)(g % 10),
+		(unsigned)(v / 10),(unsigned)(v % 10));
+}
+
+// -------------------- Page1:ИСТОЧНИКИ СИНХРОНИЗАЦИИ --------------------
+class Page1 :public PageBase {
+public:
+	using PageBase::PageBase;
+
+	void setup() override {}
+
+	void onActivate() override {
+		_mode = MODE_LIST;
+		_sel = 0;
+		_param = 0;
+
+		_tmp = syncData;
+
+		_tzTargetTmp = cfg.tzTargetHours;
+		_tzNtpTmp = cfg.tzNtpHours;
+
+		_staticDrawn = false;
+		_lastSel = 255;
+		_lastParam = 255;
+		_lastHash = 0;
+
+		_lastGpsLine1[0] = 0;
+		_lastGpsLine2[0] = 0;
+		_lastGpsInfoMs = 0;
+
+		draw();
+	}
+
+	void update() override {
+		if (_mode == MODE_GPS) {
+			uint32_t now = millis();
+			if (now - _lastGpsInfoMs >= 500) {
+				_lastGpsInfoMs = now;
+				drawGpsInfo(false);
+			}
+		}
+	}
+
+	void draw() override {
+		if (!_staticDrawn) {
+			drawStatic();
+			_staticDrawn = true;
+			_lastSel = 255;
+			_lastParam = 255;
+			_lastHash = 0;
+		}
+		drawDynamic(true);
+	}
+
+	void onButtonPressed(int buttonID) override {
+
+		// ---- LIST ----
+		if (_mode == MODE_LIST) {
+			if (buttonID == BTN_SW2) { // UP
+				_sel = (_sel + 4) % 5;
+				drawDynamic(false);
+				return;
+			}
+			if (buttonID == BTN_SW3) { // DOWN
+				_sel = (_sel + 1) % 5;
+				drawDynamic(false);
+				return;
+			}
+			if (buttonID == BTN_SW1) { // ENTER
+				if (_sel == 0) _mode = MODE_GPS;
+				else if (_sel == 1) _mode = MODE_NET;
+				else if (_sel == 2) _mode = MODE_NET2;
+				else if (_sel == 3) _mode = MODE_GSM;
+				else return;
+
+				_param = 0;
+				_tzTargetTmp = cfg.tzTargetHours;
+				_tzNtpTmp = cfg.tzNtpHours;
+
+				_staticDrawn = false;
+				draw();
+				return;
+			}
+			if (buttonID == BTN_SW4) { // HOME
+				_m->backToStart();
+				return;
+			}
+			return;
+		}
+
+		// ---- SUBMENU ----
+		if (buttonID == BTN_SW1) { // NEXT PARAM
+			_param = (_param + 1) % paramCount();
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW2) { // "-"
+			changeParam(-1);
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW3) { // "+"
+			changeParam(+1);
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW4) { // SAVE + BACK
+			commitSave();
+			_mode = MODE_LIST;
+			_sel = 0;
+			_staticDrawn = false;
+			draw();
+			return;
+		}
+	}
+
+	void onButtonReleased(int) override {}
+
+private:
+	enum Mode :uint8_t { MODE_LIST = 0,MODE_GPS = 1,MODE_NET = 2,MODE_NET2 = 3,MODE_GSM = 4 };
+
+	static const int X = 10;
+	static const int Y_TITLE = 0;
+	static const int Y0 = 22;
+	static const int DY = 22;
+	static const int LINE_W = 320;
+	static const int LINE_H = 20;
+
+	static const int Y_HINT1 = 132;
+	static const int Y_HINT2 = 148;
+
+	Mode _mode = MODE_LIST;
+	bool _staticDrawn = false;
+
+	uint8_t _sel = 0;
+	uint8_t _param = 0;
+
+	SyncSourcesStore::Data _tmp;
+
+	int8_t _tzTargetTmp = 0;
+	int8_t _tzNtpTmp = 0;
+
+	uint8_t _lastSel = 255;
+	uint8_t _lastParam = 255;
+	uint32_t _lastHash = 0;
+
+	uint32_t _lastGpsInfoMs = 0;
+	char _lastGpsLine1[64] = { 0 };
+	char _lastGpsLine2[96] = { 0 };
+
+	uint8_t paramCount() const {
+		if (_mode == MODE_GPS) return 4; // enable,period,TZ target,TZ NTP
+		if (_mode == MODE_NET) return 5; // enable,ntpIdx,period,TZ target,TZ NTP
+		if (_mode == MODE_NET2) return 4; // enable,period,TZ target,TZ NTP
+		if (_mode == MODE_GSM) return 5; // enable,operator,period,TZ target,TZ NTP
+		return 0;
+	}
+
+	void drawStatic() {
+		TFT_eSPI* d = tft(); if (!d) return;
+
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+
+		if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",X,Y_TITLE);
+		else if (_mode == MODE_GPS) d->drawString("GPS",X,Y_TITLE);
+		else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+		else if (_mode == MODE_NET2) d->drawString("ИНТЕРНЕТ2 (I2C)",X,Y_TITLE);
+		else if (_mode == MODE_GSM) d->drawString("GSM (SIM800)",X,Y_TITLE);
+
+		for (int i = 0; i < 6; i++) d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+
+		d->setTextSize(1);
+		d->setTextColor(TFT_WHITE,TFT_BLACK);
+		d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+
+		if (_mode == MODE_LIST) {
+			d->drawString("SW2:UP SW3:DOWN SW1:ENTER",X,Y_HINT1);
+			d->drawString("SW4:HOME",X,Y_HINT2);
+		}
+		else {
+			d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+			d->drawString("SW4:SAVE+BACK",X,Y_HINT2);
+		}
+
+		d->setTextSize(2);
+	}
+
+	void drawDynamic(bool force) {
+		TFT_eSPI* d = tft(); if (!d) return;
+
+		if (_mode == MODE_LIST) {
+			if (!force && _lastSel == _sel) return;
+			_lastSel = _sel;
+
+			for (int i = 0; i < 5; i++) {
+				d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+				d->setTextColor((i == _sel) ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+				d->drawString(_m->itemLabel(0,i),X,Y0 + i * DY);
+			}
+			return;
+		}
+
+		uint32_t h = calcHash();
+		if (!force && _lastParam == _param && _lastHash == h) {
+			if (_mode == MODE_GPS) drawGpsInfo(false);
+			return;
+		}
+		_lastParam = _param;
+		_lastHash = h;
+
+		uint8_t n = paramCount();
+		for (uint8_t i = 0; i < n; i++) {
+			d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+			d->setTextColor((i == _param) ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+			if (i == _param) d->drawString(">",0,Y0 + i * DY);
+
+			char line[96];
+			buildLine(i,line,sizeof(line));
+			d->drawString(line,X,Y0 + i * DY);
+		}
+
+		if (_mode == MODE_GPS) drawGpsInfo(true);
+	}
+
+	uint32_t calcHash() const {
+		uint32_t h = 2166136261u;
+		auto mix = [&](uint32_t v) { h ^= v; h *= 16777619u; };
+
+		if (_mode == MODE_GPS) {
+			mix(_tmp.gpsEnable); mix(_tmp.gpsPeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		else if (_mode == MODE_NET) {
+			mix(_tmp.netEnable); mix(_tmp.netProviderIdx); mix(_tmp.netPeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		else if (_mode == MODE_NET2) {
+			mix(_tmp.net2Enable); mix(_tmp.net2PeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		else if (_mode == MODE_GSM) {
+			mix(_tmp.gsmEnable); mix(_tmp.gsmProviderIdx); mix(_tmp.gsmPeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		mix(_param);
+		return h;
+	}
+
+	void buildLine(uint8_t i,char* out,size_t n) const {
+		if (_mode == MODE_GPS) {
+			if (i == 0) snprintf(out,n,"1) GPS:%s",_tmp.gpsEnable ? "ON" :"OFF");
+			else if (i == 1) snprintf(out,n,"2) PER:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+			else if (i == 2) snprintf(out,n,"3) TZ target:%d",(int)_tzTargetTmp);
+			else snprintf(out,n,"4) TZ NTP:%d",(int)_tzNtpTmp);
+			return;
+		}
+
+		if (_mode == MODE_NET) {
+			if (i == 0) snprintf(out,n,"1) NTP:%s",_tmp.netEnable ? "ON" :"OFF");
+			else if (i == 1) snprintf(out,n,"2) NTP IP:%s",kNtpIpStr[_tmp.netProviderIdx % 5]);
+			else if (i == 2) snprintf(out,n,"3) PER:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+			else if (i == 3) snprintf(out,n,"4) TZ target:%d",(int)_tzTargetTmp);
+			else snprintf(out,n,"5) TZ NTP:%d",(int)_tzNtpTmp);
+			return;
+		}
+
+		if (_mode == MODE_NET2) {
+			if (i == 0) snprintf(out,n,"1) NET2:%s",_tmp.net2Enable ? "ON" :"OFF");
+			else if (i == 1) snprintf(out,n,"2) PER:%s",kPeriodsName[_tmp.net2PeriodIdx % 6]);
+			else if (i == 2) snprintf(out,n,"3) TZ target:%d",(int)_tzTargetTmp);
+			else snprintf(out,n,"4) TZ NTP:%d",(int)_tzNtpTmp);
+			return;
+		}
+
+		// MODE_GSM
+		if (i == 0) snprintf(out,n,"1) GSM:%s",_tmp.gsmEnable ? "ON" :"OFF");
+		else if (i == 1) snprintf(out,n,"2) OP:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+		else if (i == 2) snprintf(out,n,"3) PER:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+		else if (i == 3) snprintf(out,n,"4) TZ target:%d",(int)_tzTargetTmp);
+		else snprintf(out,n,"5) TZ NTP:%d",(int)_tzNtpTmp);
+	}
+
+	static void clampTz(int8_t& tz) {
+		if (tz < -12) tz = -12;
+		if (tz > 14) tz = 14;
+	}
+
+	void changeParam(int delta) {
+		if (_mode == MODE_GPS) {
+			if (_param == 0) _tmp.gpsEnable = _tmp.gpsEnable ? 0 :1;
+			else if (_param == 1) _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+			else if (_param == 2) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+			else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+			return;
+		}
+
+		if (_mode == MODE_NET) {
+			if (_param == 0) _tmp.netEnable = _tmp.netEnable ? 0 :1;
+			else if (_param == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta > 0 ? 1 :4)) % 5);
+			else if (_param == 2) _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+			else if (_param == 3) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+			else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+			return;
+		}
+
+		if (_mode == MODE_NET2) {
+			if (_param == 0) _tmp.net2Enable = _tmp.net2Enable ? 0 :1;
+			else if (_param == 1) _tmp.net2PeriodIdx = (uint8_t)((_tmp.net2PeriodIdx + (delta > 0 ? 1 :5)) % 6);
+			else if (_param == 2) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+			else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+			return;
+		}
+
+		// GSM
+		if (_param == 0) _tmp.gsmEnable = _tmp.gsmEnable ? 0 :1;
+		else if (_param == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta > 0 ? 1 :4)) % 5);
+		else if (_param == 2) _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+		else if (_param == 3) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+		else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+	}
+
+	void commitSave() {
+		syncData = _tmp;
+		syncStore.save(syncData);
+
+		cfg.tzTargetHours = _tzTargetTmp;
+		cfg.tzNtpHours = _tzNtpTmp;
+		ee.writeTzTargetHours(cfg.tzTargetHours);
+		ee.writeTzNtpHours(cfg.tzNtpHours);
+
+		planner.onSettingsChanged();
+	}
+
+	void drawGpsInfo(bool clearLine) {
+		TFT_eSPI* d = tft(); if (!d) return;
+
+		int y1 = Y0 + 3 * DY;
+		int y2 = Y0 + 4 * DY;
+
+		char line1[64];
+		char line2[96];
+		formatGpsLine1(line1,sizeof(line1));
+		formatGpsLine2(line2,sizeof(line2));
+
+		bool changed1 = (strcmp(_lastGpsLine1,line1) != 0);
+		bool changed2 = (strcmp(_lastGpsLine2,line2) != 0);
+
+		if (clearLine || changed1) {
+			d->fillRect(0,y1,LINE_W,LINE_H,TFT_BLACK);
+			d->setTextColor(TFT_GREEN,TFT_BLACK);
+			d->drawString(line1,X,y1);
+			strncpy(_lastGpsLine1,line1,sizeof(_lastGpsLine1) - 1);
+			_lastGpsLine1[sizeof(_lastGpsLine1) - 1] = 0;
+		}
+
+		if (clearLine || changed2) {
+			d->fillRect(0,y2,LINE_W,LINE_H,TFT_BLACK);
+			d->setTextColor(TFT_CYAN,TFT_BLACK);
+			d->drawString(line2,X,y2);
+			strncpy(_lastGpsLine2,line2,sizeof(_lastGpsLine2) - 1);
+			_lastGpsLine2[sizeof(_lastGpsLine2) - 1] = 0;
+		}
+	}
+};
+
+// -------------------- Internet pages base --------------------
+class InternetPageBase :public PageBase {
+public:
+	using PageBase::PageBase;
+
+protected:
+	static const int X = 10,Y_TITLE = 0,Y0 = 22,DY = 20,W = 320,H = 18;
+	static const int Y_HINT1 = 132,Y_HINT2 = 148;
+
+	enum Param :uint8_t { P_DHCP = 0,P_IP = 1,P_MASK = 2,P_GW = 3,P_DNS = 4,P_NTP = 5,P_PERIOD = 6,PARAM_COUNT = 7 };
+
+	static bool isIpParam(uint8_t p) { return (p == P_IP || p == P_MASK || p == P_GW || p == P_DNS); }
+
+	static void adjOct(uint8_t v[4],uint8_t idx,int delta) {
+		int x = (int)v[idx] + (delta > 0 ? 1 :-1);
+		if (x < 0) x = 255;
+		if (x > 255) x = 0;
+		v[idx] = (uint8_t)x;
+	}
+
+	void drawIpLine(TFT_eSPI* d,const char* name,uint8_t v[4],uint8_t p,int row,uint8_t curParam) {
+		d->setTextColor(curParam == p ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(curParam == p ? ">" :" ",0,Y0 + row * DY);
+
+		char s[40];
+		snprintf(s,sizeof(s),"%s %u.%u.%u.%u",name,v[0],v[1],v[2],v[3]);
+		d->drawString(s,X,Y0 + row * DY);
+	}
+};
+
+// -------------------- Page2:ИНТЕРНЕТ1 --------------------
+class Page2 :public InternetPageBase {
+public:
+	using InternetPageBase::InternetPageBase;
+
+	void setup() override {}
+
+	void onActivate() override {
+		_staticDrawn = false;
+		_param = 0;
+		_oct = 0;
+		lanStore.load(LanIfStore::IF1,_cfg,false);
+
+		_statLine[0] = 0;
+		_lastStatMs = 0;
+
+		draw();
+	}
+
+	void update() override
+	{
+		uint32_t now = millis();
+		if (now - _lastStatMs < 1000) return;
+		_lastStatMs = now;
+
+		IPAddress ip = ntpLan.localIP();
+		bool ok = !(ip[0]==0 && ip[1]==0 && ip[2]==0 && ip[3]==0);
+
+		char line[48];
+		snprintf(line,sizeof(line),"STATUS:%s IP=%u.%u.%u.%u",
+			ok ? "OK" :"NO",ip[0],ip[1],ip[2],ip[3]);
+
+		if (strcmp(_statLine,line) != 0) {
+			strncpy(_statLine,line,sizeof(_statLine)-1);
+			_statLine[sizeof(_statLine)-1] = 0;
+			drawStatusLine();
+		}
+	}
+
+	void draw() override {
+		if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+		drawDynamic(true);
+	}
+
+	void onButtonPressed(int buttonID) override {
+		if (buttonID == BTN_SW4) { // SAVE+HOME
+			lanStore.save(LanIfStore::IF1,_cfg,true);
+			applyInternet1FromStore();
+			_m->backToStart();
+			return;
+		}
+
+		if (buttonID == BTN_SW1) { // NEXT
+			if (isIpParam(_param)) {
+				_oct = (_oct + 1) & 3;
+				if (_oct == 0) _param = (_param + 1) % PARAM_COUNT;
+			}
+			else {
+				_param = (_param + 1) % PARAM_COUNT;
+			}
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+			int delta = (buttonID == BTN_SW3) ? +1 :-1;
+			applyDelta(delta);
+			drawDynamic(false);
+			return;
+		}
+	}
+
+	void onButtonReleased(int) override {}
+
+private:
+	LanIfStore::IfConfig _cfg{};
+	bool _staticDrawn = false;
+	uint8_t _param = 0;
+	uint8_t _oct = 0;
+
+	// status
+	uint32_t _lastStatMs = 0;
+	char _statLine[48] = {0};
+
+	void drawStatusLine()
+	{
+		auto d = tft(); if (!d) return;
+
+		d->setTextSize(1);
+		d->fillRect(0,18,320,12,TFT_BLACK);
+
+		bool ok = (strstr(_statLine,"STATUS:OK") != nullptr);
+		d->setTextColor(ok ? TFT_GREEN :TFT_RED,TFT_BLACK);
+		d->drawString(_statLine,X,18);
+
+		d->setTextSize(2);
+	}
+
+	void drawStatic() {
+		auto d = tft(); if (!d) return;
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		d->drawString("INTERNET1",X,Y_TITLE);
+
+		drawStatusLine(); // пустая строка; заполнится в update()
+
+		d->setTextSize(1);
+		d->setTextColor(TFT_WHITE,TFT_BLACK);
+		d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+		d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+		d->drawString("SW4:SAVE+HOME",X,Y_HINT2);
+		d->setTextSize(2);
+	}
+
+	void drawDynamic(bool) {
+		auto d = tft(); if (!d) return;
+
+		for (int i = 0; i < 6; i++) d->fillRect(0,Y0 + i * DY,W,H,TFT_BLACK);
+
+		d->setTextColor(_param == P_DHCP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_DHCP ? ">" :" ",0,Y0 + 0 * DY);
+		d->drawString(_cfg.dhcp ? "DHCP:ON" :"DHCP:OFF",X,Y0 + 0 * DY);
+
+		drawIpLine(d,"IP :",_cfg.ip,P_IP,1,_param);
+		drawIpLine(d,"MASK:",_cfg.mask,P_MASK,2,_param);
+		drawIpLine(d,"GW :",_cfg.gw,P_GW,3,_param);
+		drawIpLine(d,"DNS :",_cfg.dns,P_DNS,4,_param);
+
+		// NTP + PERIOD
+		char b[64];
+		d->setTextColor(_param == P_NTP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_NTP ? ">" :" ",0,Y0 + 5 * DY);
+		snprintf(b,sizeof(b),"NTP:%s",kNtpIpStr[_cfg.ntpIdx % 5]);
+		d->drawString(b,X,Y0 + 5 * DY);
+
+		d->setTextColor(_param == P_PERIOD ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		snprintf(b,sizeof(b),"PER:%s",kPeriodsName[_cfg.periodIdx % 6]);
+		d->fillRect(160,Y0 + 5 * DY,160,H,TFT_BLACK);
+		d->drawString(b,160,Y0 + 5 * DY);
+	}
+
+	void applyDelta(int delta) {
+		if (_param == P_DHCP) { _cfg.dhcp = _cfg.dhcp ? 0 :1; return; }
+
+		if (_cfg.dhcp && isIpParam(_param)) return;
+
+		if (_param == P_IP) adjOct(_cfg.ip,_oct,delta);
+		else if (_param == P_MASK) adjOct(_cfg.mask,_oct,delta);
+		else if (_param == P_GW) adjOct(_cfg.gw,_oct,delta);
+		else if (_param == P_DNS) adjOct(_cfg.dns,_oct,delta);
+		else if (_param == P_NTP) _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta > 0 ? 1 :4)) % 5);
+		else if (_param == P_PERIOD) _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta > 0 ? 1 :5)) % 6);
+	}
+};
+
+// -------------------- Page3:ИНТЕРНЕТ2 --------------------
+class Page3 :public InternetPageBase {
+public:
+	using InternetPageBase::InternetPageBase;
+
+	void setup() override {}
+
+	void onActivate() override {
+		_staticDrawn = false;
+		_param = 0;
+		_oct = 0;
+		lanStore.load(LanIfStore::IF2,_cfg,false);
+
+		_statLine[0] = 0;
+		_lastStatMs = 0;
+
+		draw();
+	}
+
+	void update() override
+	{
+		uint32_t now = millis();
+		if (now - _lastStatMs < 1000) return;
+		_lastStatMs = now;
+
+		Internet2Client::Status st;
+		bool okRead = internet2.readStatus(st);
+
+		IPAddress ip = okRead ? st.ip :IPAddress(0,0,0,0);
+		bool ok = okRead && !(ip[0]==0 && ip[1]==0 && ip[2]==0 && ip[3]==0);
+
+		char line[48];
+		snprintf(line,sizeof(line),"STATUS:%s IP=%u.%u.%u.%u",
+			ok ? "OK" :"NO",ip[0],ip[1],ip[2],ip[3]);
+
+		if (strcmp(_statLine,line) != 0) {
+			strncpy(_statLine,line,sizeof(_statLine)-1);
+			_statLine[sizeof(_statLine)-1] = 0;
+			drawStatusLine();
+		}
+	}
+
+	void draw() override {
+		if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+		drawDynamic(true);
+	}
+
+	void onButtonPressed(int buttonID) override {
+		if (buttonID == BTN_SW4) { // SAVE+HOME
+			lanStore.save(LanIfStore::IF2,_cfg,true);
+			applyInternet2FromStore(); // <-- применяем по I2C
+			_m->backToStart();
+			return;
+		}
+
+		if (buttonID == BTN_SW1) {
+			if (isIpParam(_param)) {
+				_oct = (_oct + 1) & 3;
+				if (_oct == 0) _param = (_param + 1) % PARAM_COUNT;
+			}
+			else {
+				_param = (_param + 1) % PARAM_COUNT;
+			}
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+			int delta = (buttonID == BTN_SW3) ? +1 :-1;
+			applyDelta(delta);
+			drawDynamic(false);
+			return;
+		}
+	}
+
+	void onButtonReleased(int) override {}
+
+private:
+	LanIfStore::IfConfig _cfg{};
+	bool _staticDrawn = false;
+	uint8_t _param = 0;
+	uint8_t _oct = 0;
+
+	// status
+	uint32_t _lastStatMs = 0;
+	char _statLine[48] = {0};
+
+	void drawStatusLine()
+	{
+		auto d = tft(); if (!d) return;
+
+		d->setTextSize(1);
+		d->fillRect(0,18,320,12,TFT_BLACK);
+
+		bool ok = (strstr(_statLine,"STATUS:OK") != nullptr);
+		d->setTextColor(ok ? TFT_GREEN :TFT_RED,TFT_BLACK);
+		d->drawString(_statLine,X,18);
+
+		d->setTextSize(2);
+	}
+
+	void drawStatic() {
+		auto d = tft(); if (!d) return;
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		d->drawString("INTERNET2",X,Y_TITLE);
+
+		drawStatusLine(); // пустая строка; заполнится в update()
+
+		d->setTextSize(1);
+		d->setTextColor(TFT_RED,TFT_BLACK);
+		d->drawString("2nd MCU over I2C",X,32);
+
+		d->setTextColor(TFT_WHITE,TFT_BLACK);
+		d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+		d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+		d->drawString("SW4:SAVE+HOME",X,Y_HINT2);
+		d->setTextSize(2);
+	}
+
+	void drawDynamic(bool) {
+		auto d = tft(); if (!d) return;
+
+		for (int i = 0; i < 6; i++) d->fillRect(0,Y0 + i * DY,W,H,TFT_BLACK);
+
+		d->setTextColor(_param == P_DHCP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_DHCP ? ">" :" ",0,Y0 + 0 * DY);
+		d->drawString(_cfg.dhcp ? "DHCP:ON" :"DHCP:OFF",X,Y0 + 0 * DY);
+
+		drawIpLine(d,"IP :",_cfg.ip,P_IP,1,_param);
+		drawIpLine(d,"MASK:",_cfg.mask,P_MASK,2,_param);
+		drawIpLine(d,"GW :",_cfg.gw,P_GW,3,_param);
+		drawIpLine(d,"DNS :",_cfg.dns,P_DNS,4,_param);
+
+		char b[64];
+		d->setTextColor(_param == P_NTP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_NTP ? ">" :" ",0,Y0 + 5 * DY);
+		snprintf(b,sizeof(b),"NTP:%s",kNtpIpStr[_cfg.ntpIdx % 5]);
+		d->drawString(b,X,Y0 + 5 * DY);
+
+		d->setTextColor(_param == P_PERIOD ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		snprintf(b,sizeof(b),"PER:%s",kPeriodsName[_cfg.periodIdx % 6]);
+		d->fillRect(160,Y0 + 5 * DY,160,H,TFT_BLACK);
+		d->drawString(b,160,Y0 + 5 * DY);
+	}
+
+	void applyDelta(int delta) {
+		if (_param == P_DHCP) { _cfg.dhcp = _cfg.dhcp ? 0 :1; return; }
+		if (_cfg.dhcp && isIpParam(_param)) return;
+
+		if (_param == P_IP) adjOct(_cfg.ip,_oct,delta);
+		else if (_param == P_MASK) adjOct(_cfg.mask,_oct,delta);
+		else if (_param == P_GW) adjOct(_cfg.gw,_oct,delta);
+		else if (_param == P_DNS) adjOct(_cfg.dns,_oct,delta);
+		else if (_param == P_NTP) _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta > 0 ? 1 :4)) % 5);
+		else if (_param == P_PERIOD) _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta > 0 ? 1 :5)) % 6);
+	}
+};
+
+// -------------------- Page4/5 stubs --------------------
+class Page4 :public PageBase {
+public:using PageBase::PageBase;
+	void setup() override {}
+	void onActivate() override { draw(); }
+	void update() override {}
+	void draw() override {
+		auto d = tft(); if (!d) return;
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		d->drawString("PAGE 4",10,10);
+	}
+	void onButtonPressed(int) override {}
+	void onButtonReleased(int) override {}
+};
+
+class Page5 :public PageBase {
+public:using PageBase::PageBase;
+	void setup() override {}
+	void onActivate() override { draw(); }
+	void update() override {}
+	void draw() override {
+		auto d = tft(); if (!d) return;
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		d->drawString("PAGE 5",10,10);
+	}
+	void onButtonPressed(int) override {}
+	void onButtonReleased(int) override {}
+};
+
+// ---------------------------------------------------------
+
+Menu::Menu(TFT_eSPI* disp) :tft(disp) {}
+
+void Menu::attachPages()
+{
+	static Page1 p1(this);
+	static Page2 p2(this);
+	static Page3 p3(this);
+	static Page4 p4(this);
+	static Page5 p5(this);
+
+	pages[0] = &p1; // SOURCES
+	pages[1] = &p2; // INTERNET1
+	pages[2] = &p3; // INTERNET2
+	pages[3] = &p4;
+	pages[4] = &p5;
+}
+
+void Menu::setup(const String& ver)
+{
+	versionString = ver;
+
+	tft->init();
+	tft->setRotation(3);
+	tft->fillScreen(TFT_NAVY);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+
+	// стартовый экран
+	tft->loadFont(AA_FONT_CALI);
+	tft->setCursor(120,20); tft->println("IVCH");
+	tft->setCursor(100,50); tft->println("DECIMA");
+
+	tft->loadFont(AA_FONT_TIME24I);
+	tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+	tft->setCursor(84,90); tft->println("ВКЛЮЧЕНИЕ");
+
+	tft->loadFont(AA_FONT_TIME18);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->setCursor(5,130); tft->println("(C) 2026");
+	tft->setCursor(5,150); tft->println("www.decima.ru");
+
+	uint16_t tbw = tft->textWidth(versionString);
+	uint16_t x = (tft->width() - tbw) - 4;
+	tft->setCursor(x,150);
+	tft->print(versionString);
+
+	attachPages();
+	for (int i = 0; i < 5; i++) if (pages[i]) pages[i]->setup();
+
+	drawStartPage();
+}
+
+void Menu::update()
+{
+	const uint32_t now = millis();
+
+	if (state == MENU_IDLE) {
+		if (!_homeStaticDrawn) {
+			drawHomeStatic();
+			_homeStaticDrawn = true;
+			_homeDirty = true;
+		}
+
+		if (_homeDirty || (now - _lastHomeTickMs) >= 500) {
+			_lastHomeTickMs = now;
+			drawHomeDynamic();
+			_homeDirty = false;
+		}
+		return;
+	}
+
+	if (state == MENU_ITEM_SELECT) {
+		if (pages[page]) pages[page]->update();
+	}
+}
+
+void Menu::invalidateHome() { _homeDirty = true; }
+
+void Menu::drawStartPage()
+{
+	state = MENU_IDLE;
+	_homeStaticDrawn = false;
+	_homeDirty = true;
+}
+
+void Menu::drawHomeStatic()
+{
+	tft->fillScreen(TFT_BLACK);
+	tft->setTextSize(2);
+
+	tft->setTextColor(TFT_CYAN,TFT_BLACK);
+	tft->drawString("HOME",10,Y_HOME);
+
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->drawString("IP1:",10,Y_IP1);
+	tft->drawString("IP2:",10,Y_IP2);
+	tft->drawString("DATE:",10,Y_DATE);
+	tft->drawString("NET GSM :",10,Y_NET);
+	tft->drawString("SIG :",10,Y_SIG);
+
+	tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+	tft->drawString(versionString,10,Y_VER);
+
+	_lastIp[0] = 0;
+	_lastIp2[0] = 0;
+	_lastDate[0] = 0;
+	_lastNet = !gNetRegistered;
+	_lastBars = 255;
+}
+
+void Menu::drawHomeDynamic()
+{
+	// IP1
+	if (strcmp(_lastIp,gIp1Str) != 0) {
+		strncpy(_lastIp,gIp1Str,sizeof(_lastIp) - 1);
+		_lastIp[sizeof(_lastIp) - 1] = 0;
+		tft->fillRect(80,Y_IP1,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		tft->drawString(_lastIp,80,Y_IP1);
+	}
+
+	// IP2
+	if (strcmp(_lastIp2,gIp2Str) != 0) {
+		strncpy(_lastIp2,gIp2Str,sizeof(_lastIp2) - 1);
+		_lastIp2[sizeof(_lastIp2) - 1] = 0;
+		tft->fillRect(80,Y_IP2,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		tft->drawString(_lastIp2,80,Y_IP2);
+	}
+
+	// Date
+	if (strcmp(_lastDate,gDateStr) != 0) {
+		strncpy(_lastDate,gDateStr,sizeof(_lastDate) - 1);
+		_lastDate[sizeof(_lastDate) - 1] = 0;
+		tft->fillRect(80,Y_DATE,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		tft->drawString(_lastDate,80,Y_DATE);
+	}
+
+	// Net (SIM800 registration)
+	if (_lastNet != gNetRegistered) {
+		_lastNet = gNetRegistered;
+		tft->fillRect(100,Y_NET,240,20,TFT_BLACK);
+		tft->setTextColor(gNetRegistered ? TFT_GREEN :TFT_RED,TFT_BLACK);
+		tft->drawString(gNetRegistered ? "CONNECTED" :"NO",100,Y_NET);
+	}
+
+	// Signal
+	if (_lastBars != gSignalBars) {
+		_lastBars = gSignalBars;
+		tft->fillRect(80,Y_SIG,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		char buf[32];
+		if (gCsqRssi == 99 || gRssiDbm == 0) snprintf(buf,sizeof(buf),"-- [0/5]");
+		else snprintf(buf,sizeof(buf),"%ddBm [%u/5]",(int)gRssiDbm,(unsigned)gSignalBars);
+		tft->drawString(buf,80,Y_SIG);
+	}
+}
+
+void Menu::activate()
+{
+	page = 0;
+	item = 0;
+	state = MENU_PAGE_SELECT;
+	draw();
+}
+
+void Menu::deactivate()
+{
+	drawStartPage();
+}
+
+bool Menu::isActive() const { return state != MENU_IDLE; }
+MenuState Menu::getState() const { return state; }
+
+void Menu::prevPage() { if (state == MENU_PAGE_SELECT) { page = (page + 4) % 5; drawPageSelect(); } }
+void Menu::nextPage() { if (state == MENU_PAGE_SELECT) { page = (page + 1) % 5; drawPageSelect(); } }
+
+void Menu::prevItem() { if (state == MENU_ITEM_SELECT) { item = (item + 4) % 5; drawActivePage(); } }
+void Menu::nextItem() { if (state == MENU_ITEM_SELECT) { item = (item + 1) % 5; drawActivePage(); } }
+
+void Menu::fixPage()
+{
+	if (state == MENU_PAGE_SELECT) {
+		item = 0;
+		state = MENU_ITEM_SELECT;
+		if (pages[page]) pages[page]->onActivate();
+		else drawActivePage();
+	}
+}
+
+void Menu::fixItem()
+{
+	// legacy:в нашем UI item не используется как отдельный уровень
+}
+
+void Menu::backToStart() { deactivate(); }
+
+void Menu::select() {}
+void Menu::runTest() { state = MENU_TEST; draw(); }
+
+void Menu::draw()
+{
+	if (state == MENU_PAGE_SELECT) drawPageSelect();
+	else if (state == MENU_ITEM_SELECT) drawActivePage();
+	else if (state == MENU_TEST) drawTestPage();
+	else drawStartPage();
+}
+
+void Menu::drawPageSelect()
+{
+	static const char* topMenuNames[5] = {
+	"ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+	"НАСТРОЙКИ ИНТЕРНЕТ1",
+	"НАСТРОЙКИ ИНТЕРНЕТ2",
+	"СВОБОДНО",
+	"СВОБОДНО"
+	};
+
+	tft->fillScreen(TFT_BLACK);
+	tft->setTextSize(2);
+	tft->setTextColor(TFT_CYAN,TFT_BLACK);
+	tft->drawString("ВЫБОР МЕНЮ",10,10);
+
+	// Только пункты меню (без IP)
+	for (int i = 0; i < 5; i++) {
+		bool sel = (i == page);
+		tft->setTextColor(sel ? TFT_GREEN :TFT_WHITE,sel ? TFT_BLUE :TFT_BLACK);
+		tft->fillRect(10,35 + i * 24,310,22,TFT_BLACK);
+		tft->drawString(topMenuNames[i],10,35 + i * 24);
+	}
+}
+
+void Menu::drawActivePage()
+{
+	if (pages[page]) pages[page]->draw();
+}
+
+void Menu::onButtonPressed(int buttonID)
+{
+	// HOME:вход в меню по SW1
+	if (state == MENU_IDLE) {
+		if (buttonID == BTN_SW1) activate();
+		return;
+	}
+
+	// MENU_PAGE_SELECT
+	if (state == MENU_PAGE_SELECT) {
+		if (buttonID == BTN_SW2) prevPage();
+		else if (buttonID == BTN_SW3) nextPage();
+		else if (buttonID == BTN_SW1) fixPage();
+		else if (buttonID == BTN_SW4) backToStart();
+		return;
+	}
+
+	// MENU_ITEM_SELECT
+	if (state == MENU_ITEM_SELECT) {
+		if (pages[page]) {
+			pages[page]->onButtonPressed(buttonID);
+			return;
+		}
+	}
+
+	// MENU_TEST
+	if (state == MENU_TEST) {
+		if (buttonID == BTN_SW4 || buttonID == BTN_SW1) backToStart();
+		return;
+	}
+}
+
+void Menu::onButtonReleased(int buttonID)
+{
+	if (state == MENU_ITEM_SELECT && pages[page]) pages[page]->onButtonReleased(buttonID);
+}
+
+const char* Menu::itemLabel(int p,int i) const
+{
+	if (p < 0 || p > 4 || i < 0 || i > 4) return "";
+	return menu[p][i];
+}
+
+void Menu::drawTestPage()
+{
+	tft->fillScreen(TFT_BLACK);
+	tft->setTextColor(TFT_RED,TFT_BLACK);
+	tft->setTextSize(2);
+	tft->drawString("TEST (legacy)",20,60);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->drawString("SW4 - exit",20,120);
+}
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Рассуждения
+
+Ошибки undefined reference to Internet2Client::... означают одно из двух:
+
+Internet2Client.cpp не участвует в сборке (в папке скетча есть .h,но нет .cpp,или .cpp лежит в 
+подпапке типа src/,которую Arduino IDE не компилирует), или
+сигнатуры в .cpp не совпадают с тем,что объявлено в .h.
+По логу у вас компиляция .ino прошла,а на этапе линковки не найдены реализации методов — это классический 
+случай “нет Internet2Client.cpp” в сборке.
+
+Ниже даю полностью готовые файлы Internet2Client.h и Internet2Client.cpp,которые соответствуют тем методам,
+которые у вас вызываются (begin/readStatus/requestSyncNow/applyNetCfg/setTimeUnixUtc). После этого — что сделать в Arduino IDE.
+
+1) Internet2Client.h (полный)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include <IPAddress.h>
+
+class Internet2Client {
+public:
+ struct Status {
+ uint8_t protoVer = 0;
+ uint8_t flags = 0;
+ IPAddress ip = IPAddress(0,0,0,0);
+ int32_t lastOffsetSec = 0;
+ uint32_t lastNtpUtc = 0;
+ bool lastSyncOk = false;
+ };
+
+ explicit Internet2Client(TwoWire& w = Wire,uint8_t addr = 0x42);
+
+ bool begin();
+
+ bool setTimeUnixUtc(uint32_t unixUtc,uint16_t ms = 0);
+
+ bool applyNetCfg(bool dhcp,
+ IPAddress ip,
+ IPAddress mask,
+ IPAddress gw,
+ IPAddress dns,
+ IPAddress ntpUpstream,
+ uint32_t periodMs);
+
+ bool requestSyncNow();
+ bool readStatus(Status& out);
+
+private:
+ TwoWire* _w;
+ uint8_t _addr;
+
+ bool writeReg(uint8_t reg,const uint8_t* data,size_t len);
+ bool readReg(uint8_t reg,uint8_t* data,size_t len);
+};
+2) Internet2Client.cpp (полный)
+cpp Копировать
+#include "Internet2Client.h"
+
+Internet2Client::Internet2Client(TwoWire& w,uint8_t addr)
+:_w(&w),_addr(addr) {}
+
+bool Internet2Client::begin() {
+ _w->beginTransmission(_addr);
+ return (_w->endTransmission() == 0);
+}
+
+bool Internet2Client::writeReg(uint8_t reg,const uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write(reg);
+ for (size_t i = 0; i < len; i++) _w->write(data[i]);
+ return (_w->endTransmission() == 0);
+}
+
+bool Internet2Client::readReg(uint8_t reg,uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write(reg);
+
+ // STM32duino поддерживает endTransmission(false)
+ if (_w->endTransmission(false) != 0) return false;
+
+ size_t got = _w->requestFrom((int)_addr,(int)len);
+ if (got != len) return false;
+
+ for (size_t i = 0; i < len; i++) data[i] = (uint8_t)_w->read();
+ return true;
+}
+
+bool Internet2Client::setTimeUnixUtc(uint32_t unixUtc,uint16_t ms) {
+ uint8_t b[6];
+ b[0] = (uint8_t)(unixUtc);
+ b[1] = (uint8_t)(unixUtc >> 8);
+ b[2] = (uint8_t)(unixUtc >> 16);
+ b[3] = (uint8_t)(unixUtc >> 24);
+ b[4] = (uint8_t)(ms);
+ b[5] = (uint8_t)(ms >> 8);
+ return writeReg(0x10,b,sizeof(b));
+}
+
+bool Internet2Client::applyNetCfg(bool dhcp,
+ IPAddress ip,
+ IPAddress mask,
+ IPAddress gw,
+ IPAddress dns,
+ IPAddress ntpUpstream,
+ uint32_t periodMs) {
+
+ uint8_t b[1 + 4*5 + 4];
+ b[0] = dhcp ? 1 :0;
+
+ int k = 1;
+ auto putIp = [&](IPAddress a){
+ b[k++] = a[0]; b[k++] = a[1]; b[k++] = a[2]; b[k++] = a[3];
+ };
+
+ putIp(ip);
+ putIp(mask);
+ putIp(gw);
+ putIp(dns);
+ putIp(ntpUpstream);
+
+ b[k++] = (uint8_t)(periodMs);
+ b[k++] = (uint8_t)(periodMs >> 8);
+ b[k++] = (uint8_t)(periodMs >> 16);
+ b[k++] = (uint8_t)(periodMs >> 24);
+
+ return writeReg(0x20,b,sizeof(b));
+}
+
+bool Internet2Client::requestSyncNow() {
+ uint8_t cmd = 1;
+ return writeReg(0x30,&cmd,1);
+}
+
+bool Internet2Client::readStatus(Status& out) {
+ uint8_t b[16];
+ if (!readReg(0x80,b,sizeof(b))) return false;
+
+ out.protoVer = b[0];
+ out.flags = b[1];
+ out.ip = IPAddress(b[2],b[3],b[4],b[5]);
+
+ out.lastOffsetSec = (int32_t)(
+ (uint32_t)b[6] |
+ ((uint32_t)b[7] << 8) |
+ ((uint32_t)b[8] << 16) |
+ ((uint32_t)b[9] << 24));
+
+ out.lastNtpUtc =
+ (uint32_t)b[10] |
+ ((uint32_t)b[11] << 8) |
+ ((uint32_t)b[12] << 16) |
+ ((uint32_t)b[13] << 24);
+
+ out.lastSyncOk = (b[14] != 0);
+ return true;
+}
+3) Что сделать в Arduino IDE (обязательно)
+Убедитесь,что оба файла лежат рядом с вашим .ino:
+
+Internet2Client.h
+Internet2Client.cpp
+Путь:Sketch → Show Sketch Folder и положить файлы туда же.
+
+Важно:Arduino IDE 1.8.x не компилирует .cpp в подпапках скетча (например src/). Если вы держали Internet2Client.cpp 
+в подпапке — перенесите в корень папки скетча.
+
+Затем полностью перезапустите Arduino IDE и пересоберите.
+
+4) Быстрая самопроверка
+После размещения файлов в папке скетча в окне компиляции вы должны видеть строку компиляции вида:
+
+Compiling... Internet2Client.cpp
+Если её нет — файл всё ещё не участвует в сборке.
+
+Если после этого будут ошибки уже компиляции (а не линковки),пришлите первые 20 строк лога компиляции:там 
+будет видно,какое именно ядро/версия Wire у вас,и нужно 
+ли заменить endTransmission(false) на другой вариант.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Нужно доработать второй модуль (Internet2, W5500) так,чтобы он:
+
+принимал от центрального unixUtc + ms,
+внутри восстанавливал текущее время с миллисекундами,
+в NTP‑ответах заполнял Transmit Timestamp (секунды + дробь) корректно (и желательно Receive тоже).
+Ниже — полностью готовые обновлённые файлы W5500NtpServerClient.h/.cpp для Internet2‑модуля.
+
+После этого на центральном модуле обязательно отправляйте ms (см. в конце).
+
+1) W5500NtpServerClient.h (обновлённый)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class W5500NtpServerClient {
+public:
+ struct NetCfg {
+ uint8_t dhcp = 1;
+ uint8_t ip[4] = {192,168,75,232};
+ uint8_t mask[4] = {255,255,255,0};
+ uint8_t gw[4] = {192,168,75,1};
+ uint8_t dns[4] = {8,8,8,8};
+
+ uint8_t upstream[4] = {162,159,200,123}; // внешний NTP IP
+ uint32_t periodMs = 3600000UL;
+ };
+
+ struct Status {
+ bool linkUp=false;
+ bool dhcp=true;
+ bool haveMasterTime=false;
+ bool syncInProgress=false;
+
+ uint8_t ip[4] = {0,0,0,0};
+
+ bool lastSyncOk=false;
+ uint32_t lastNtpUtc=0;
+ int32_t lastOffsetSec=0;
+ uint32_t lastSyncMs=0;
+ };
+
+ void begin();
+ void tick();
+
+ void applyNetCfg(const NetCfg& cfg);
+ void requestSyncNow();
+
+ // from master:unix utc + ms (0..999)
+ void setMasterTimeUtc(uint32_t unixUtc,uint16_t ms);
+
+ // for status/debug
+ uint32_t nowUtcSeconds() const;
+
+ Status status() const { return _st; }
+
+ // UART clients
+ void printNowTo(Stream& s) const;
+
+private:
+ NetCfg _cfg{};
+ mutable Status _st{};
+
+ // base time from master
+ uint32_t _baseUnix=0;     // seconds
+ uint32_t _baseMillis=0;   // millis() at base
+ uint16_t _baseMs=0;       // 0..999 ms inside current second at baseMillis moment
+
+ uint32_t _nextSyncMs=0;
+ bool _syncReq=false;
+
+ // internals
+ void ethBegin();
+ bool linkUp() const;
+
+ void tickNtpServer();
+ void tickNtpClient();
+
+ uint32_t syncUpstreamOnce(); // returns unix utc or 0
+
+ // --- точное время:секунды + дробь ---
+ void nowUtcSecFrac(uint32_t& unixSec,uint32_t& ntpFrac) const;
+ static uint32_t msToNtpFrac(uint16_t ms);
+};
+
+
+//----------------------------------------------
+
+Ниже — полный W5500NtpServerClient.cpp (целиком) с точным NTP Timestamp (секунды + дробь) на основе времени,полученного по I2C от центрального модуля (unixUtc + ms). Также оставлен NTP-клиент для внешней синхронизации (использует короткий ожидатель ~1200 мс как было).
+
+Требует обновлённый W5500NtpServerClient.h из предыдущего сообщения (с методами nowUtcSecFrac() и т.п.).
+
+cpp Копировать
+#include "W5500NtpServerClient.h"
+
+#include <SPI.h>
+#include <IPAddress.h>
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+
+#define USE_THIS_SS_PIN PA4
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+static EthernetUDP udpSrv;
+static EthernetUDP udpCli;
+
+static const uint16_t NTP_PORT = 123;
+static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800UL;
+
+static uint32_t unixToNtp1900(uint32_t u){ return u + NTP_UNIX_EPOCH_DELTA; }
+static uint32_t ntp1900ToUnix(uint32_t n){ return n - NTP_UNIX_EPOCH_DELTA; }
+
+bool W5500NtpServerClient::linkUp() const {
+ const char* s = Ethernet.linkReport();
+ return (s && strcmp(s,"LINK")==0);
+}
+
+uint32_t W5500NtpServerClient::msToNtpFrac(uint16_t ms) {
+ // frac = ms / 1000 * 2^32
+ return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+}
+
+void W5500NtpServerClient::nowUtcSecFrac(uint32_t& unixSec,uint32_t& ntpFrac) const {
+ if (_baseUnix == 0) { unixSec = 0; ntpFrac = 0; return; }
+
+ uint32_t nowMs = millis();
+ uint32_t dMs = nowMs - _baseMillis; // wrap-safe
+ uint64_t totalMs = (uint64_t)_baseMs + (uint64_t)dMs;
+
+ unixSec = _baseUnix + (uint32_t)(totalMs / 1000ULL);
+ uint16_t remMs = (uint16_t)(totalMs % 1000ULL);
+ ntpFrac = msToNtpFrac(remMs);
+}
+
+uint32_t W5500NtpServerClient::nowUtcSeconds() const {
+ uint32_t s,f;
+ nowUtcSecFrac(s,f);
+ return s;
+}
+
+void W5500NtpServerClient::begin() {
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+ SPI_New.begin();
+
+ // Ethernet_Generic uses global pCUR_SPI
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ ethBegin();
+
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ _nextSyncMs = millis() + 1000;
+}
+
+void W5500NtpServerClient::ethBegin() {
+ uint8_t mac[6] = {0xDE,0xAD,0xBE,0xEF,0x02,0x02};
+
+ // быстрый старт:если линк down - DHCP не запускаем
+ if (_cfg.dhcp && linkUp()) {
+ int ok = Ethernet.begin(mac,&SPI_New,3000,1000);
+ if (!ok) _cfg.dhcp = 0;
+ } else {
+ _cfg.dhcp = 0;
+ }
+
+ if (!_cfg.dhcp) {
+ Ethernet.begin(mac,
+ IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+ IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+ IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+ IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+ }
+}
+
+void W5500NtpServerClient::applyNetCfg(const NetCfg& cfg) {
+ _cfg = cfg;
+ ethBegin();
+ udpSrv.stop(); udpCli.stop();
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+}
+
+void W5500NtpServerClient::setMasterTimeUtc(uint32_t unixUtc,uint16_t ms) {
+ if (ms > 999) ms = 999;
+ _baseUnix = unixUtc;
+ _baseMillis = millis();
+ _baseMs = ms;
+ _st.haveMasterTime = (unixUtc != 0);
+}
+
+void W5500NtpServerClient::requestSyncNow() { _syncReq = true; }
+
+void W5500NtpServerClient::tick() {
+ _st.linkUp = linkUp();
+ _st.dhcp = (_cfg.dhcp != 0);
+
+ IPAddress ip = Ethernet.localIP();
+ _st.ip[0]=ip[0]; _st.ip[1]=ip[1]; _st.ip[2]=ip[2]; _st.ip[3]=ip[3];
+
+ // отвечаем NTP клиентам даже если интернета нет (лишь бы был master time)
+ tickNtpServer();
+
+ if (!_st.linkUp) return;
+
+ if (_cfg.dhcp) Ethernet.maintain();
+
+ uint32_t now = millis();
+ if (_syncReq || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncReq = false;
+ _nextSyncMs = now + _cfg.periodMs;
+ tickNtpClient();
+ }
+}
+
+void W5500NtpServerClient::tickNtpServer() {
+ int packetSize = udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = udpSrv.read(req,48);
+ if (n < 48) return;
+
+ // Нужна база времени от мастер-модуля
+ if (!_st.haveMasterTime) return;
+
+ uint32_t unixSec;
+ uint32_t frac;
+ nowUtcSecFrac(unixSec,frac);
+ if (unixSec == 0) return;
+
+ uint32_t txSec1900 = unixToNtp1900(unixSec);
+
+ uint8_t resp[48] = {0};
+
+ // LI=0,VN=4,Mode=4(Server)
+ resp[0] = (0 << 6) | (4 << 3) | 4;
+ resp[1] = 1; // stratum
+ resp[2] = 6; // poll
+ resp[3] = (uint8_t)-20; // precision
+ resp[12] = 'L'; resp[13] = 'O'; resp[14] = 'C'; resp[15] = '2';
+
+ // Originate Timestamp = client's Transmit Timestamp (bytes 40..47 of request)
+ memcpy(&resp[24],&req[40],8);
+
+ // Receive Timestamp (мы ставим "текущее" время)
+ resp[32]=(txSec1900>>24)&0xFF; resp[33]=(txSec1900>>16)&0xFF; resp[34]=(txSec1900>>8)&0xFF; resp[35]=txSec1900&0xFF;
+ resp[36]=(frac>>24)&0xFF; resp[37]=(frac>>16)&0xFF; resp[38]=(frac>>8)&0xFF; resp[39]=frac&0xFF;
+
+ // Transmit Timestamp (текущее)
+ resp[40]=(txSec1900>>24)&0xFF; resp[41]=(txSec1900>>16)&0xFF; resp[42]=(txSec1900>>8)&0xFF; resp[43]=txSec1900&0xFF;
+ resp[44]=(frac>>24)&0xFF; resp[45]=(frac>>16)&0xFF; resp[46]=(frac>>8)&0xFF; resp[47]=frac&0xFF;
+
+ udpSrv.beginPacket(udpSrv.remoteIP(),udpSrv.remotePort());
+ udpSrv.write(resp,48);
+ udpSrv.endPacket();
+}
+
+uint32_t W5500NtpServerClient::syncUpstreamOnce() {
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ pkt[0]=0b11100011; // LI=3? VN=4 Mode=3 (client request)
+ pkt[1]=0; pkt[2]=6; pkt[3]=0xEC;
+
+ // Можно добавить transmit timestamp клиента — но не обязательно для получения времени
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+
+ uint32_t t0 = millis();
+ while (millis() - t0 < 1200) {
+ int sz = udpCli.parsePacket();
+ if (sz >= 48) {
+ uint8_t resp[48];
+ int n = udpCli.read(resp,48);
+ if (n < 48) return 0;
+
+ // server transmit timestamp seconds
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 < NTP_UNIX_EPOCH_DELTA) return 0;
+ return ntp1900ToUnix(sec1900);
+ }
+ delay(1);
+ }
+ return 0;
+}
+
+void W5500NtpServerClient::tickNtpClient() {
+ if (!_st.haveMasterTime) return;
+
+ _st.syncInProgress = true;
+ uint32_t ntpUtc = syncUpstreamOnce();
+ _st.syncInProgress = false;
+
+ _st.lastSyncMs = millis();
+ if (ntpUtc == 0) { _st.lastSyncOk=false; return; }
+
+ uint32_t curUtc = nowUtcSeconds();
+ _st.lastNtpUtc = ntpUtc;
+ _st.lastOffsetSec = (int32_t)ntpUtc - (int32_t)curUtc;
+ _st.lastSyncOk = true;
+}
+
+void W5500NtpServerClient::printNowTo(Stream& s) const {
+ uint32_t sec,frac;
+ nowUtcSecFrac(sec,frac);
+ uint16_t ms = 0;
+ if (_baseUnix != 0) {
+ // восстановим миллисекунды из frac (приближенно)
+ // ms ~= frac * 1000 / 2^32
+ ms = (uint16_t)(((uint64_t)frac * 1000ULL) >> 32);
+ }
+ auto st = status();
+
+ s.print("UNIX:"); s.println((unsigned long)sec);
+ s.print("MS:"); s.println((unsigned)ms);
+ s.print("IP:"); s.print(st.ip[0]); s.print('.'); s.print(st.ip[1]); s.print('.'); s.print(st.ip[2]); s.print('.'); s.println(st.ip[3]);
+ s.print("SYNC_OK:"); s.println(st.lastSyncOk ? 1 :0);
+ s.print("OFFS:"); s.println(st.lastOffsetSec);
+}
+3) Обязательная правка на центральном модуле (VGT6)
+Чтобы смысл “мс” был,отправляйте ms:
+
+Замените:
+
+cpp Копировать
+internet2.setTimeUnixUtc(unixUtc,0);
+на:
+
+cpp Копировать
+uint16_t ms = (uint16_t)(millis() % 1000);
+internet2.setTimeUnixUtc(unixUtc,ms);
+И желательно отправлять чаще (например 200–500 мс),или “по смене секунды RTC + ms”.
+
+Если хотите,я дам неблокирующую версию syncUpstreamOnce() (без while 1.2 сек) в 
+виде FSM,чтобы даже внешний NTP запрос не давал пауз.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — неблокирующая реализация внешней NTP‑синхронизации для Internet2‑модуля (W5500). Мы убираем syncUpstreamOnce() с while(...) и делаем FSM (машину состояний),которая:
+
+отправляет запрос,
+затем “фоном” ждёт ответ в tick() через udpCli.parsePacket(),
+по таймауту завершает попытку без зависаний.
+Я даю точный патч:что добавить в .h и что заменить/добавить в .cpp.
+
+1) Патч W5500NtpServerClient.h
+1.1. Добавьте в private: поля и методы FSM
+В конец private: добавьте:
+
+cpp Копировать
+ // --- Non-blocking upstream NTP sync FSM ---
+ enum SyncState :uint8_t { SYNC_IDLE=0,SYNC_WAIT=1 };
+ SyncState _syncState = SYNC_IDLE;
+ uint32_t _syncDeadlineMs = 0;
+ uint8_t _syncRetriesLeft = 0;
+
+ void startUpstreamSync(); // отправить запрос (не блокирует)
+ void pollUpstreamSync(); // опросить ответ/таймаут (не блокирует)
+ void finishUpstreamSync(bool ok,uint32_t ntpUtc);
+Если хотите 2 попытки при потере пакета — оставьте _syncRetriesLeft,если не надо — можно убрать.
+
+2) Патч W5500NtpServerClient.cpp
+2.1. Удалите/не используйте блокирующий syncUpstreamOnce() и перепишите tickNtpClient()
+Замените вашу текущую tickNtpClient() на неблокирующую:
+cpp Копировать
+void W5500NtpServerClient::tickNtpClient() {
+ // 1) если идёт ожидание — просто опрашиваем
+ if (_syncState != SYNC_IDLE) {
+ pollUpstreamSync();
+ return;
+ }
+
+ // 2) стартовать новую синхронизацию только если есть база времени от мастера
+ if (!_st.haveMasterTime) return;
+
+ // 3) запуск по запросу/расписанию (этот флаг/расписание вы уже выставляете в tick())
+ startUpstreamSync();
+}
+Важно:теперь tickNtpClient() не делает сетевых ожиданий — только старт/опрос.
+
+2.2. Добавьте реализации FSM методов (в конец файла .cpp)
+cpp Копировать
+void W5500NtpServerClient::startUpstreamSync()
+{
+ // старт новой попытки
+ _st.syncInProgress = true;
+ _st.lastSyncOk = false;
+ _st.lastSyncMs = millis();
+
+ _syncState = SYNC_WAIT;
+ _syncDeadlineMs = millis() + 1200; // общий таймаут ожидания ответа
+ _syncRetriesLeft = 1; // 1 = одна повторная отправка (можно 0)
+
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ pkt[0]=0b11100011; // client
+ pkt[1]=0; pkt[2]=6; pkt[3]=0xEC;
+
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+
+ // отметим попытку (для статуса на экране)
+ _st.lastAttemptMs = millis();
+}
+
+void W5500NtpServerClient::pollUpstreamSync()
+{
+ // 1) проверяем,не пришёл ли ответ
+ int sz = udpCli.parsePacket();
+ if (sz >= 48) {
+ uint8_t resp[48];
+ int n = udpCli.read(resp,48);
+ if (n >= 48) {
+
+ // transmit timestamp seconds
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 >= NTP_UNIX_EPOCH_DELTA) {
+ uint32_t ntpUtc = ntp1900ToUnix(sec1900);
+ finishUpstreamSync(true,ntpUtc);
+ return;
+ }
+ }
+ // если пакет кривой — игнорируем и продолжаем ждать до таймаута
+ }
+
+ // 2) таймаут?
+ if ((int32_t)(millis() - _syncDeadlineMs) >= 0) {
+ if (_syncRetriesLeft > 0) {
+ _syncRetriesLeft--;
+
+ // повторная отправка
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ pkt[0]=0b11100011; pkt[1]=0; pkt[2]=6; pkt[3]=0xEC;
+
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+
+ _syncDeadlineMs = millis() + 1200;
+ return;
+ }
+
+ finishUpstreamSync(false,0);
+ return;
+ }
+}
+
+void W5500NtpServerClient::finishUpstreamSync(bool ok,uint32_t ntpUtc)
+{
+ _syncState = SYNC_IDLE;
+ _st.syncInProgress = false;
+ _st.lastSyncMs = millis();
+
+ if (!ok || ntpUtc == 0) {
+ _st.lastSyncOk = false;
+ return;
+ }
+
+ // offset считаем относительно текущего master-time (секунды)
+ uint32_t curUtc = nowUtcSeconds();
+
+ _st.lastNtpUtc = ntpUtc;
+ _st.lastOffsetSec = (int32_t)ntpUtc - (int32_t)curUtc;
+ _st.lastSyncOk = true;
+}
+2.3. В tick() замените вызов tickNtpClient() так,чтобы он работал в двух режимах
+Сейчас у вас было (упрощенно):
+
+cpp Копировать
+if (_syncReq || timeDue) { tickNtpClient(); }
+Теперь надо:
+
+при наступлении события просто “пометить”,что надо стартовать,
+а tickNtpClient() пусть работает каждый цикл,чтобы дождаться ответа.
+Минимально:
+
+cpp Копировать
+// внутри tick(),где вы решаете "пора синхронизироваться"
+if (_syncReq || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncReq = false;
+ _nextSyncMs = now + _cfg.periodMs;
+
+ // стартуем только если FSM свободна
+ if (_syncState == SYNC_IDLE) startUpstreamSync();
+}
+
+// а далее (или в конце tick()) всегда:
+if (_syncState != SYNC_IDLE) pollUpstreamSync();
+То есть внешняя синхронизация продолжится “фоном” после отправки.
+
+3) Итог:что вы получите
+Никаких while/delay ожиданий в Internet2‑модуле.
+Даже если интернет пропал,модуль продолжает:
+отвечать локальным NTP клиентам (по мастер‑времени),
+обслуживать UART2/UART3,
+обслуживать I2C.
+Важно:у вас в Status структуры нет lastAttemptMs
+В предыдущих версиях W5500NtpServerClient::Status не содержал lastAttemptMs. 
+Если вы хотите хранить/показывать его — добавьте поле в Status:
+
+cpp Копировать
+uint32_t lastAttemptMs=0;
+Иначе просто удалите строку _st.lastAttemptMs = millis(); из startUpstreamSync().
+
+Если хотите,я соберу полный файл W5500NtpServerClient.cpp целиком с уже внедрённой FSM 
+(включая tickNtpServer,точный txFrac,и неблокирующий upstream) — скажите,какая у вас текущая версия .h 
+(или просто пришлите её),чтобы совпали поля Status и компиляция прошла без ручных правок.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — полный W5500NtpServerClient.cpp (целиком) для Internet2‑модуля,в котором:
+
+NTP‑сервер отвечает точно (секунды + дробь) на основе времени от центрального (unixUtc + ms)
+внешний NTP‑клиент (upstream) работает неблокирующе через FSM (без while ожиданий)
+DHCP/maintain вызываются только при LINK up
+при LINK down синхронизация автоматически завершается без зависаний
+Требует ваш обновлённый W5500NtpServerClient.h,в котором объявлены:
+
+nowUtcSecFrac(),msToNtpFrac()
+поля FSM:_syncState,_syncDeadlineMs,_syncRetriesLeft и методы startUpstreamSync/pollUpstreamSync/finishUpstreamSync
+SyncState { SYNC_IDLE,SYNC_WAIT }
+cpp Копировать
+#include "W5500NtpServerClient.h"
+
+#include <SPI.h>
+#include <IPAddress.h>
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+
+// ---- W5500 on SPI1 (STM32F103CBT6 in your Internet2 module) ----
+#define USE_THIS_SS_PIN PA4
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+
+static EthernetUDP udpSrv; // local NTP server socket (port 123)
+static EthernetUDP udpCli; // upstream NTP client socket (ephemeral)
+
+static const uint16_t NTP_PORT = 123;
+static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800UL; // seconds between 1900 and 1970
+
+static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + NTP_UNIX_EPOCH_DELTA; }
+static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - NTP_UNIX_EPOCH_DELTA; }
+
+// -------------------- helpers --------------------
+bool W5500NtpServerClient::linkUp() const {
+ const char* s = Ethernet.linkReport();
+ return (s && strcmp(s,"LINK") == 0);
+}
+
+uint32_t W5500NtpServerClient::msToNtpFrac(uint16_t ms) {
+ // frac = ms / 1000 * 2^32
+ return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+}
+
+// current UTC time derived from master base:returns unix seconds + NTP fractional seconds
+void W5500NtpServerClient::nowUtcSecFrac(uint32_t& unixSec,uint32_t& ntpFrac) const {
+ if (_baseUnix == 0) { unixSec = 0; ntpFrac = 0; return; }
+
+ uint32_t nowMs = millis();
+ uint32_t dMs = nowMs - _baseMillis; // wrap-safe
+ uint64_t totalMs = (uint64_t)_baseMs + (uint64_t)dMs;
+
+ unixSec = _baseUnix + (uint32_t)(totalMs / 1000ULL);
+ uint16_t remMs = (uint16_t)(totalMs % 1000ULL);
+ ntpFrac = msToNtpFrac(remMs);
+}
+
+uint32_t W5500NtpServerClient::nowUtcSeconds() const {
+ uint32_t s,f;
+ nowUtcSecFrac(s,f);
+ return s;
+}
+
+// -------------------- init/config --------------------
+void W5500NtpServerClient::begin() {
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+ SPI_New.begin();
+
+ // Ethernet_Generic uses global pCUR_SPI
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ ethBegin();
+
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ _nextSyncMs = millis() + 1000;
+
+ // reset FSM
+ _syncState = SYNC_IDLE;
+ _syncDeadlineMs = 0;
+ _syncRetriesLeft = 0;
+ _st.syncInProgress = false;
+}
+
+void W5500NtpServerClient::ethBegin() {
+ uint8_t mac[6] = {0xDE,0xAD,0xBE,0xEF,0x02,0x02};
+
+ // Fast startup:if link down -> do not run DHCP
+ if (_cfg.dhcp && linkUp()) {
+ int ok = Ethernet.begin(mac,&SPI_New,3000,1000); // short DHCP timeouts
+ if (!ok) _cfg.dhcp = 0;
+ } else {
+ _cfg.dhcp = 0;
+ }
+
+ if (!_cfg.dhcp) {
+ Ethernet.begin(mac,
+ IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+ IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+ IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+ IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3])
+ );
+ }
+}
+
+void W5500NtpServerClient::applyNetCfg(const NetCfg& cfg) {
+ _cfg = cfg;
+
+ // ensure Ethernet_Generic uses our SPI
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ ethBegin();
+
+ udpSrv.stop();
+ udpCli.stop();
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ // if cfg changed while waiting upstream,stop the attempt
+ _syncState = SYNC_IDLE;
+ _st.syncInProgress = false;
+}
+
+void W5500NtpServerClient::setMasterTimeUtc(uint32_t unixUtc,uint16_t ms) {
+ if (ms > 999) ms = 999;
+ _baseUnix = unixUtc;
+ _baseMillis = millis();
+ _baseMs = ms;
+ _st.haveMasterTime = (unixUtc != 0);
+}
+
+void W5500NtpServerClient::requestSyncNow() {
+ _syncReq = true;
+}
+
+// -------------------- main tick --------------------
+void W5500NtpServerClient::tick() {
+ _st.linkUp = linkUp();
+ _st.dhcp = (_cfg.dhcp != 0);
+
+ IPAddress ip = Ethernet.localIP();
+ _st.ip[0] = ip[0]; _st.ip[1] = ip[1]; _st.ip[2] = ip[2]; _st.ip[3] = ip[3];
+
+ // Local NTP server tick (non-blocking)
+ tickNtpServer();
+
+ // If link is down,cancel any upstream attempt quickly and return
+ if (!_st.linkUp) {
+ if (_syncState != SYNC_IDLE) finishUpstreamSync(false,0);
+ return;
+ }
+
+ // DHCP maintenance only when link is up
+ if (_cfg.dhcp) Ethernet.maintain();
+
+ // Upstream NTP client tick (non-blocking FSM)
+ tickNtpClient();
+}
+
+// -------------------- NTP server (local clients) --------------------
+void W5500NtpServerClient::tickNtpServer() {
+ int packetSize = udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = udpSrv.read(req,48);
+ if (n < 48) return;
+
+ // Need time base from master
+ if (!_st.haveMasterTime) return;
+
+ uint32_t unixSec,frac;
+ nowUtcSecFrac(unixSec,frac);
+ if (unixSec == 0) return;
+
+ uint32_t txSec1900 = unixToNtp1900(unixSec);
+
+ uint8_t resp[48] = {0};
+
+ // LI=0,VN=4,Mode=4 (server)
+ resp[0] = (0 << 6) | (4 << 3) | 4;
+ resp[1] = 1; // stratum
+ resp[2] = 6; // poll
+ resp[3] = (uint8_t)-20; // precision (approx)
+
+ // Reference ID
+ resp[12] = 'L'; resp[13] = 'O'; resp[14] = 'C'; resp[15] = '2';
+
+ // Originate Timestamp = client's Transmit Timestamp (request[40..47])
+ memcpy(&resp[24],&req[40],8);
+
+ // Receive Timestamp (use current)
+ resp[32] = (txSec1900 >> 24) & 0xFF;
+ resp[33] = (txSec1900 >> 16) & 0xFF;
+ resp[34] = (txSec1900 >> 8) & 0xFF;
+ resp[35] = (txSec1900) & 0xFF;
+ resp[36] = (frac >> 24) & 0xFF;
+ resp[37] = (frac >> 16) & 0xFF;
+ resp[38] = (frac >> 8) & 0xFF;
+ resp[39] = (frac) & 0xFF;
+
+ // Transmit Timestamp (use current)
+ resp[40] = (txSec1900 >> 24) & 0xFF;
+ resp[41] = (txSec1900 >> 16) & 0xFF;
+ resp[42] = (txSec1900 >> 8) & 0xFF;
+ resp[43] = (txSec1900) & 0xFF;
+ resp[44] = (frac >> 24) & 0xFF;
+ resp[45] = (frac >> 16) & 0xFF;
+ resp[46] = (frac >> 8) & 0xFF;
+ resp[47] = (frac) & 0xFF;
+
+ udpSrv.beginPacket(udpSrv.remoteIP(),udpSrv.remotePort());
+ udpSrv.write(resp,48);
+ udpSrv.endPacket();
+}
+
+// -------------------- NTP client (upstream,non-blocking) --------------------
+void W5500NtpServerClient::tickNtpClient()
+{
+ // If waiting for reply,poll it
+ if (_syncState != SYNC_IDLE) {
+ pollUpstreamSync();
+ return;
+ }
+
+ // Start new attempt when requested or period reached
+ uint32_t now = millis();
+ if (_syncReq || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncReq = false;
+ _nextSyncMs = now + _cfg.periodMs;
+
+ // Need master time base to compute offset meaningfully
+ if (!_st.haveMasterTime) return;
+
+ startUpstreamSync();
+ }
+}
+
+void W5500NtpServerClient::startUpstreamSync()
+{
+ // start attempt
+ _st.syncInProgress = true;
+ _st.lastSyncOk = false;
+ _st.lastSyncMs = millis();
+
+ _syncState = SYNC_WAIT;
+ _syncDeadlineMs = millis() + 1200;
+ _syncRetriesLeft = 1; // one retry on timeout (0..N)
+
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ // LI=0,VN=4,Mode=3 (client)
+ pkt[0] = (0 << 6) | (4 << 3) | 3;
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+}
+
+void W5500NtpServerClient::pollUpstreamSync()
+{
+ // If link went down mid-wait,stop
+ if (!linkUp()) {
+ finishUpstreamSync(false,0);
+ return;
+ }
+
+ // Check for response
+ int sz = udpCli.parsePacket();
+ if (sz >= 48) {
+ uint8_t resp[48];
+ int n = udpCli.read(resp,48);
+ if (n >= 48) {
+
+ // Server Transmit Timestamp seconds (resp[40..43])
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) |
+ ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) |
+ (uint32_t)resp[43];
+
+ if (sec1900 >= NTP_UNIX_EPOCH_DELTA) {
+ uint32_t ntpUtc = ntp1900ToUnix(sec1900);
+ finishUpstreamSync(true,ntpUtc);
+ return;
+ }
+ }
+ // If packet invalid,keep waiting until timeout
+ }
+
+ // Timeout?
+ if ((int32_t)(millis() - _syncDeadlineMs) >= 0) {
+ if (_syncRetriesLeft > 0) {
+ _syncRetriesLeft--;
+
+ // resend
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ pkt[0] = (0 << 6) | (4 << 3) | 3;
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+
+ _syncDeadlineMs = millis() + 1200;
+ return;
+ }
+
+ finishUpstreamSync(false,0);
+ return;
+ }
+}
+
+void W5500NtpServerClient::finishUpstreamSync(bool ok,uint32_t ntpUtc)
+{
+ _syncState = SYNC_IDLE;
+ _st.syncInProgress = false;
+ _st.lastSyncMs = millis();
+
+ if (!ok || ntpUtc == 0) {
+ _st.lastSyncOk = false;
+ return;
+ }
+
+ uint32_t curUtc = nowUtcSeconds();
+ _st.lastNtpUtc = ntpUtc;
+ _st.lastOffsetSec = (int32_t)ntpUtc - (int32_t)curUtc;
+ _st.lastSyncOk = true;
+}
+
+// -------------------- UART clients --------------------
+void W5500NtpServerClient::printNowTo(Stream& s) const {
+ uint32_t sec,frac;
+ nowUtcSecFrac(sec,frac);
+
+ // approximate ms from frac
+ uint16_t ms = 0;
+ if (_baseUnix != 0) ms = (uint16_t)(((uint64_t)frac * 1000ULL) >> 32);
+
+ auto st = status();
+ s.print("UNIX:"); s.println((unsigned long)sec);
+ s.print("MS:"); s.println((unsigned)ms);
+ s.print("IP:"); s.print(st.ip[0]); s.print('.'); s.print(st.ip[1]); s.print('.'); s.print(st.ip[2]); s.print('.'); s.println(st.ip[3]);
+ s.print("SYNC_OK:"); s.println(st.lastSyncOk ? 1 :0);
+ s.print("OFFS:"); s.println(st.lastOffsetSec);
+}
+Что ещё важно на центральном модуле (VGT6)
+Чтобы NTP на Internet2 был действительно точным,передавайте миллисекунды:
+
+cpp Копировать
+uint16_t ms = (uint16_t)(millis() % 1000);
+internet2.setTimeUnixUtc(unixUtc,ms);
+И лучше отправлять чаще,чем раз в 2 секунды (например 200–500 мс),или по смене секунды DS3231.
+
+Если пришлёте ваш текущий W5500NtpServerClient.h,я сверю поля/методы и при необходимости подгоню 
+.cpp “в ноль” под вашу конкретную версию заголовка.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — полный W5500NtpServerClient.cpp,который на 100% совместим с вашим текущим W5500NtpServerClient.h (который вы прислали):
+
+реализованы все методы/символы,объявленные в .h,включая syncUpstreamOnce() (оставлен как совместимый wrapper:не блокирует и не используется; возвращает 0)
+NTP‑сервер отвечает точно (Transmit/Receive timestamps с дробной частью)
+Upstream NTP синхронизация реализована неблокирующе через FSM:startUpstreamSync()/pollUpstreamSync()/finishUpstreamSync()
+нет while ожиданий,нет долгих задержек
+DHCP/maintain только при LINK up
+Пины SPI:PA4/PA5/PA6/PA7 заданы здесь,как вы требовали.
+
+W5500NtpServerClient.cpp (полный)
+cpp Копировать
+#include "W5500NtpServerClient.h"
+
+#include <SPI.h>
+#include <IPAddress.h>
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+
+// ---- W5500 on SPI1 ----
+#define USE_THIS_SS_PIN PA4
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+
+static EthernetUDP udpSrv; // local NTP server socket (port 123)
+static EthernetUDP udpCli; // upstream NTP client socket
+
+static const uint16_t NTP_PORT = 123;
+static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800UL; // 1900->1970 seconds
+
+static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + NTP_UNIX_EPOCH_DELTA; }
+static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - NTP_UNIX_EPOCH_DELTA; }
+
+// -------------------- link/time helpers --------------------
+bool W5500NtpServerClient::linkUp() const {
+ const char* s = Ethernet.linkReport();
+ return (s && strcmp(s,"LINK") == 0);
+}
+
+uint32_t W5500NtpServerClient::msToNtpFrac(uint16_t ms) {
+ // frac = ms/1000 * 2^32
+ return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+}
+
+void W5500NtpServerClient::nowUtcSecFrac(uint32_t& unixSec,uint32_t& ntpFrac) const {
+ if (_baseUnix == 0) { unixSec = 0; ntpFrac = 0; return; }
+
+ uint32_t nowMs = millis();
+ uint32_t dMs = nowMs - _baseMillis; // wrap-safe
+ uint64_t totalMs = (uint64_t)_baseMs + (uint64_t)dMs;
+
+ unixSec = _baseUnix + (uint32_t)(totalMs / 1000ULL);
+ uint16_t remMs = (uint16_t)(totalMs % 1000ULL);
+ ntpFrac = msToNtpFrac(remMs);
+}
+
+uint32_t W5500NtpServerClient::nowUtcSeconds() const {
+ uint32_t s,f;
+ nowUtcSecFrac(s,f);
+ return s;
+}
+
+// -------------------- begin/config --------------------
+void W5500NtpServerClient::begin() {
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+ SPI_New.begin();
+
+ // Ethernet_Generic uses global pCUR_SPI
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ ethBegin();
+
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ _nextSyncMs = millis() + 1000;
+
+ // reset FSM
+ _syncState = SYNC_IDLE;
+ _syncDeadlineMs = 0;
+ _syncRetriesLeft = 0;
+ _st.syncInProgress = false;
+}
+
+void W5500NtpServerClient::ethBegin() {
+ uint8_t mac[6] = { 0xDE,0xAD,0xBE,0xEF,0x02,0x02 };
+
+ // Fast startup:if LINK down -> skip DHCP to avoid long delays
+ if (_cfg.dhcp && linkUp()) {
+ int ok = Ethernet.begin(mac,&SPI_New,3000,1000);
+ if (!ok) _cfg.dhcp = 0;
+ } else {
+ _cfg.dhcp = 0;
+ }
+
+ if (!_cfg.dhcp) {
+ Ethernet.begin(mac,
+ IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+ IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+ IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+ IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+ }
+}
+
+void W5500NtpServerClient::applyNetCfg(const NetCfg& cfg) {
+ _cfg = cfg;
+
+ // ensure Ethernet_Generic uses our SPI
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ ethBegin();
+
+ udpSrv.stop();
+ udpCli.stop();
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ // stop any in-progress upstream sync
+ _syncState = SYNC_IDLE;
+ _st.syncInProgress = false;
+}
+
+void W5500NtpServerClient::setMasterTimeUtc(uint32_t unixUtc,uint16_t ms) {
+ if (ms > 999) ms = 999;
+ _baseUnix = unixUtc;
+ _baseMillis = millis();
+ _baseMs = ms;
+ _st.haveMasterTime = (unixUtc != 0);
+}
+
+void W5500NtpServerClient::requestSyncNow() {
+ _syncReq = true;
+}
+
+// -------------------- main tick --------------------
+void W5500NtpServerClient::tick() {
+ _st.linkUp = linkUp();
+ _st.dhcp = (_cfg.dhcp != 0);
+
+ IPAddress ip = Ethernet.localIP();
+ _st.ip[0] = ip[0];
+ _st.ip[1] = ip[1];
+ _st.ip[2] = ip[2];
+ _st.ip[3] = ip[3];
+
+ // Local NTP server tick (non-blocking)
+ tickNtpServer();
+
+ // If link down:stop upstream attempt and exit (no maintain)
+ if (!_st.linkUp) {
+ if (_syncState != SYNC_IDLE) finishUpstreamSync(false,0);
+ return;
+ }
+
+ // DHCP maintain only when link up
+ if (_cfg.dhcp) Ethernet.maintain();
+
+ // Upstream non-blocking client
+ tickNtpClient();
+}
+
+// -------------------- NTP server (local clients) --------------------
+void W5500NtpServerClient::tickNtpServer() {
+ int packetSize = udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = udpSrv.read(req,48);
+ if (n < 48) return;
+
+ if (!_st.haveMasterTime) return;
+
+ uint32_t unixSec = 0,frac = 0;
+ nowUtcSecFrac(unixSec,frac);
+ if (unixSec == 0) return;
+
+ uint32_t txSec1900 = unixToNtp1900(unixSec);
+
+ uint8_t resp[48] = {0};
+
+ // LI=0,VN=4,Mode=4(Server)
+ resp[0] = (0 << 6) | (4 << 3) | 4;
+ resp[1] = 1; // stratum
+ resp[2] = 6; // poll
+ resp[3] = (uint8_t)-20; // precision (rough)
+
+ // Reference ID
+ resp[12] = 'L'; resp[13] = 'O'; resp[14] = 'C'; resp[15] = '2';
+
+ // Originate Timestamp = client's Transmit Timestamp (request[40..47])
+ memcpy(&resp[24],&req[40],8);
+
+ // Receive Timestamp (current)
+ resp[32] = (txSec1900 >> 24) & 0xFF;
+ resp[33] = (txSec1900 >> 16) & 0xFF;
+ resp[34] = (txSec1900 >> 8) & 0xFF;
+ resp[35] = (txSec1900) & 0xFF;
+ resp[36] = (frac >> 24) & 0xFF;
+ resp[37] = (frac >> 16) & 0xFF;
+ resp[38] = (frac >> 8) & 0xFF;
+ resp[39] = (frac) & 0xFF;
+
+ // Transmit Timestamp (current)
+ resp[40] = (txSec1900 >> 24) & 0xFF;
+ resp[41] = (txSec1900 >> 16) & 0xFF;
+ resp[42] = (txSec1900 >> 8) & 0xFF;
+ resp[43] = (txSec1900) & 0xFF;
+ resp[44] = (frac >> 24) & 0xFF;
+ resp[45] = (frac >> 16) & 0xFF;
+ resp[46] = (frac >> 8) & 0xFF;
+ resp[47] = (frac) & 0xFF;
+
+ udpSrv.beginPacket(udpSrv.remoteIP(),udpSrv.remotePort());
+ udpSrv.write(resp,48);
+ udpSrv.endPacket();
+}
+
+// -------------------- Upstream NTP client (non-blocking FSM) --------------------
+void W5500NtpServerClient::tickNtpClient() {
+ // If currently waiting for reply,poll it
+ if (_syncState != SYNC_IDLE) {
+ pollUpstreamSync();
+ return;
+ }
+
+ // start new attempt on schedule or immediate request
+ uint32_t now = millis();
+ if (_syncReq || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncReq = false;
+ _nextSyncMs = now + _cfg.periodMs;
+
+ if (!_st.haveMasterTime) return; // no base -> cannot compute meaningful offset
+
+ startUpstreamSync();
+ }
+}
+
+void W5500NtpServerClient::startUpstreamSync() {
+ _st.syncInProgress = true;
+ _st.lastSyncOk = false;
+ _st.lastSyncMs = millis();
+
+ _syncState = SYNC_WAIT;
+ _syncDeadlineMs = millis() + 1200;
+ _syncRetriesLeft = 1; // one retry
+
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ // LI=0,VN=4,Mode=3(Client)
+ pkt[0] = (0 << 6) | (4 << 3) | 3;
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+}
+
+void W5500NtpServerClient::pollUpstreamSync() {
+ // if link down mid-wait -> fail quickly
+ if (!linkUp()) {
+ finishUpstreamSync(false,0);
+ return;
+ }
+
+ // response?
+ int sz = udpCli.parsePacket();
+ if (sz >= 48) {
+ uint8_t resp[48];
+ int n = udpCli.read(resp,48);
+ if (n >= 48) {
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) |
+ ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) |
+ (uint32_t)resp[43];
+
+ if (sec1900 >= NTP_UNIX_EPOCH_DELTA) {
+ uint32_t ntpUtc = ntp1900ToUnix(sec1900);
+ finishUpstreamSync(true,ntpUtc);
+ return;
+ }
+ }
+ // invalid packet -> ignore,keep waiting until timeout
+ }
+
+ // timeout?
+ if ((int32_t)(millis() - _syncDeadlineMs) >= 0) {
+ if (_syncRetriesLeft > 0) {
+ _syncRetriesLeft--;
+
+ // resend
+ IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+ uint8_t pkt[48] = {0};
+ pkt[0] = (0 << 6) | (4 << 3) | 3;
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ udpCli.beginPacket(up,NTP_PORT);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+
+ _syncDeadlineMs = millis() + 1200;
+ return;
+ }
+
+ finishUpstreamSync(false,0);
+ return;
+ }
+}
+
+void W5500NtpServerClient::finishUpstreamSync(bool ok,uint32_t ntpUtc) {
+ _syncState = SYNC_IDLE;
+ _st.syncInProgress = false;
+ _st.lastSyncMs = millis();
+
+ if (!ok || ntpUtc == 0) {
+ _st.lastSyncOk = false;
+ return;
+ }
+
+ uint32_t curUtc = nowUtcSeconds();
+ _st.lastNtpUtc = ntpUtc;
+ _st.lastOffsetSec = (int32_t)ntpUtc - (int32_t)curUtc;
+ _st.lastSyncOk = true;
+}
+
+// -------------------- Compatibility:syncUpstreamOnce() --------------------
+// В вашем .h этот метод объявлен,но в неблокирующем варианте он не используется.
+// Оставляем как "неблокирующий stub",чтобы не было ошибок линковки.
+uint32_t W5500NtpServerClient::syncUpstreamOnce() {
+ // НЕ БЛОКИРУЕТ.
+ // Для ручного режима можно инициировать FSM:
+ if (_syncState == SYNC_IDLE && _st.haveMasterTime) startUpstreamSync();
+ return 0;
+}
+
+// -------------------- UART clients --------------------
+void W5500NtpServerClient::printNowTo(Stream& s) const {
+ uint32_t sec,frac;
+ nowUtcSecFrac(sec,frac);
+
+ uint16_t ms = 0;
+ if (_baseUnix != 0) ms = (uint16_t)(((uint64_t)frac * 1000ULL) >> 32);
+
+ auto st = status();
+ s.print("UNIX:"); s.println((unsigned long)sec);
+ s.print("MS:"); s.println((unsigned)ms);
+ s.print("IP:"); s.print(st.ip[0]); s.print('.'); s.print(st.ip[1]); s.print('.'); s.print(st.ip[2]); s.print('.'); s.println(st.ip[3]);
+ s.print("SYNC_OK:"); s.println(st.lastSyncOk ? 1 :0);
+ s.print("OFFS:"); s.println(st.lastOffsetSec);
+}
+Важно на центральном модуле
+Чтобы точность действительно была <1 секунды,передавайте миллисекунды:
+
+cpp Копировать
+uint16_t ms = (uint16_t)(millis() % 1000);
+internet2.setTimeUnixUtc(unixUtc,ms);
+И лучше отправлять чаще (например раз в 200–500 мс) или “по смене секунды RTC”.
+
+Если захотите — сделаю “более правильно”:отправлять в Internet2 время строго на границе секунды
+ (с подстройкой по millis()),чтобы фаза мс была стабильнее.
+ 
+ //---------------------------------------------+++++++++++++++++++++++++++++++++++++++++++
+ 
+ Текущее “раз в 2 секунды отправить unixUtc” даёт ошибку до секунд потому что:
+
+DS3231 у вас в RTCSupport::getTime() кэшируется ~1 раз в секунду (>999 ms) — вы физически не видите момент смены секунды точнее;
+вы часто отправляете только секунды,без корректной подсекундной фазы.
+Чтобы сделать “более правильно” и получить точный NTP с дробью,нужно:
+
+синхронизировать Internet2 по границе секунды (желательно)
+передавать ms корректно
+(критично) убрать/уменьшить кэширование в rtc.getTime() или использовать вывод SQW 1Hz DS3231 на вход МК (лучший вариант).
+Ниже даю 2 варианта.
+
+Вариант A (лучший):использовать SQW 1Hz DS3231
+Если вы можете подключить SQW DS3231 к входу STM32 (любой EXTI),то получаете точный “тик” секунды аппаратно.
+
+Алгоритм:
+
+по фронту SQW фиксируете edgeMillis = millis()
+сразу читаете rtc.getTime() (или читаете чуть позже,но знаете,что это граница секунды)
+отправляете в Internet2:
+unixUtc по этому времени
+ms = 0 (мы на границе секунды)
+Это даёт ошибку обычно <1–2 мс (зависит от задержек I2C/ISR).
+
+Если SQW подключить нельзя — вариант B.
+
+Вариант B (без SQW):программная привязка к секунде (но нужно убрать кэш 999ms)
+1) Обязательное условие
+В RTCSupport.cpp у вас сейчас:
+
+cpp Копировать
+if(!lastRequestTime || ((millis() - lastRequestTime) > 999))
+Это делает точность детекта секунды “примерно 1 секунда”. Поменяйте 999 на,например,50 (или 20):
+
+cpp Копировать
+if(!lastRequestTime || ((millis() - lastRequestTime) > 50))
+После этого вы сможете ловить смену секунды почти сразу (ошибка ~= период опроса + время I2C).
+
+2) “Правильная” отправка в Internet2:по смене секунды
+Добавьте в центральный .ino такую функцию (не блокирует):
+
+cpp Копировать
+static void tickInternet2TimePushEdge()
+{
+ static uint8_t lastSec = 255;
+ static uint32_t lastEdgeMs = 0;
+ static uint32_t unixUtcAtEdge = 0;
+
+ RTCTime t = rtc.getTime(); // локальное время
+ if (t.second != lastSec) {
+ lastSec = t.second;
+
+ // считаем UTC unix по локальному времени и cfg.tzTargetHours
+ unixUtcAtEdge = unixUtcFromRtcLocal(t,cfg.tzTargetHours);
+
+ // отметка момента обнаружения границы секунды
+ lastEdgeMs = millis();
+
+ // отправляем "ровно начало секунды"
+ internet2.setTimeUnixUtc(unixUtcAtEdge,0);
+ return;
+ }
+
+ // (опционально) подстраховка:если долго не было отправки,можно обновить ms-фазу
+ // например раз в 5 секунд:
+ static uint32_t tGuard = 0;
+ if (millis() - tGuard > 5000) {
+ tGuard = millis();
+ if (unixUtcAtEdge != 0) {
+ uint32_t d = millis() - lastEdgeMs;
+ uint32_t unixUtcNow = unixUtcAtEdge + d / 1000UL;
+ uint16_t msNow = (uint16_t)(d % 1000UL);
+ internet2.setTimeUnixUtc(unixUtcNow,msNow);
+ }
+ }
+}
+И в loop() вызывайте часто:
+
+cpp Копировать
+tickInternet2TimePushEdge();
+Почему это “более правильно”
+основная синхронизация идёт в начале каждой секунды (ms=0)
+Internet2 получает стабильную “фазу” секунды и может формировать дробь NTP очень точно
+guard‑обновление позволяет не “уплыть”,если вдруг вы пропустили несколько секундных тиков.
+Важно:на Internet2 вы уже сделали правильную часть
+Мы ранее обновили W5500NtpServerClient.cpp,где NTP‑ответ заполняет Transmit/Receive Timestamp с frac на
+ основе unixUtc + ms. Чтобы это работало,на центральном модуле надо реально передавать ms,а не 0/редко.
+
+Итоговая рекомендация
+Если нужна реально “хорошая” точность — подключайте SQW (вариант A).
+Если без SQW — обязательно уменьшайте кэш в rtc.getTime() и используйте отправку по смене секунды (вариант B).
+Если скажете,можете ли вы физически подключить SQW DS3231 к STM32F103VGT6 (и какой пин свободен),я дам точный пример 
+с attachInterrupt() и без дергания I2C в ISR (правильно:ISR ставит флаг,а
+ чтение RTC и I2C отправка делаются в loop()).
+
+

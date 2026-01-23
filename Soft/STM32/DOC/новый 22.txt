@@ -1,0 +1,847 @@
+У вас тут два “убийцы IP” на STM32F103CBT6 + W5500:
+
+Неправильный вызов DHCP Вы вызываете DHCP так:
+cpp Копировать
+Ethernet.begin(mac,&SPI_New,3000,1000);
+Для Ethernet_Generic (и большинства сборок Ethernet для W5x00) DHCP‑вариант не принимает SPIClass*,
+SPI выбирается через pCUR_SPI. Такой вызов часто приводит к неверному overload/порче параметров → в 
+итоге Ethernet.localIP() = 0.0.0.0 или “мусор”.
+
+linkUp() почти всегда FALSE Вы делаете:
+cpp Копировать
+return (s && strcmp(s,"LINK") == 0);
+Но linkReport() в разных версиях возвращает не только "LINK" (может быть "LinkON","ON","UP" и т.д.).
+Тогда вы никогда не заходите в DHCP,а ниже ещё и принудительно делаете _cfg.dhcp = 0.
+
+И третье (часто критично):порядок настройки SPI/pCUR_SPI. Лучше выставлять pCUR_SPI до Ethernet.init()/Ethernet.begin().
+
+Минимальный рабочий патч (ваш файл W5500NtpServerClient.cpp)
+1) Исправьте linkUp()
+Замените на более терпимый вариант:
+
+cpp Копировать
+bool W5500NtpServerClient::linkUp() const {
+ // Если библиотека поддерживает linkStatus() — используйте её
+ #ifdef ETHERNET_HAS_LINK_STATUS
+ return Ethernet.linkStatus() == LinkON;
+ #else
+ const char* s = Ethernet.linkReport();
+ if (!s) return false;
+ // принимаем разные варианты строк
+ return (strstr(s,"LINK") != nullptr) || (strstr(s,"ON") != nullptr) || (strstr(s,"UP") != nullptr);
+ #endif
+}
+2) В begin() переставьте порядок SPI и pCUR_SPI
+Сейчас у вас Ethernet.init() вызывается до того,как выбран SPI. Сделайте так:
+
+cpp Копировать
+void W5500NtpServerClient::begin()
+{
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ // ВАЖНО:сначала SPI,затем указатель,затем init
+ SPI_New.begin();
+
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ Ethernet.init(USE_THIS_SS_PIN);
+
+ ethBegin();
+
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ _nextSyncMs = millis() + 1000;
+
+ _syncState = SYNC_IDLE;
+ _syncDeadlineMs = 0;
+ _syncRetriesLeft = 0;
+ _st.syncInProgress = false;
+}
+3) В ethBegin() исправьте DHCP-вызов и НЕ отключайте DHCP навсегда
+Замените DHCP‑вызов и логику:
+
+cpp Копировать
+void W5500NtpServerClient::ethBegin()
+{
+ uint8_t mac[6] = { 0xDE,0xAD,0xBE,0xEF,0x02,0x02 };
+
+ bool wantDhcp = (_cfg.dhcp != 0);
+
+ if (wantDhcp && linkUp())
+ {
+ // ВАЖНО:без &SPI_New
+ int ok = Ethernet.begin(mac,3000,1000);
+
+ if (!ok)
+ {
+ Serial.println(F("[ETH] DHCP failed -> fallback to static"));
+ // fallback to static,но _cfg.dhcp можно оставить как “wantDhcp”,
+ // если хотите потом повторить попытку
+ Ethernet.begin(mac,
+ IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+ IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+ IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+ IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+ }
+ }
+ else
+ {
+ // Линка нет (или DHCP выключен) -> static
+ Ethernet.begin(mac,
+ IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+ IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+ IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+ IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+ }
+
+ // Диагностика (оставьте на время)
+ Serial.print("linkReport="); Serial.println(Ethernet.linkReport());
+ Serial.print("localIP="); Serial.println(Ethernet.localIP());
+ Serial.print("gw="); Serial.println(Ethernet.gatewayIP());
+ Serial.print("mask="); Serial.println(Ethernet.subnetMask());
+ Serial.print("dns="); Serial.println(Ethernet.dnsServerIP());
+}
+Если после этого всё равно 0.0.0.0
+Тогда это уже похоже не на DHCP,а на SPI/проводку/CS (W5500 не отвечает). Проверьте:
+
+W5500 питается 3.3В,общая земля.
+PA4 действительно идёт на CS W5500.
+SCK/MISO/MOSI соответствуют SPI1:PA5/PA6/PA7.
+Нет конфликтов на PA4 (например,этот пин где-то ещё дёргается).
+И дайте,пожалуйста,вывод этих строк в Serial:
+
+linkReport=...
+localIP=...
+gw=...
+mask=...
+dns=...
+По ним сразу будет ясно:
+
+W5500 не виден по SPI,
+или линк не определяется из-за linkReport,
+или DHCP не стартует/не проходит.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++
+
+linkReport=NO LINK
+...
+=== INTERNET2 CONNECTED === (хотя линка нет)
+Это означает,что функция linkUp() у вас ошибочно возвращает TRUE при строке "NO LINK" 
+(потому что "NO LINK" содержит подстроку "LINK"). Из‑за этого вы пытаетесь запускать DHCP при 
+реально отключённом линке,получаете “мусорные” значения IP/Mask/GW/DNS.
+
+Плюс,даже при fallback на static,при “битом” состоянии стека/чипа значения могут оставаться некорректными.
+
+Ниже — конкретные правки.
+
+1) Исправьте linkUp() (чтобы "NO LINK" было FALSE)
+Замените linkUp() в W5500NtpServerClient.cpp на:
+
+cpp Копировать
+bool W5500NtpServerClient::linkUp() const
+{
+#ifdef ETHERNET_HAS_LINK_STATUS
+ return Ethernet.linkStatus() == LinkON;
+#else
+ const char* s = Ethernet.linkReport();
+ if (!s) return false;
+
+ // Явно отсекаем "NO LINK"
+ if (strstr(s,"NO LINK") != nullptr) return false;
+
+ // Частые варианты в разных версиях библиотек
+ if (strcmp(s,"LINK") == 0) return true;
+ if (strstr(s,"LinkON") != nullptr) return true;
+ if (strstr(s,"LINKON") != nullptr) return true;
+ if (strstr(s,"UP") != nullptr) return true;
+ if (strcmp(s,"ON") == 0) return true;
+
+ return false;
+#endif
+}
+Важно: больше не используйте просто strstr(s,"LINK"),иначе "NO LINK" опять будет считаться “линк есть”.
+
+2) Порядок инициализации SPI / pCUR_SPI / Ethernet.init()
+В begin() сделайте порядок строго такой:
+
+cpp Копировать
+void W5500NtpServerClient::begin()
+{
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ SPI_New.begin();
+
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ Ethernet.init(USE_THIS_SS_PIN);
+
+ ethBegin();
+
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ _nextSyncMs = millis() + 1000;
+ _syncState = SYNC_IDLE;
+ _st.syncInProgress = false;
+}
+3) DHCP-вызов:НЕ передавать &SPI_New
+В ethBegin() у вас всё ещё стоит:
+
+cpp Копировать
+Ethernet.begin(mac,&SPI_New,3000,1000);
+Это нужно заменить на:
+
+cpp Копировать
+Ethernet.begin(mac,3000,1000);
+(и аналогично,если где-то ещё осталось)
+
+4) Почему сейчас IP “33.4.0.34” даже при static
+Пока linkReport=NO LINK,у вас,скорее всего,фактически нет физического линка 
+(кабель/разъём/трансформатор/порт/питание W5500). При отсутствии корректной связи с 
+чипом/PHY библиотека часто возвращает мусор из регистров → такие “перемешанные” IP/Mask/GW.
+
+После правки linkUp() вы хотя бы перестанете считать "NO LINK" подключением и перестанете запускать DHCP “в пустоту”.
+
+5) Быстрая проверка железа (обязательная)
+Сейчас в логе реально “NO LINK”. Это не софт,это физика. Проверьте:
+
+Кабель подключён к роутеру/свитчу,порт активен (индикаторы на порту/модуле).
+На модуле W5500 есть магнитика (RJ45 с трансформатором).
+Питание W5500 стабильное 3.3В,общая GND.
+CS точно на PA4,и PA4 нигде больше не используется/не конфликтует.
+SPI1:PA5/PA6/PA7 действительно разведены на SCK/MISO/MOSI.
+Если после этих правок linkReport станет чем-то вроде LINK/LinkON,но IP 
+всё равно не 192.168.75.xxx — пришлите новый лог (эти строки):
+
+linkReport=...
+localIP=...
+gw=...
+mask=...
+dns=...
+и я скажу,это DHCP/настройки или всё ещё проблема с доступом к W5500 по SPI.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+По логу видно две разные вещи:
+
+На старте линк есть (linkReport=LINK) и IP/Mask/GW/DNS читаются правильно.
+Потом линк реально пропадает (linkReport=NO LINK) и сразу после этого чтение Ethernet.localIP()/gatewayIP()
+/subnetMask()/dnsServerIP() начинает возвращать мусор (33.4.0.34 ...).
+Дополнительно:у вас снова печатается === CONNECTED === даже когда linkReport=NO LINK. Значит ваша linkUp() 
+считает “NO LINK” как “линк есть” (типичная ошибка,если проверять подстроку "LINK").
+
+Нужно сделать 3 правки:(A) корректно определять линк,(B) не читать IP из W5500 при отсутствии линка,(C)
+ переинициализировать Ethernet при возврате линка.
+
+A) Исправьте linkUp() так,чтобы "NO LINK" было FALSE
+Сделайте строго так (в W5500NtpServerClient.cpp):
+
+cpp Копировать
+bool W5500NtpServerClient::linkUp() const
+{
+ const char* s = Ethernet.linkReport();
+ if (!s) return false;
+
+ // Критично:"NO LINK" содержит подстроку "LINK"
+ if (strstr(s,"NO LINK") != nullptr) return false;
+
+ // Нормальный линк (варианты строк зависят от версии либы)
+ if (strcmp(s,"LINK") == 0) return true;
+ if (strstr(s,"LinkON") != nullptr) return true;
+ if (strstr(s,"LINKON") != nullptr) return true;
+ if (strcmp(s,"ON") == 0) return true;
+
+ return false;
+}
+Если у вас сейчас стоит что-то вроде strstr(s,"LINK") — это и есть причина “CONNECTED при NO LINK”.
+
+B) Не обновляйте IP,если линка нет (иначе получаете мусор)
+В tick() замените блок,где вы каждый раз делаете:
+
+cpp Копировать
+IPAddress ip = Ethernet.localIP();
+_st.ip[0]=ip[0]...
+на безопасный вариант:
+
+cpp Копировать
+void W5500NtpServerClient::tick()
+{
+ bool lu = linkUp();
+ _st.linkUp = lu;
+ _st.dhcp = (_cfg.dhcp != 0);
+
+ if (!lu)
+ {
+ // При NO LINK не читаем регистры IP (часто мусор при “полу-живом” PHY/SPI)
+ _st.ip[0]=0; _st.ip[1]=0; _st.ip[2]=0; _st.ip[3]=0;
+
+ // сброс печати
+ s_printedAfterConnect = false;
+
+ // стопаем sync ожидания
+ if (_syncState != SYNC_IDLE) finishUpstreamSync(false,0);
+ return;
+ }
+
+ // линк есть -> можно читать IP
+ IPAddress ip = Ethernet.localIP();
+ _st.ip[0]=ip[0]; _st.ip[1]=ip[1]; _st.ip[2]=ip[2]; _st.ip[3]=ip[3];
+
+ // дальше по вашему коду...
+ if (_cfg.dhcp) Ethernet.maintain();
+ tickNtpServer();
+ tickNtpClient();
+}
+Так вы гарантированно не увидите “33.4.0.34” при NO LINK.
+
+C) Переинициализируйте Ethernet при возврате линка (link down → up)
+Добавьте вверху файла статик:
+
+cpp Копировать
+static bool s_prevLinkUp = false;
+И в начале tick() после lu = linkUp();:
+
+cpp Копировать
+if (!s_prevLinkUp && lu) {
+ // линк только что появился -> заново поднять DHCP/static
+ ethBegin();
+
+ udpSrv.stop(); udpCli.stop();
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+}
+s_prevLinkUp = lu;
+Это важно,если линк “мигает”:DHCP/ARP/сокеты могут требовать переоткрытия.
+
+Очень вероятная аппаратная причина (почему линк падает)
+Раз линк сначала LINK,а потом NO LINK,то это чаще всего физика:
+
+плохой RJ45/кабель/порт свитча,
+питание W5500 проседает (особенно если питание от 3.3В слабое),
+“шум”/плохая земля,
+модуль W5500 перегружается (reset/ brownout).
+Проверьте,горят ли LED на RJ45 в момент,когда в логе NO LINK.
+
+Важно:убедитесь,что DHCP вызывается без &SPI_New
+В вашем коде всё ещё было:
+
+cpp Копировать
+Ethernet.begin(mac,&SPI_New,3000,1000);
+Это нужно убрать везде. Должно быть:
+
+cpp Копировать
+Ethernet.begin(mac,3000,1000);
+(а SPI выбирается только через pCUR_SPI = &SPI_New;)
+
+Если вы пришлёте ваш текущий linkUp() (после правок) и файл I2CInternet2Proto 
+(как вы принимаете конфиг по I2C),я проверю ещё одну частую причину “потом всё ломается”:
+переполнение буфера при приёме I2C,которое может портить память и давать странные IP/Mask. Но по вашему 
+логу первично именно NO LINK + неправильная проверка линка.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — полный исправленный W5500NtpServerClient.cpp (целиком),с учётом ваших симптомов:
+
+linkUp() НЕ считает "NO LINK" как линк.
+При NO LINK не читаем Ethernet.localIP() (иначе мусор).
+При переходе LINK↓/LINK↑ выполняется re-init сети (ethBegin() + перезапуск UDP сокетов).
+DHCP вызывается без &SPI_New.
+pCUR_SPI и SPI_New.begin() выставляются до Ethernet.init().
+Скопируйте файл полностью и замените ваш.
+
+Важно:в начале файла есть static SPIClass* pCUR_SPI extern — он есть в Ethernet_Generic. 
+Если сборка ругнётся,напишите точный текст ошибки (но обычно это есть).
+
+cpp Копировать
+#include "W5500NtpServerClient.h"
+
+#include <SPI.h>
+#include <IPAddress.h>
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+#include <string.h>
+
+// ---- W5500 on SPI1 ----
+#define USE_THIS_SS_PIN PA4
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+
+static EthernetUDP udpSrv; // local NTP server socket (port 123)
+static EthernetUDP udpCli; // upstream NTP client socket
+
+static const uint16_t NTP_PORT = 123;
+static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800UL; // 1900->1970 seconds
+
+static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + NTP_UNIX_EPOCH_DELTA; }
+static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - NTP_UNIX_EPOCH_DELTA; }
+
+// ---- state for edge detection / one-shot prints ----
+static bool s_prevLinkUp = false;
+static bool s_printedAfterConnect = false;
+
+// -------------------- link/time helpers --------------------
+bool W5500NtpServerClient::linkUp() const
+{
+	// Лучше всего использовать linkStatus(),но в разных сборках может отсутствовать.
+	// Поэтому делаем безопасную проверку по linkReport().
+	const char* s = Ethernet.linkReport();
+	if (!s) return false;
+
+	// КРИТИЧНО:"NO LINK" содержит подстроку "LINK"
+	if (strstr(s,"NO LINK") != nullptr) return false;
+
+	// Варианты строк зависят от версии библиотеки
+	if (strcmp(s,"LINK") == 0) return true;
+	if (strstr(s,"LinkON") != nullptr) return true;
+	if (strstr(s,"LINKON") != nullptr) return true;
+	if (strcmp(s,"ON") == 0) return true;
+	if (strcmp(s,"UP") == 0) return true;
+
+	return false;
+}
+
+uint32_t W5500NtpServerClient::msToNtpFrac(uint16_t ms)
+{
+	// frac = ms/1000 * 2^32
+	return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+}
+
+void W5500NtpServerClient::nowUtcSecFrac(uint32_t& unixSec,uint32_t& ntpFrac) const
+{
+	if (_baseUnix == 0) { unixSec = 0; ntpFrac = 0; return; }
+
+	uint32_t nowMs = millis();
+	uint32_t dMs = nowMs - _baseMillis; // wrap-safe
+	uint64_t totalMs = (uint64_t)_baseMs + (uint64_t)dMs;
+
+	unixSec = _baseUnix + (uint32_t)(totalMs / 1000ULL);
+	uint16_t remMs = (uint16_t)(totalMs % 1000ULL);
+	ntpFrac = msToNtpFrac(remMs);
+}
+
+uint32_t W5500NtpServerClient::nowUtcSeconds() const
+{
+	uint32_t s,f;
+	nowUtcSecFrac(s,f);
+	return s;
+}
+
+// -------------------- begin/config --------------------
+void W5500NtpServerClient::begin()
+{
+	pinMode(USE_THIS_SS_PIN,OUTPUT);
+	digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+	// ВАЖНО:сначала запускаем SPI и указываем его библиотеке,потом Ethernet.init()
+	SPI_New.begin();
+
+	extern SPIClass* pCUR_SPI; // Ethernet_Generic global
+	pCUR_SPI = &SPI_New;
+
+	Ethernet.init(USE_THIS_SS_PIN);
+
+	ethBegin();
+
+	udpSrv.begin(NTP_PORT);
+	udpCli.begin(0);
+
+	_nextSyncMs = millis() + 1000;
+
+	// reset FSM
+	_syncState = SYNC_IDLE;
+	_syncDeadlineMs = 0;
+	_syncRetriesLeft = 0;
+	_st.syncInProgress = false;
+
+	s_prevLinkUp = linkUp();
+	s_printedAfterConnect = false;
+}
+
+void W5500NtpServerClient::ethBegin()
+{
+	// MAC (можно сделать уникальной,но для теста пойдёт)
+	uint8_t mac[6] = { 0xDE,0xAD,0xBE,0xEF,0x02,0x02 };
+
+	// На всякий случай ещё раз гарантируем SPI для Ethernet_Generic
+	extern SPIClass* pCUR_SPI;
+	pCUR_SPI = &SPI_New;
+
+	const bool lu = linkUp();
+	const bool wantDhcp = (_cfg.dhcp != 0);
+
+	if (wantDhcp && lu)
+	{
+		// ВАЖНО:DHCP begin() без &SPI_New
+		int ok = Ethernet.begin(mac,3000,1000);
+
+		if (!ok)
+		{
+			Serial.println(F("[ETH] DHCP failed -> fallback to static"));
+			Ethernet.begin(mac,
+				IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+				IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+				IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+				IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+		}
+	}
+	else
+	{
+		// Если линка нет — DHCP не запускаем (иначе задержки/мусор).
+		// Поднимем статический,а при появлении линка tick() сделает re-init.
+		Ethernet.begin(mac,
+			IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+			IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+			IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+			IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+	}
+
+	// Диагностика (можно потом убрать)
+	Serial.print(F("linkReport=")); Serial.println(Ethernet.linkReport());
+	if (linkUp())
+	{
+		Serial.print(F("localIP=")); Serial.println(Ethernet.localIP());
+		Serial.print(F("gw=")); Serial.println(Ethernet.gatewayIP());
+		Serial.print(F("mask=")); Serial.println(Ethernet.subnetMask());
+		Serial.print(F("dns=")); Serial.println(Ethernet.dnsServerIP());
+	}
+	else
+	{
+		Serial.println(F("localIP=0.0.0.0 (link down)"));
+	}
+}
+
+void W5500NtpServerClient::applyNetCfg(const NetCfg& cfg)
+{
+	_cfg = cfg;
+
+	// ensure Ethernet_Generic uses our SPI
+	extern SPIClass* pCUR_SPI;
+	pCUR_SPI = &SPI_New;
+
+	ethBegin();
+
+	udpSrv.stop();
+	udpCli.stop();
+	udpSrv.begin(NTP_PORT);
+	udpCli.begin(0);
+
+	// stop any in-progress upstream sync
+	_syncState = SYNC_IDLE;
+	_st.syncInProgress = false;
+
+	s_printedAfterConnect = false;
+}
+
+void W5500NtpServerClient::setMasterTimeUtc(uint32_t unixUtc,uint16_t ms)
+{
+	if (ms > 999) ms = 999;
+	_baseUnix = unixUtc;
+	_baseMillis = millis();
+	_baseMs = ms;
+	_st.haveMasterTime = (unixUtc != 0);
+}
+
+void W5500NtpServerClient::requestSyncNow()
+{
+	_syncReq = true;
+}
+
+// -------------------- main tick --------------------
+void W5500NtpServerClient::tick()
+{
+	const bool lu = linkUp();
+	_st.linkUp = lu;
+	_st.dhcp = (_cfg.dhcp != 0);
+
+	// LINK edge detect:если линк только что появился -> переинициализируем Ethernet+UDP
+	if (!s_prevLinkUp && lu)
+	{
+		Serial.println(F("[ETH] Link UP -> re-init"));
+		ethBegin();
+
+		udpSrv.stop();
+		udpCli.stop();
+		udpSrv.begin(NTP_PORT);
+		udpCli.begin(0);
+
+		s_printedAfterConnect = false;
+	}
+	s_prevLinkUp = lu;
+
+	// Если линк упал — НЕ читаем localIP (часто мусор),а в статус кладём 0.0.0.0
+	if (!lu)
+	{
+		_st.ip[0] = 0; _st.ip[1] = 0; _st.ip[2] = 0; _st.ip[3] = 0;
+		s_printedAfterConnect = false;
+
+		// Stop upstream FSM quickly
+		if (_syncState != SYNC_IDLE) finishUpstreamSync(false,0);
+		return;
+	}
+
+	// линк есть -> читаем IP
+	IPAddress ip = Ethernet.localIP();
+	_st.ip[0] = ip[0];
+	_st.ip[1] = ip[1];
+	_st.ip[2] = ip[2];
+	_st.ip[3] = ip[3];
+
+	// One-shot print when link becomes UP and IP is assigned
+	const bool ipValid = (ip[0] != 0 && ip[0] != 255);
+	if (lu && ipValid && !s_printedAfterConnect)
+	{
+		s_printedAfterConnect = true;
+
+		IPAddress mask = Ethernet.subnetMask();
+		IPAddress gw = Ethernet.gatewayIP();
+		IPAddress dns = Ethernet.dnsServerIP();
+
+		Serial.println(F("=== INTERNET2 CONNECTED (W5500) ==="));
+		Serial.print(F("DHCP=")); Serial.println(_cfg.dhcp ? 1 :0);
+
+		Serial.print(F("IP="));
+		Serial.print(ip[0]); Serial.print('.'); Serial.print(ip[1]); Serial.print('.');
+		Serial.print(ip[2]); Serial.print('.'); Serial.println(ip[3]);
+
+		Serial.print(F("MASK="));
+		Serial.print(mask[0]); Serial.print('.'); Serial.print(mask[1]); Serial.print('.');
+		Serial.print(mask[2]); Serial.print('.'); Serial.println(mask[3]);
+
+		Serial.print(F("GW="));
+		Serial.print(gw[0]); Serial.print('.'); Serial.print(gw[1]); Serial.print('.');
+		Serial.print(gw[2]); Serial.print('.'); Serial.println(gw[3]);
+
+		Serial.print(F("DNS="));
+		Serial.print(dns[0]); Serial.print('.'); Serial.print(dns[1]); Serial.print('.');
+		Serial.print(dns[2]); Serial.print('.'); Serial.println(dns[3]);
+
+		Serial.print(F("UPSTREAM_NTP="));
+		Serial.print(_cfg.upstream[0]); Serial.print('.'); Serial.print(_cfg.upstream[1]); Serial.print('.');
+		Serial.print(_cfg.upstream[2]); Serial.print('.'); Serial.println(_cfg.upstream[3]);
+
+		Serial.print(F("SYNC_PERIOD_MS=")); Serial.println((unsigned long)_cfg.periodMs);
+		Serial.println(F("================================"));
+	}
+
+	// Local NTP server tick (non-blocking)
+	tickNtpServer();
+
+	// DHCP maintain only when link up
+	if (_cfg.dhcp) Ethernet.maintain();
+
+	// Upstream non-blocking client
+	tickNtpClient();
+}
+
+// -------------------- NTP server (local clients) --------------------
+void W5500NtpServerClient::tickNtpServer()
+{
+	int packetSize = udpSrv.parsePacket();
+	if (packetSize <= 0) return;
+
+	uint8_t req[48];
+	int n = udpSrv.read(req,48);
+	if (n < 48) return;
+
+	if (!_st.haveMasterTime) return;
+
+	uint32_t unixSec = 0,frac = 0;
+	nowUtcSecFrac(unixSec,frac);
+	if (unixSec == 0) return;
+
+	uint32_t txSec1900 = unixToNtp1900(unixSec);
+
+	uint8_t resp[48] = { 0 };
+
+	// LI=0,VN=4,Mode=4(Server)
+	resp[0] = (0 << 6) | (4 << 3) | 4;
+	resp[1] = 1; // stratum
+	resp[2] = 6; // poll
+	resp[3] = (uint8_t)-20; // precision (rough)
+
+	// Reference ID
+	resp[12] = 'L'; resp[13] = 'O'; resp[14] = 'C'; resp[15] = '2';
+
+	// Originate Timestamp = client's Transmit Timestamp (request[40..47])
+	memcpy(&resp[24],&req[40],8);
+
+	// Receive Timestamp (current)
+	resp[32] = (txSec1900 >> 24) & 0xFF;
+	resp[33] = (txSec1900 >> 16) & 0xFF;
+	resp[34] = (txSec1900 >> 8) & 0xFF;
+	resp[35] = (txSec1900) & 0xFF;
+	resp[36] = (frac >> 24) & 0xFF;
+	resp[37] = (frac >> 16) & 0xFF;
+	resp[38] = (frac >> 8) & 0xFF;
+	resp[39] = (frac) & 0xFF;
+
+	// Transmit Timestamp (current)
+	resp[40] = (txSec1900 >> 24) & 0xFF;
+	resp[41] = (txSec1900 >> 16) & 0xFF;
+	resp[42] = (txSec1900 >> 8) & 0xFF;
+	resp[43] = (txSec1900) & 0xFF;
+	resp[44] = (frac >> 24) & 0xFF;
+	resp[45] = (frac >> 16) & 0xFF;
+	resp[46] = (frac >> 8) & 0xFF;
+	resp[47] = (frac) & 0xFF;
+
+	udpSrv.beginPacket(udpSrv.remoteIP(),udpSrv.remotePort());
+	udpSrv.write(resp,48);
+	udpSrv.endPacket();
+}
+
+// -------------------- Upstream NTP client (non-blocking FSM) --------------------
+void W5500NtpServerClient::tickNtpClient()
+{
+	// If currently waiting for reply,poll it
+	if (_syncState != SYNC_IDLE) {
+		pollUpstreamSync();
+		return;
+	}
+
+	// start new attempt on schedule or immediate request
+	uint32_t now = millis();
+	if (_syncReq || (int32_t)(now - _nextSyncMs) >= 0) {
+		_syncReq = false;
+		_nextSyncMs = now + _cfg.periodMs;
+
+		if (!_st.haveMasterTime) return; // no base -> cannot compute meaningful offset
+
+		startUpstreamSync();
+	}
+}
+
+void W5500NtpServerClient::startUpstreamSync()
+{
+	_st.syncInProgress = true;
+	_st.lastSyncOk = false;
+	_st.lastSyncMs = millis();
+
+	_syncState = SYNC_WAIT;
+	_syncDeadlineMs = millis() + 1200;
+	_syncRetriesLeft = 1; // one retry
+
+	IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+	uint8_t pkt[48] = { 0 };
+	// LI=0,VN=4,Mode=3(Client)
+	pkt[0] = (0 << 6) | (4 << 3) | 3;
+	pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+	udpCli.beginPacket(up,NTP_PORT);
+	udpCli.write(pkt,48);
+	udpCli.endPacket();
+}
+
+void W5500NtpServerClient::pollUpstreamSync()
+{
+	// if link down mid-wait -> fail quickly
+	if (!linkUp()) {
+		finishUpstreamSync(false,0);
+		return;
+	}
+
+	// response?
+	int sz = udpCli.parsePacket();
+	if (sz >= 48) {
+		uint8_t resp[48];
+		int n = udpCli.read(resp,48);
+		if (n >= 48) {
+			uint32_t sec1900 =
+				((uint32_t)resp[40] << 24) |
+				((uint32_t)resp[41] << 16) |
+				((uint32_t)resp[42] << 8) |
+				(uint32_t)resp[43];
+
+			if (sec1900 >= NTP_UNIX_EPOCH_DELTA) {
+				uint32_t ntpUtc = ntp1900ToUnix(sec1900);
+				finishUpstreamSync(true,ntpUtc);
+				return;
+			}
+		}
+		// invalid packet -> ignore,keep waiting until timeout
+	}
+
+	// timeout?
+	if ((int32_t)(millis() - _syncDeadlineMs) >= 0) {
+		if (_syncRetriesLeft > 0) {
+			_syncRetriesLeft--;
+
+			// resend
+			IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+			uint8_t pkt[48] = { 0 };
+			pkt[0] = (0 << 6) | (4 << 3) | 3;
+			pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+			udpCli.beginPacket(up,NTP_PORT);
+			udpCli.write(pkt,48);
+			udpCli.endPacket();
+
+			_syncDeadlineMs = millis() + 1200;
+			return;
+		}
+
+		finishUpstreamSync(false,0);
+		return;
+	}
+}
+
+void W5500NtpServerClient::finishUpstreamSync(bool ok,uint32_t ntpUtc)
+{
+	_syncState = SYNC_IDLE;
+	_st.syncInProgress = false;
+	_st.lastSyncMs = millis();
+
+	if (!ok || ntpUtc == 0) {
+		_st.lastSyncOk = false;
+		return;
+	}
+
+	uint32_t curUtc = nowUtcSeconds();
+	_st.lastNtpUtc = ntpUtc;
+	_st.lastOffsetSec = (int32_t)ntpUtc - (int32_t)curUtc;
+	_st.lastSyncOk = true;
+}
+
+// -------------------- Compatibility:syncUpstreamOnce() --------------------
+uint32_t W5500NtpServerClient::syncUpstreamOnce()
+{
+	// НЕ БЛОКИРУЕТ.
+	if (_syncState == SYNC_IDLE && _st.haveMasterTime) startUpstreamSync();
+	return 0;
+}
+
+// -------------------- UART clients --------------------
+void W5500NtpServerClient::printNowTo(Stream& s) const
+{
+	uint32_t sec,frac;
+	nowUtcSecFrac(sec,frac);
+
+	uint16_t ms = 0;
+	if (_baseUnix != 0) ms = (uint16_t)(((uint64_t)frac * 1000ULL) >> 32);
+
+	auto st = status();
+	s.print("UNIX:"); s.println((unsigned long)sec);
+	s.print("MS:"); s.println((unsigned)ms);
+	s.print("IP:"); s.print(st.ip[0]); s.print('.'); s.print(st.ip[1]); s.print('.');
+	s.print(st.ip[2]); s.print('.'); s.println(st.ip[3]);
+	s.print("SYNC_OK:"); s.println(st.lastSyncOk ? 1 :0);
+	s.print("OFFS:"); s.println(st.lastOffsetSec);
+}
+Что ещё важно (коротко)
+Если после этого вы всё равно видите,что линк реально падает (NO LINK),то это уже аппаратная 
+причина (кабель/порт/питание/контакт). Но теперь при падении линка IP не будет превращаться в мусор,и 
+при восстановлении линка Ethernet будет корректно подниматься заново.
+
+Если хотите — пришлите лог после замены файла (10–20 секунд работы),я скажу,есть ли ещё признаки проблем питания/линка.
+
+

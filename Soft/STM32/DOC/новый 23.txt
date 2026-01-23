@@ -1,0 +1,303 @@
+Микроконтроллер STM32F103VGT6 Среда программирования Arduino IDE.
+
+Исправить пункты меню Page2:ИНТЕРНЕТ1 и Page3:ИНТЕРНЕТ2
+
+Переключаемые пункты меню:
+2 строка DHCP
+3 строка NTP   
+4 строка PER
+
+Не переключаемые строки
+5 строка IP
+6 строка MASK
+7 строка CW
+8 строка DNS
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — правки только для Page2 (INTERNET1) и Page3 (INTERNET2),чтобы:
+
+Переключаемые пункты (выделяются “>”,меняются SW2/SW3):
+2 строка: DHCP
+3 строка: NTP
+4 строка: PER
+Не переключаемые (только отображение):
+5 строка: IP
+6 строка: MASK
+7 строка: CW (использую поле _cfg.gw)
+8 строка: DNS
+В статусе показывается STATUS:OK/NO IP=...
+В Page3 по SW4 уже вызывается applyInternet2FromStore() — оставляем.
+1) InternetPageBase:упростить параметры + helper для RO-IP строк
+Замените внутри class InternetPageBase блок enum Param ... и добавьте helper для read-only строк.
+
+Было:
+
+cpp Копировать
+	enum Param :uint8_t { P_DHCP = 0,P_IP = 1,P_MASK = 2,P_GW = 3,P_DNS = 4,P_NTP = 5,P_PERIOD = 6,PARAM_COUNT = 7 };
+
+	static bool isIpParam(uint8_t p) { return (p == P_IP || p == P_MASK || p == P_GW || p == P_DNS); }
+
+	static void adjOct(uint8_t v[4],uint8_t idx,int delta) { ... }
+
+	void drawIpLine(TFT_eSPI* d,const char* name,uint8_t v[4],uint8_t p,int row,uint8_t curParam) { ... }
+Стало:
+
+cpp Копировать
+	enum Param :uint8_t {
+		P_DHCP = 0,
+		P_NTP = 1,
+		P_PERIOD = 2,
+		PARAM_COUNT = 3
+	};
+
+	void drawIpLineRO(TFT_eSPI* d,const char* name,uint8_t v[4],int row) {
+		d->setTextColor(TFT_WHITE,TFT_BLACK);
+		d->drawString(" ",0,Y0 + row * DY);
+
+		char s[40];
+		snprintf(s,sizeof(s),"%s %u.%u.%u.%u",name,v[0],v[1],v[2],v[3]);
+		d->drawString(s,X,Y0 + row * DY);
+	}
+adjOct() / isIpParam() / редактирование октетов больше не нужно,т.к. IP/MASK/CW/DNS теперь не переключаемые.
+
+2) Page2 (INTERNET1):кнопки,отрисовка 7 строк,STATUS с IP
+2.1. Удалите _oct и всю логику октетов
+В class Page2 удалите поле:
+
+cpp Копировать
+uint8_t _oct = 0;
+В onActivate() уберите:
+
+cpp Копировать
+_oct = 0;
+2.2. update() — статус теперь с IP
+Замените тело update() в Page2 на:
+
+cpp Копировать
+void update() override
+{
+	uint32_t now = millis();
+	if (now - _lastStatMs < 1000) return;
+	_lastStatMs = now;
+
+	IPAddress ip = ntpLan.localIP();
+	bool ok = !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+
+	char line[48];
+	snprintf(line,sizeof(line),"STATUS:%s IP=%u.%u.%u.%u",
+		ok ? "OK" :"NO",ip[0],ip[1],ip[2],ip[3]);
+
+	if (strcmp(_statLine,line) != 0)
+	{
+		strncpy(_statLine,line,sizeof(_statLine) - 1);
+		_statLine[sizeof(_statLine) - 1] = 0;
+		drawStatusLine();
+	}
+}
+2.3. drawStatusLine() — исправить очистку (сейчас чистится не там)
+Замените drawStatusLine() в Page2 на:
+
+cpp Копировать
+void drawStatusLine()
+{
+	auto d = tft(); if (!d) return;
+
+	d->setTextSize(1);
+	d->fillRect(120,0,200,16,TFT_BLACK); // <-- чистим в строке заголовка (y=0)
+
+	bool ok = (strstr(_statLine,"STATUS:OK") != nullptr);
+	d->setTextColor(ok ? TFT_GREEN :TFT_RED,TFT_BLACK);
+	d->drawString(_statLine,120,Y_TITLE);
+
+	d->setTextSize(2);
+}
+2.4. onButtonPressed() — SW1 циклически только 3 параметра
+Замените обработку SW1 в Page2 на:
+
+cpp Копировать
+if (buttonID == BTN_SW1) { // NEXT (только DHCP/NTP/PER)
+	_param = (_param + 1) % PARAM_COUNT;
+	drawDynamic(false);
+	return;
+}
+2.5. drawDynamic() — строки в нужном порядке (DHCP/NTP/PER + IP/MASK/CW/DNS RO)
+Полностью замените drawDynamic(bool) в Page2 на:
+
+cpp Копировать
+void drawDynamic(bool)
+{
+	auto d = tft(); if (!d) return;
+
+	// 7 строк:DHCP,NTP,PER,IP,MASK,CW,DNS
+	for (int i = 0; i < 7; i++) d->fillRect(0,Y0 + i * DY,W,H,TFT_BLACK);
+
+	// 2 строка:DHCP (row 0) - переключаемая
+	d->setTextColor(_param == P_DHCP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+	d->drawString(_param == P_DHCP ? ">" :" ",0,Y0 + 0 * DY);
+	d->drawString(_cfg.dhcp ? "DHCP:ON" :"DHCP:OFF",X,Y0 + 0 * DY);
+
+	// 3 строка:NTP (row 1) - переключаемая
+	char b[64];
+	d->setTextColor(_param == P_NTP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+	d->drawString(_param == P_NTP ? ">" :" ",0,Y0 + 1 * DY);
+	snprintf(b,sizeof(b),"NTP:%s",kNtpIpStr[_cfg.ntpIdx % 5]);
+	d->drawString(b,X,Y0 + 1 * DY);
+
+	// 4 строка:PER (row 2) - переключаемая
+	d->setTextColor(_param == P_PERIOD ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+	d->drawString(_param == P_PERIOD ? ">" :" ",0,Y0 + 2 * DY);
+	snprintf(b,sizeof(b),"PER:%s",kPeriodsName[_cfg.periodIdx % 6]);
+	d->drawString(b,X,Y0 + 2 * DY);
+
+	// 5-8 строки:RO
+	drawIpLineRO(d,"IP :",_cfg.ip,3);
+	drawIpLineRO(d,"MASK:",_cfg.mask,4);
+	drawIpLineRO(d,"CW :",_cfg.gw,5); // <-- CW = gateway
+	drawIpLineRO(d,"DNS :",_cfg.dns,6);
+}
+2.6. applyDelta() — только DHCP/NTP/PER
+Замените applyDelta(int delta) в Page2 на:
+
+cpp Копировать
+void applyDelta(int delta) {
+	if (_param == P_DHCP) { _cfg.dhcp = _cfg.dhcp ? 0 :1; return; }
+	if (_param == P_NTP) { _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta > 0 ? 1 :4)) % 5); return; }
+	if (_param == P_PERIOD){ _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta > 0 ? 1 :5)) % 6); return; }
+}
+3) Page3 (INTERNET2):аналогично + STATUS с IP + убрать надпись,которая мешает строкам
+Сделайте те же изменения,что и для Page2:
+
+3.1. Удалить _oct и _oct = 0;
+Удалите поле uint8_t _oct и строку _oct = 0; в onActivate().
+
+3.2. update() — STATUS с IP из internet2.readStatus()
+Замените update() в Page3 на:
+
+cpp Копировать
+void update() override
+{
+	uint32_t now = millis();
+	if (now - _lastStatMs < 1000) return;
+	_lastStatMs = now;
+
+	Internet2Client::Status st;
+	bool okRead = internet2.readStatus(st);
+
+	IPAddress ip = okRead ? st.ip :IPAddress(0,0,0,0);
+	bool ok = okRead && !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+
+	char line[48];
+	snprintf(line,sizeof(line),"STATUS:%s IP=%u.%u.%u.%u",
+		ok ? "OK" :"NO",ip[0],ip[1],ip[2],ip[3]);
+
+	if (strcmp(_statLine,line) != 0) {
+		strncpy(_statLine,line,sizeof(_statLine) - 1);
+		_statLine[sizeof(_statLine) - 1] = 0;
+		drawStatusLine();
+	}
+}
+3.3. drawStatusLine() — исправить очистку (как в Page2)
+Замените на тот же вариант с fillRect(120,0,200,16,...).
+
+3.4. onButtonPressed() — SW1 циклично только 3 параметра
+Замените логику SW1 на:
+
+cpp Копировать
+if (buttonID == BTN_SW1) {
+	_param = (_param + 1) % PARAM_COUNT;
+	drawDynamic(false);
+	return;
+}
+3.5. drawDynamic() — 7 строк в нужном порядке
+Скопируйте drawDynamic() из Page2 (только данные _cfg те же).
+
+3.6. applyDelta() — только DHCP/NTP/PER
+Скопируйте applyDelta() из Page2.
+
+3.7. drawStatic() — убрать пересекающуюся надпись
+В Page3 сейчас есть:
+
+cpp Копировать
+d->setTextSize(1);
+d->setTextColor(TFT_RED,TFT_BLACK);
+d->drawString("2nd MCU over I2C",X,32);
+...
+d->setTextSize(2);
+Её нужно убрать или перенести,иначе она перекрывает строки меню (Y0=22). Проще — удалить эти 3 строки целиком.
+
+Если хотите,я могу собрать эти изменения в виде единого diff/patch (unified diff) под ваш menu.cpp. Для этого уточните,пожалуйста:
+строка “CW” точно должна отображать gateway (_cfg.gw) или это другое поле?
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Не правильно определяется IP адрес в локальной сети.
+EthConfig
+NtpLanService_Generic
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Рассуждения
+
+192.168.75.1 — это почти всегда адрес роутера (gateway),а IP вашего устройства в этой сети должен быть вида 192.168.75.xxx.
+
+Адрес 1.0.1.1 выглядит как “публичный DNS” (рядом с Cloudflare 1.1.1.1/1.0.0.1). Поэтому есть два типовых сценария:
+
+DHCP запускается неправильно/ломает память,и в регистрах/структурах получаются “левые” значения → Ethernet.localIP()
+ возвращает мусор вроде 1.0.1.1.
+Вы на самом деле показываете не localIP,а DNS/GW,и потому видите 1.0.1.1.
+Ниже — что сделать,чтобы точно исправить/диагностировать.
+
+1) Исправьте DHCP-вызов Ethernet.begin() (самое важное)
+У вас сейчас:
+
+cpp Копировать
+int ok = Ethernet.begin(mac[idx],&SPI_New,3000,1000);
+В большинстве сборок Ethernet_Generic нет корректного DHCP overload с SPIClass*,а SPI выбирается через pCUR_SPI. Передача &SPI_New вторым аргументом часто приводит к неверному выбору overload/порче параметров → “левый IP”.
+
+Исправьте в ДВУХ местах:
+
+Impl::begin()
+cpp Копировать
+int ok = Ethernet.begin(mac[idx],3000,1000);
+Impl::applyLanConfig()
+cpp Копировать
+int ok = Ethernet.begin(mac[idx],3000,1000);
+2) Установите pCUR_SPI и поднимите SPI ДО Ethernet.init/begin
+Сделайте одинаково в begin() и applyLanConfig():
+
+cpp Копировать
+extern SPIClass* pCUR_SPI;
+pCUR_SPI = &SPI_New;
+
+pinMode(USE_THIS_SS_PIN,OUTPUT);
+digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+SPI_New.begin();
+Ethernet.init(USE_THIS_SS_PIN);
+Только после этого вызывайте Ethernet.begin(...).
+
+3) Проверьте:вы не путаете IP устройства с GW/DNS
+Сразу после Ethernet.begin(...) временно выведите:
+
+cpp Копировать
+SerialDebug.print("localIP="); SerialDebug.println(Ethernet.localIP());
+SerialDebug.print("gw="); SerialDebug.println(Ethernet.gatewayIP());
+SerialDebug.print("mask="); SerialDebug.println(Ethernet.subnetMask());
+SerialDebug.print("dns="); SerialDebug.println(Ethernet.dnsServerIP());
+Ожидаемо в вашей сети будет примерно так:
+
+gw = 192.168.75.1
+localIP = 192.168.75.xxx
+dns может быть 192.168.75.1 или публичный (1.1.1.1,8.8.8.8 и т.п.)
+Если окажется,что dns = 1.0.1.1,а localIP нормальный 192.168.75.xxx,то проблема не в 
+Ethernet,а в том,что где-то в UI/NetFeed вы отображаете DNS вместо localIP.
+
+4) Если после правки всё ещё 1.0.1.1
+Тогда пришлите,пожалуйста,вывод 4 строк из пункта (3) и ваш код формирования NetConfig 
+(где вы заполняете net.ip/net.dns/net.gw/net.mask из LanIfStore и вызываете ntpLan.begin(net) 
+/ applyLanConfig(...)). По этим данным можно точно сказать,это:
+
+неправильная маппинг-логика (GW/DNS/IP перепутаны),или
+DHCP реально не поднимается (linkUp/maintain),или
+SPI/CS не туда.
+Но в 90% случаев именно замена Ethernet.begin(mac,&SPI_New,...) → Ethernet.begin(mac,...) убирает “IP = 1.0.1.1”.

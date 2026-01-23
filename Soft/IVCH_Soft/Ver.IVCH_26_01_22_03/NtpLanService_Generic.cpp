@@ -1,0 +1,420 @@
+#include "NtpLanService_Generic.h"
+
+// Ethernet_Generic подключаем “ќЋ№ ќ здесь
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+
+struct NtpLanService_Generic::Impl
+{
+	RealtimeClock& rtc;
+	AT24C128Settings::Config& cfg;
+	NetConfig net;
+
+	EthernetUDP udpSrv;
+	EthernetUDP udpCli;
+
+	static const uint16_t NTP_PORT = 123;
+
+	bool syncRequested = false; 
+	uint32_t nextSyncMs = 0;
+
+	bool lastSyncOk = false;
+	uint32_t lastAttemptMs = 0;
+	uint32_t lastSuccessMs = 0;
+
+	uint32_t lastPrintMs = 0;
+
+	// если сохранили настройки при отключенном линке Ч применим когда линк по€витс€
+	bool pendingLanApply = false;
+
+	Impl(RealtimeClock& r, AT24C128Settings::Config& c) :rtc(r), cfg(c) {}
+
+	IPAddress localIP() const { return Ethernet.localIP(); }
+
+	bool linkUp() const
+	{
+		// Ethernet_Generic возвращает строку (у вас в логе "LINK")
+		const char* s = Ethernet.linkReport();
+		return (s && (strcmp(s, "LINK") == 0));
+	}
+
+	static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + 2208988800UL; }
+	static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - 2208988800UL; }
+	static uint32_t millisToFrac(uint32_t ms) { return (uint32_t)(((uint64_t)ms << 32) / 1000ULL); }
+
+	static void buildNtpResponse(uint8_t* out48, uint32_t txSec1900, uint32_t txFrac, const uint8_t* req48)
+	{
+		memset(out48, 0, 48);
+		out48[0] = (0 << 6) | (4 << 3) | (4); // LI=0,VN=4,Mode=4 (server)
+		out48[1] = 1;
+		out48[2] = 6;
+		out48[3] = (uint8_t)-20;
+		out48[12] = 'L'; out48[13] = 'O'; out48[14] = 'C'; out48[15] = 'L';
+		memcpy(&out48[24], &req48[40], 8); // originate = client tx time
+
+		// Receive = Transmit (упрощение дл€ LAN)
+		out48[32] = (txSec1900 >> 24) & 0xFF;
+		out48[33] = (txSec1900 >> 16) & 0xFF;
+		out48[34] = (txSec1900 >> 8) & 0xFF;
+		out48[35] = (txSec1900) & 0xFF;
+		out48[36] = (txFrac >> 24) & 0xFF;
+		out48[37] = (txFrac >> 16) & 0xFF;
+		out48[38] = (txFrac >> 8) & 0xFF;
+		out48[39] = (txFrac) & 0xFF;
+
+		// Transmit
+		out48[40] = (txSec1900 >> 24) & 0xFF;
+		out48[41] = (txSec1900 >> 16) & 0xFF;
+		out48[42] = (txSec1900 >> 8) & 0xFF;
+		out48[43] = (txSec1900) & 0xFF;
+		out48[44] = (txFrac >> 24) & 0xFF;
+		out48[45] = (txFrac >> 16) & 0xFF;
+		out48[46] = (txFrac >> 8) & 0xFF;
+		out48[47] = (txFrac) & 0xFF;
+	}
+
+	static uint32_t unixFromRtcLocal(const RTCTime& t, int8_t tzTargetHours)
+	{
+		auto daysFromCivil = [](int y, int m, int d)->int32_t {
+			y -= (m <= 2);
+			const int era = (y >= 0 ? y : y - 399) / 400;
+			const unsigned yoe = (unsigned)(y - era * 400);
+			const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + (unsigned)d - 1;
+			const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+			return (int32_t)(era * 146097 + (int)doe - 719468);
+		};
+
+		int32_t days = daysFromCivil((int)t.year, (int)t.month, (int)t.dayOfMonth);
+		int64_t local = (int64_t)days * 86400LL + (int64_t)t.hour * 3600LL + (int64_t)t.minute * 60LL + (int64_t)t.second;
+		int64_t utc = local - (int64_t)tzTargetHours * 3600LL;
+		if (utc < 0) utc = 0;
+		return (uint32_t)utc;
+	}
+
+	static void rtcLocalFromUnix(uint32_t unixUtc, int8_t tzTargetHours, RTCTime& outLocal)
+	{
+		int64_t t = (int64_t)unixUtc + (int64_t)tzTargetHours * 3600LL;
+		int64_t days = t / 86400LL;
+		int64_t rem = t % 86400LL;
+
+		auto civilFromDays = [](int32_t z, int& y, int& m, int& d) {
+			z += 719468;
+			const int era = (z >= 0 ? z : z - 146096) / 146097;
+			const unsigned doe = (unsigned)(z - era * 146097);
+			const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+			y = (int)yoe + era * 400;
+			const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+			const unsigned mp = (5 * doy + 2) / 153;
+			d = (int)(doy - (153 * mp + 2) / 5 + 1);
+			m = (int)(mp + (mp < 10 ? 3 : -9));
+			y += (m <= 2);
+		};
+
+		int y, mo, d;
+		civilFromDays((int32_t)days, y, mo, d);
+
+		int hh = (int)(rem / 3600LL); rem %= 3600LL;
+		int mm = (int)(rem / 60LL);
+		int ss = (int)(rem % 60LL);
+
+		outLocal.year = (uint16_t)y;
+		outLocal.month = (uint8_t)mo;
+		outLocal.dayOfMonth = (uint8_t)d;
+		outLocal.hour = (uint8_t)hh;
+		outLocal.minute = (uint8_t)mm;
+		outLocal.second = (uint8_t)ss;
+
+		// DOW 1..7 (Mon..Sun)
+		static int tt[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+		int yy = y;
+		if (mo < 3) yy -= 1;
+		uint8_t dow0 = (uint8_t)((yy + yy / 4 - yy / 100 + yy / 400 + tt[mo - 1] + d) % 7);
+		outLocal.dayOfWeek = (dow0 == 0) ? 7 : dow0;
+	}
+
+	bool begin(const NetConfig& nc)
+	{
+		net = nc;
+		pendingLanApply = false;
+
+		// Ќастраиваем SPI/CS
+		//pinMode(USE_THIS_SS_PIN, OUTPUT);
+		//digitalWrite(USE_THIS_SS_PIN, HIGH);
+
+		//Ethernet.init(USE_THIS_SS_PIN);
+		//SPI_New.begin();
+
+		//// направл€ем Ethernet_Generic на SPI_New
+		//extern SPIClass* pCUR_SPI;
+		//pCUR_SPI = &SPI_New;
+
+		extern SPIClass* pCUR_SPI;
+		pCUR_SPI = &SPI_New;
+
+		pinMode(USE_THIS_SS_PIN, OUTPUT);
+		digitalWrite(USE_THIS_SS_PIN, HIGH);
+
+		SPI_New.begin();
+		Ethernet.init(USE_THIS_SS_PIN);
+
+
+		uint16_t idx = net.macIndex % NUMBER_OF_MAC;
+
+		// ¬ј∆Ќќ:если линк отсутствует Ч не делаем DHCP (иначе возможна больша€ задержка)
+		if (net.useDhcp)
+		{
+			if (!linkUp())
+			{
+				SerialDebug.println(F("[ETH] LINK down -> skip DHCP,use static"));
+				Ethernet.begin(mac[idx], net.ip, net.dns, net.gw, net.mask);
+				net.useDhcp = false;
+			}
+			else
+			{
+				// сокращенные таймауты DHCP
+				//int ok = Ethernet.begin(mac[idx], &SPI_New, 3000, 1000);
+				int ok = Ethernet.begin(mac[idx], 3000, 1000);
+				//SerialDebug.print("localIP="); SerialDebug.println(Ethernet.localIP());
+				//SerialDebug.print("gw="); SerialDebug.println(Ethernet.gatewayIP());
+				//SerialDebug.print("mask="); SerialDebug.println(Ethernet.subnetMask());
+				//SerialDebug.print("dns="); SerialDebug.println(Ethernet.dnsServerIP());
+				if (!ok)
+				{
+					SerialDebug.println(F("[ETH] DHCP failed -> static"));
+					Ethernet.begin(mac[idx], net.ip, net.dns, net.gw, net.mask);
+					net.useDhcp = false;
+				}
+			}
+		}
+		else
+		{
+			Ethernet.begin(mac[idx], net.ip, net.dns, net.gw, net.mask);
+		}
+
+		if (udpSrv.begin(NTP_PORT) == 0) return false;
+		udpCli.begin(0);
+
+		syncRequested = true;
+		nextSyncMs = millis();
+		return true;
+	}
+
+	void forceSyncNow()
+	{
+		syncRequested = true;
+		nextSyncMs = millis();
+	}
+
+	void handleNtpServer()
+	{
+		int packetSize = udpSrv.parsePacket();
+		if (packetSize <= 0) return;
+
+		uint8_t req[48];
+		int n = udpSrv.read(req, 48);
+		if (n < 48) return;
+
+		RTCTime tLocal = rtc.getTime();
+		uint32_t unixUtc = unixFromRtcLocal(tLocal, cfg.tzTargetHours);
+
+		uint32_t txSec1900 = unixToNtp1900(unixUtc);
+		uint32_t txFrac = millisToFrac(millis() % 1000);
+
+		uint8_t resp[48];
+		buildNtpResponse(resp, txSec1900, txFrac, req);
+
+		udpSrv.beginPacket(udpSrv.remoteIP(), udpSrv.remotePort());
+		udpSrv.write(resp, 48);
+		udpSrv.endPacket();
+	}
+
+	void handleSyncClient()
+	{
+		uint32_t now = millis();
+
+		if (syncRequested || (int32_t)(now - nextSyncMs) >= 0) {
+			syncRequested = false;
+			nextSyncMs = now + net.syncPeriodMs;
+
+			uint8_t pkt[48] = { 0 };
+			pkt[0] = 0b11100011;
+			pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+			udpCli.beginPacket(net.upstreamIp, net.upstreamPort);
+			udpCli.write(pkt, 48);
+			udpCli.endPacket();
+
+			lastAttemptMs = now;
+			lastSyncOk = false;
+		}
+
+		int sz = udpCli.parsePacket();
+		if (sz < 48) return;
+
+		uint8_t resp[48];
+		int n = udpCli.read(resp, 48);
+		if (n < 48) return;
+
+		uint32_t sec1900 =
+			((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+			((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+		if (sec1900 < 2208988800UL) return;
+
+		uint32_t unixUtc = ntp1900ToUnix(sec1900);
+
+		RTCTime tLocal;
+		rtcLocalFromUnix(unixUtc, cfg.tzTargetHours, tLocal);
+
+		rtc.setTime(tLocal.second, tLocal.minute, tLocal.hour,
+			tLocal.dayOfWeek, tLocal.dayOfMonth, tLocal.month, tLocal.year);
+
+		lastSyncOk = true;
+		lastSuccessMs = millis();
+	}
+
+	void tick()
+	{
+		// если линка нет Ч вообще не трогаем Ethernet.maintain() и не делаем NTP
+		if (!linkUp())
+		{
+			// ждЄм линк,при этом ничего не блокируем
+			return;
+		}
+
+		// линк есть
+		handleNtpServer();
+		handleSyncClient();
+
+		if (net.useDhcp) Ethernet.maintain();
+
+		// если настройки были отложены Ч применим сейчас (линк есть)
+		if (pendingLanApply)
+		{
+			pendingLanApply = false;
+			applyLanConfig(net.useDhcp, net.ip, net.dns, net.gw, net.mask);
+		}
+	}
+
+	void printStatus1Hz()
+	{
+		uint32_t now = millis();
+		if (now - lastPrintMs < 1000) return;
+		lastPrintMs = now;
+
+		SerialDebug.print(F("[ETH] IP="));
+		SerialDebug.print(Ethernet.localIP());
+
+		SerialDebug.print(F(" Link="));
+		SerialDebug.print(Ethernet.linkReport());
+		SerialDebug.print(F(" Speed="));
+		SerialDebug.print(Ethernet.speedReport());
+		SerialDebug.print(F(" Duplex="));
+		SerialDebug.print(Ethernet.duplexReport());
+
+		SerialDebug.print(F(" NTP="));
+		SerialDebug.print(lastSyncOk ? F("OK") : F("FAIL"));
+
+		SerialDebug.print(F(" attemptMs="));
+		SerialDebug.print(lastAttemptMs);
+
+		SerialDebug.print(F(" successMs="));
+		if (lastSuccessMs == 0) SerialDebug.println(F("never"));
+		else SerialDebug.println(lastSuccessMs);
+	}
+
+	void applyUpstream(IPAddress ip, uint32_t periodMs)
+	{
+		net.upstreamIp = ip;
+		net.syncPeriodMs = periodMs;
+		forceSyncNow();
+	}
+
+	void applyLanConfig(bool dhcp, IPAddress ip, IPAddress dns, IPAddress gw, IPAddress mask)
+	{
+		net.useDhcp = dhcp;
+		net.ip = ip;
+		net.dns = dns;
+		net.gw = gw;
+		net.mask = mask;
+
+		// ≈сли линка нет Ч Ќ≈ пытаемс€ делать Ethernet.begin()
+		if (!linkUp())
+		{
+			pendingLanApply = true;
+			return;
+		}
+
+		// направл€ем Ethernet_Generic на SPI_New
+		extern SPIClass* pCUR_SPI;
+		pCUR_SPI = &SPI_New;
+
+		uint16_t idx = net.macIndex % NUMBER_OF_MAC;
+
+		if (net.useDhcp)
+		{
+			//int ok = Ethernet.begin(mac[idx], &SPI_New, 3000, 1000);
+			int ok = Ethernet.begin(mac[idx], 3000, 1000);
+			SerialDebug.print("localIP="); SerialDebug.println(Ethernet.localIP());
+			SerialDebug.print("gw="); SerialDebug.println(Ethernet.gatewayIP());
+			SerialDebug.print("mask="); SerialDebug.println(Ethernet.subnetMask());
+			SerialDebug.print("dns="); SerialDebug.println(Ethernet.dnsServerIP());
+
+			if (!ok)
+			{
+				SerialDebug.println(F("[ETH] DHCP failed,fallback to static"));
+				Ethernet.begin(mac[idx], net.ip, net.dns, net.gw, net.mask);
+				net.useDhcp = false;
+			}
+		}
+		else
+		{
+			Ethernet.begin(mac[idx], net.ip, net.dns, net.gw, net.mask);
+		}
+
+		// перезапуск UDP сокетов
+		udpSrv.stop();
+		udpCli.stop();
+		udpSrv.begin(NTP_PORT);
+		udpCli.begin(0);
+
+		forceSyncNow();
+	}
+};
+
+// -------- wrappers --------
+
+NtpLanService_Generic::NtpLanService_Generic(RealtimeClock& rtc, AT24C128Settings::Config& cfg)
+{
+	_impl = new Impl(rtc, cfg);
+}
+NtpLanService_Generic::~NtpLanService_Generic()
+{
+	delete _impl;
+	_impl = nullptr;
+}
+
+bool NtpLanService_Generic::begin(const NetConfig& net) { return _impl ? _impl->begin(net) : false; }
+void NtpLanService_Generic::tick() { if (_impl) _impl->tick(); }
+void NtpLanService_Generic::forceSyncNow() { if (_impl) _impl->forceSyncNow(); }
+
+bool NtpLanService_Generic::lastSyncOk() const { return _impl ? _impl->lastSyncOk : false; }
+uint32_t NtpLanService_Generic::lastAttemptMs() const { return _impl ? _impl->lastAttemptMs : 0; }
+uint32_t NtpLanService_Generic::lastSuccessMs() const { return _impl ? _impl->lastSuccessMs : 0; }
+
+void NtpLanService_Generic::printStatus1Hz() { if (_impl) _impl->printStatus1Hz(); }
+
+void NtpLanService_Generic::applyUpstream(IPAddress ip, uint32_t periodMs)
+{
+	if (_impl) _impl->applyUpstream(ip, periodMs);
+}
+
+void NtpLanService_Generic::applyLanConfig(bool dhcp, IPAddress ip, IPAddress dns, IPAddress gw, IPAddress mask)
+{
+	if (_impl) _impl->applyLanConfig(dhcp, ip, dns, gw, mask);
+}
+
+IPAddress NtpLanService_Generic::localIP() const
+{
+	return _impl ? _impl->localIP() : IPAddress(0, 0, 0, 0);
+}

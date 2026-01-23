@@ -1,0 +1,112 @@
+Ниже — как сделать:
+
+первый запуск синхронизации немедленно (с приоритетом GPS > Internet(NTP) > GSM(CCLK));
+главным источником текущего времени всегда остаётся DS3231SN:все “запросы текущего времени”
+ берём только из rtc.getTime(). SIM800 используется только для коррекции DS3231.
+A) Немедленный первый запуск синхронизации (патч TimeSyncPlanner)
+1) TimeSyncPlanner.h — добавить метод и флаг
+Добавьте в public::
+
+cpp Копировать
+// Запросить немедленную синхронизацию (по приоритету GPS > NET > GSM).
+// Не блокирует:стартует в tick(),когда SIM свободен.
+void triggerImmediate();
+Добавьте в private::
+
+cpp Копировать
+bool _immediatePending = false;
+2) TimeSyncPlanner.cpp — реализовать triggerImmediate() и учесть в tick()
+Добавьте:
+
+cpp Копировать
+void TimeSyncPlanner::triggerImmediate()
+{
+ _immediatePending = true;
+}
+И измените tick() на:
+
+cpp Копировать
+void TimeSyncPlanner::tick()
+{
+ const uint32_t now = millis();
+
+ // Немедленный запуск (один раз),если запрошен
+ if (_immediatePending) {
+ // Сначала попробуем GPS,потом NET,потом GSM (приоритет)
+ // GPS может быть не реализован и вернёт false — тогда пойдём дальше
+ (void)tryStartGps(now);
+
+ if (tryStartNet(now)) { _immediatePending = false; return; }
+ if (tryStartGsm(now)) { _immediatePending = false; return; }
+
+ // Если ничего не смогли стартовать (например SIM busy или все источники выключены),
+ // оставляем _immediatePending=true — попробуем на следующем tick().
+ return;
+ }
+
+ // Обычное расписание:GPS > NET > GSM
+ (void)tryStartGps(now);
+ if (tryStartNet(now)) return;
+ (void)tryStartGsm(now);
+}
+В tryStartNet/tryStartGsm у вас уже стоит проверка _sim.isBusy(),поэтому немедленный запуск будет ждать,пока SIM освободится.
+
+B) Изменения в вашем .ino (немедленный запуск + DS3231 как master)
+1) В setup() после planner.begin() — запросить немедленную синхронизацию
+У вас сейчас:
+
+cpp Копировать
+planner.begin();
+planner.onSettingsChanged();
+Сделайте так:
+
+cpp Копировать
+planner.begin();
+planner.onSettingsChanged();
+planner.triggerImmediate(); // <-- первый запуск синхронизации сразу
+Рекомендую также убрать прежний разовый sim.requestTimeNow() (иначе вы запускаете “вне планировщика”):
+
+cpp Копировать
+// sim.requestTimeNow(); // УБРАТЬ,теперь этим управляет planner
+2) “Все запросы текущего времени — из DS3231SN”
+У вас это уже почти так:
+
+на главную вы формируете gDateStr/gTimeStr из rtc.getTime()
+дисплей 7-seg тоже показывает rtc.getTime()
+Оставьте это как есть и следуйте правилу:
+
+Для отображения/логики “текущее время” никогда не берите из sim.lastCCLKRaw(). sim.hasNewTime() 
+используется только чтобы один раз обновить DS3231.
+
+То есть блок:
+
+cpp Копировать
+if (sim.hasNewTime()) {
+ ... parse CCLK ...
+ rtc.setTime(...); // корректируем DS3231
+ planner.onTimeUpdated();
+}
+— это правильно. После этого время читается только из DS3231.
+
+3) Чтобы Home обновлялся стабильно
+Сейчас вы обновляете gTimeStr/gDateStr когда секунды изменились — этого достаточно. Если захотите обновлять 
+строго раз в 500 мс независимо от секунд,можно заменить условие на таймер (но это не обязательно).
+
+C) Важное про Internet(NTP)
+Немедленный запуск Internet сработает только если:
+
+syncData.netEnable = 1
+cfg.enableFallback = true (вы так используете NTP в SIM800TimeAsync)
+в SIM800TimeAsync есть патч requestNtpNow() (и он реально ведёт в ветку NTP_CGATT)
+Если cfg.enableFallback=false,планировщик может вызвать requestNtpNow(),но SIM800 не
+ пойдёт в NTP (у вас это условие проверяется в SIM).
+
+Что именно вы увидите после патча
+После старта:
+
+DS3231 сразу отдаёт “текущее” (пусть и неточное) время для всей системы,
+планировщик сразу пытается синхронизировать (Internet/GSM по настройкам),
+при успехе sim.hasNewTime() корректирует DS3231,
+дальше вся система читает время только из DS3231SN.
+Если хотите,я могу вернуть вам обновлённые “полные” файлы TimeSyncPlanner.h/.cpp уже с triggerImmediate() 
+(целиком),чтобы вы просто заменили файлы без ручных правок.

@@ -1,0 +1,108 @@
+Ниже — готовый патч:весь блок HOME‑констант + две функции drawHomeStatic() и drawHomeDynamic() целиком (под 2 IP:gIp1Str и gIp2Str). Также указал обязательное добавление _lastIp2 в Menu.h.
+
+1) Menu.h — добавить кеш второго IP
+В private: класса Menu рядом с _lastIp добавьте:
+
+cpp Копировать
+char _lastIp2[16] = "0.0.0.0";
+2) Menu.cpp — заменить HOME константы
+Найдите старый блок:
+
+cpp Копировать
+static const int Y_HOME = 10;
+static const int Y_IP = 32; // ниже HOME
+static const int Y_DATE = 55;
+static const int Y_NET = 78;
+static const int Y_SIG = 101;
+static const int Y_VER = 140;
+и замените на:
+
+cpp Копировать
+static const int Y_HOME = 10;
+
+static const int Y_IP1 = 32; // IP1 под HOME
+static const int Y_IP2 = 52; // IP2 под IP1
+
+static const int Y_DATE = 72;
+static const int Y_NET = 94;
+static const int Y_SIG = 116;
+
+static const int Y_VER = 140;
+3) Menu.cpp — заменить void Menu::drawHomeStatic() целиком
+cpp Копировать
+void Menu::drawHomeStatic()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("HOME",10,Y_HOME);
+
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("IP1:",10,Y_IP1);
+ tft->drawString("IP2:",10,Y_IP2);
+ tft->drawString("DATE:",10,Y_DATE);
+ tft->drawString("NET :",10,Y_NET);
+ tft->drawString("SIG :",10,Y_SIG);
+
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->drawString(versionString,10,Y_VER);
+
+ _lastIp[0] = 0;
+ _lastIp2[0] = 0;
+ _lastDate[0] = 0;
+ _lastNet = !gNetRegistered;
+ _lastBars = 255;
+}
+4) Menu.cpp — заменить void Menu::drawHomeDynamic() целиком
+cpp Копировать
+void Menu::drawHomeDynamic()
+{
+ // IP1
+ if (strcmp(_lastIp,gIp1Str) != 0) {
+ strncpy(_lastIp,gIp1Str,sizeof(_lastIp) - 1);
+ _lastIp[sizeof(_lastIp) - 1] = 0;
+ tft->fillRect(80,Y_IP1,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastIp,80,Y_IP1);
+ }
+
+ // IP2
+ if (strcmp(_lastIp2,gIp2Str) != 0) {
+ strncpy(_lastIp2,gIp2Str,sizeof(_lastIp2) - 1);
+ _lastIp2[sizeof(_lastIp2) - 1] = 0;
+ tft->fillRect(80,Y_IP2,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastIp2,80,Y_IP2);
+ }
+
+ // Date
+ if (strcmp(_lastDate,gDateStr) != 0) {
+ strncpy(_lastDate,gDateStr,sizeof(_lastDate) - 1);
+ _lastDate[sizeof(_lastDate) - 1] = 0;
+ tft->fillRect(80,Y_DATE,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastDate,80,Y_DATE);
+ }
+
+ // Net (SIM800 registration)
+ if (_lastNet != gNetRegistered) {
+ _lastNet = gNetRegistered;
+ tft->fillRect(80,Y_NET,240,20,TFT_BLACK);
+ tft->setTextColor(gNetRegistered ? TFT_GREEN :TFT_RED,TFT_BLACK);
+ tft->drawString(gNetRegistered ? "CONNECTED" :"NO",80,Y_NET);
+ }
+
+ // Signal
+ if (_lastBars != gSignalBars) {
+ _lastBars = gSignalBars;
+ tft->fillRect(80,Y_SIG,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ char buf[32];
+ if (gCsqRssi == 99 || gRssiDbm == 0) snprintf(buf,sizeof(buf),"-- [0/5]");
+ else snprintf(buf,sizeof(buf),"%ddBm [%u/5]",(int)gRssiDbm,(unsigned)gSignalBars);
+ tft->drawString(buf,80,Y_SIG);
+ }
+}
+Если после этого на HOME “поедет” верстка (высота шрифта/строк),скажите какой шрифт активен на HOME и какие 
+размеры setTextSize вы используете — подгоню координаты точнее под ваш стиль.

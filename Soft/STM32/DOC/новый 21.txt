@@ -1,0 +1,167 @@
+Ниже — готовые фрагменты,которые выводят в Serial параметры INTERNET2:
+
+на центральном STM32F103VGT6 (читает настройки IF2 из EEPROM + статус модуля по I2C)
+на модуле Internet2 (STM32F103CBT6 + W5500) (печатает свой линк/IP/последнюю синхронизацию)
+Выберите,что вам нужно (обычно достаточно центрального).
+
+1) Центральный модуль:печать настроек IF2 + статус Internet2 по I2C
+1.1. Добавьте функцию (в .ino,вне setup/loop)
+cpp Копировать
+static void printInternet2ConfigAndStatus()
+{
+ // 1) Настройки из EEPROM (IF2)
+ LanIfStore::IfConfig c;
+ lanStore.load(LanIfStore::IF2,c,false);
+
+ Serial.println(F("=== INTERNET2 CONFIG (EEPROM IF2) ==="));
+ Serial.print(F("DHCP=")); Serial.println(c.dhcp ? 1 :0);
+
+ Serial.print(F("IP="));
+ Serial.print(c.ip[0]); Serial.print('.'); Serial.print(c.ip[1]); Serial.print('.'); Serial.print(c.ip[2]); Serial.print('.'); Serial.println(c.ip[3]);
+
+ Serial.print(F("MASK="));
+ Serial.print(c.mask[0]); Serial.print('.'); Serial.print(c.mask[1]); Serial.print('.'); Serial.print(c.mask[2]); Serial.print('.'); Serial.println(c.mask[3]);
+
+ Serial.print(F("GW="));
+ Serial.print(c.gw[0]); Serial.print('.'); Serial.print(c.gw[1]); Serial.print('.'); Serial.print(c.gw[2]); Serial.print('.'); Serial.println(c.gw[3]);
+
+ Serial.print(F("DNS="));
+ Serial.print(c.dns[0]); Serial.print('.'); Serial.print(c.dns[1]); Serial.print('.'); Serial.print(c.dns[2]); Serial.print('.'); Serial.println(c.dns[3]);
+
+ Serial.print(F("NTP_IDX=")); Serial.println((unsigned)(c.ntpIdx % 5));
+ Serial.print(F("PERIOD_IDX=")); Serial.println((unsigned)(c.periodIdx % 6));
+
+ // 2) Статус модуля по I2C
+ Internet2Client::Status st;
+ bool ok = internet2.readStatus(st);
+
+ Serial.println(F("=== INTERNET2 STATUS (I2C) ==="));
+ Serial.print(F("I2C=")); Serial.println(ok ? F("OK") :F("NO"));
+
+ if (ok) {
+ Serial.print(F("PROTO=")); Serial.println((unsigned)st.protoVer);
+ Serial.print(F("FLAGS=0x")); Serial.println(st.flags,HEX);
+
+ Serial.print(F("IP2="));
+ Serial.print(st.ip[0]); Serial.print('.'); Serial.print(st.ip[1]); Serial.print('.'); Serial.print(st.ip[2]); Serial.print('.'); Serial.println(st.ip[3]);
+
+ Serial.print(F("LAST_SYNC_OK=")); Serial.println(st.lastSyncOk ? 1 :0);
+ Serial.print(F("LAST_NTP_UTC=")); Serial.println((unsigned long)st.lastNtpUtc);
+ Serial.print(F("OFFSET_SEC=")); Serial.println((long)st.lastOffsetSec);
+ }
+}
+1.2. Варианты вызова
+А) Печатать раз в 5 секунд (в loop())
+
+cpp Копировать
+static uint32_t tDbg2 = 0;
+if (millis() - tDbg2 > 5000) {
+ tDbg2 = millis();
+ printInternet2ConfigAndStatus();
+}
+Б) Печатать сразу после SAVE в меню INTERNET2 Самое удобное:добавьте в вашу функцию applyInternet2FromStore() в конце:
+
+cpp Копировать
+printInternet2ConfigAndStatus();
+2) Модуль Internet2 (STM32F103CBT6):печать локального статуса
+Если вы хотите видеть параметры прямо на втором модуле,добавьте в его loop():
+
+cpp Копировать
+static uint32_t t0=0;
+if (millis() - t0 > 5000) {
+ t0 = millis();
+ auto st = net2.status();
+
+ Serial.println(F("=== INTERNET2 (W5500) ==="));
+ Serial.print(F("LINK=")); Serial.println(st.linkUp ? 1 :0);
+ Serial.print(F("DHCP=")); Serial.println(st.dhcp ? 1 :0);
+ Serial.print(F("HAVE_MASTER_TIME=")); Serial.println(st.haveMasterTime ? 1 :0);
+
+ Serial.print(F("IP="));
+ Serial.print(st.ip[0]); Serial.print('.'); Serial.print(st.ip[1]); Serial.print('.'); Serial.print(st.ip[2]); Serial.print('.'); Serial.println(st.ip[3]);
+
+ Serial.print(F("SYNC_OK=")); Serial.println(st.lastSyncOk ? 1 :0);
+ Serial.print(F("LAST_NTP_UTC=")); Serial.println((unsigned long)st.lastNtpUtc);
+ Serial.print(F("OFFSET_SEC=")); Serial.println((long)st.lastOffsetSec);
+}
+Вопрос (чтобы сделать “идеально” под вас)
+Вы хотите вывод на центральном (VGT6) или на втором модуле (CBT6)? Могу подогнать формат под ваш монитор
+ (одна строка компактно или многострочно как выше) и добавить вывод выбранного upstream 
+IP/периода “человечески” (по таблице kNtpIpStr и kPeriodsName).
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Сделаем вывод на втором модуле (CBT6) автоматически один раз после появления LINK и 
+получения ненулевого IP. Самый правильный путь — печатать из W5500NtpServerClient.cpp,потому что
+ там уже подключён Ethernet_Generic и доступны Ethernet.localIP()/subnetMask()/gatewayIP()/dnsServerIP().
+
+Ниже — готовый патч.
+
+1) Правка W5500NtpServerClient.cpp
+1.1. Добавьте в начало файла (после static EthernetUDP ...) маленькие флаги
+cpp Копировать
+// ---- one-shot print after link+ip up ----
+static bool s_prevLinkUp = false;
+static bool s_printedAfterConnect = false;
+1.2. Внутри W5500NtpServerClient::tick() после того,как вы обновили _st.ip[],вставьте блок
+Ищите место где у вас:
+
+cpp Копировать
+_st.linkUp = linkUp();
+...
+IPAddress ip = Ethernet.localIP();
+_st.ip[0] = ip[0]; ...
+Сразу после этого вставьте:
+
+cpp Копировать
+// One-shot print when link becomes UP and IP is assigned
+bool ipValid = (ip[0] != 0 && ip[0] != 255); // грубая проверка (0.0.0.0 / 255.x.x.x)
+if (!_st.linkUp) {
+ s_printedAfterConnect = false; // сброс,чтобы при следующем подключении напечатать снова
+}
+
+if (_st.linkUp && ipValid && !s_printedAfterConnect) {
+ s_printedAfterConnect = true;
+
+ IPAddress mask = Ethernet.subnetMask();
+ IPAddress gw = Ethernet.gatewayIP();
+ IPAddress dns = Ethernet.dnsServerIP();
+
+ Serial.println(F("=== INTERNET2 CONNECTED (W5500) ==="));
+ Serial.print(F("DHCP=")); Serial.println(_cfg.dhcp ? 1 :0);
+
+ Serial.print(F("IP="));
+ Serial.print(ip[0]); Serial.print('.'); Serial.print(ip[1]); Serial.print('.'); Serial.print(ip[2]); Serial.print('.'); Serial.println(ip[3]);
+
+ Serial.print(F("MASK="));
+ Serial.print(mask[0]); Serial.print('.'); Serial.print(mask[1]); Serial.print('.'); Serial.print(mask[2]); Serial.print('.'); Serial.println(mask[3]);
+
+ Serial.print(F("GW="));
+ Serial.print(gw[0]); Serial.print('.'); Serial.print(gw[1]); Serial.print('.'); Serial.print(gw[2]); Serial.print('.'); Serial.println(gw[3]);
+
+ Serial.print(F("DNS="));
+ Serial.print(dns[0]); Serial.print('.'); Serial.print(dns[1]); Serial.print('.'); Serial.print(dns[2]); Serial.print('.'); Serial.println(dns[3]);
+
+ Serial.print(F("UPSTREAM_NTP="));
+ Serial.print(_cfg.upstream[0]); Serial.print('.'); Serial.print(_cfg.upstream[1]); Serial.print('.');
+ Serial.print(_cfg.upstream[2]); Serial.print('.'); Serial.println(_cfg.upstream[3]);
+
+ Serial.print(F("SYNC_PERIOD_MS=")); Serial.println((unsigned long)_cfg.periodMs);
+ Serial.println(F("================================"));
+}
+Готово:как только кабель воткнули/линк поднялся и IP стал ненулевым — модуль напечатает параметры один раз.
+
+2) Убедитесь,что Serial.begin(...) есть в Internet2_Slave.ino
+У вас должно быть в setup():
+
+cpp Копировать
+Serial.begin(115200);
+И всё.
+
+Если хотите печатать только при DHCP (а при static — сразу)
+Можно заменить условие ipValid на:
+
+(_cfg.dhcp ? ipValid :true) и печатать сразу на статике.
+Скажите,у вас Internet2 чаще DHCP или static — подстрою условие.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++

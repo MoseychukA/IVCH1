@@ -1,0 +1,4148 @@
+Создать ntp-server для обслуживания запросов времени по локальной сети.
+Обеспечить получение, синхронизацию времени с внешних источников в интернет.
+
+
+
+
+Составить программу для тестирования работы модуля W5500.
+Результат вывести в Serial.
+Микроконтроллер STM32F103VGT6
+Среда программирования Arduino IDE
+Модуль интернет W5500
+Подключение:
+INTn PB0
+MOSI PA7
+MISO PA6
+SCLK PA5
+SCSn PA4
+
+Включить программу в проект
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — готовый модуль NTP‑сервера для локальной сети на STM32F103 + W5500,который:
+
+отвечает на NTP‑запросы по UDP порт 123 в вашей LAN (NTP server),
+периодически синхронизирует время из интернета с внешнего NTP (SNTP client),
+как “источник времени” для ответов использует DS3231SN (через ваш RealtimeClock rtc),
+умеет корректно отдавать UTC,даже если DS3231 хранит “локальное” время (использует cfg.tzTargetHours).
+Подключение W5500 (SPI1):
+
+INTn → PB0 (в коде не требуется,можно не использовать)
+MOSI PA7
+MISO PA6
+SCLK PA5
+SCSn (CS) PA4
+Важно:если TFT/SD тоже на SPI — проверьте,что их CS держатся в HIGH,когда работает W5500.
+
+0) Зависимости (Arduino IDE)
+Для W5500 чаще всего подходят библиотеки:
+
+Ethernet2 или Ethernet (в зависимости от вашего core/сборки)
+В коде ниже я использую Ethernet.h + EthernetUdp.h. Если у вас стоит Ethernet2,просто замените 
+include’ы на #include <Ethernet2.h> / EthernetUDP обычно тот же.
+
+1) Файлы модуля:NtpLanService.h и NtpLanService.cpp
+NtpLanService.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+
+#include "RTCSupport.h"
+#include "AT24C128Settings.h"
+
+class NtpLanService {
+public:
+ struct NetConfig {
+ byte mac[6];
+
+ IPAddress ip;
+ IPAddress dns;
+ IPAddress gw;
+ IPAddress mask;
+
+ // внешний NTP (можно IP,чтобы не зависеть от DNS)
+ IPAddress upstreamIp = IPAddress(129,6,15,28); // time.nist.gov
+ uint16_t upstreamPort = 123;
+
+ // период синхронизации с интернетом
+ uint32_t syncPeriodMs = 3600000UL; // 1 час
+ };
+
+ NtpLanService(RealtimeClock& rtc,AT24C128Settings::Config& cfg);
+
+ // csPin = PA4 (ваш SCSn)
+ bool begin(const NetConfig& net,uint8_t csPin);
+
+ void tick(); // вызывать часто
+ void forceSyncNow(); // немедленно запросить интернет NTP
+
+ bool lastSyncOk() const { return _lastSyncOk; }
+ uint32_t lastSyncMs() const { return _lastSyncMs; }
+
+private:
+ RealtimeClock& _rtc;
+ AT24C128Settings::Config& _cfg;
+
+ EthernetUDP _udpSrv;
+ EthernetUDP _udpCli;
+
+ NetConfig _net;
+ uint8_t _csPin = 0;
+
+ // NTP server port
+ static const uint16_t NTP_PORT = 123;
+
+ // sync state
+ bool _syncRequested = false;
+ bool _lastSyncOk = false;
+ uint32_t _lastSyncMs = 0;
+ uint32_t _nextSyncMs = 0;
+
+ // helpers
+ void handleNtpServer();
+ void handleSyncClient();
+
+ // time conversions
+ static uint32_t unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours);
+ static void rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal);
+
+ // NTP packet helpers
+ static void buildNtpResponse(uint8_t* out48,
+ uint32_t rxSeconds1900,uint32_t rxFrac,
+ uint32_t txSeconds1900,uint32_t txFrac,
+ const uint8_t* clientRequest48);
+
+ static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + 2208988800UL; }
+ static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - 2208988800UL; }
+
+ static uint32_t millisToFrac(uint32_t ms) {
+ // приближение:ms/1000 * 2^32
+ return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+ }
+};
+NtpLanService.cpp
+cpp Копировать
+#include "NtpLanService.h"
+
+// ---- constructor ----
+NtpLanService::NtpLanService(RealtimeClock& rtc,AT24C128Settings::Config& cfg)
+:_rtc(rtc),_cfg(cfg) {}
+
+bool NtpLanService::begin(const NetConfig& net,uint8_t csPin)
+{
+ _net = net;
+ _csPin = csPin;
+
+ // Важно:CS всех остальных SPI устройств должен быть HIGH
+ pinMode(_csPin,OUTPUT);
+ digitalWrite(_csPin,HIGH);
+
+ // Ethernet init (для многих реализаций)
+ // Для Ethernet/Ethernet2 на некоторых платформах можно использовать Ethernet.init(csPin),
+ // но на Arduino_STM32 может не быть. Поэтому используем стандартный pin.
+ // Если у вас есть Ethernet.init(csPin) — можно добавить.
+ #if defined(ETHERNET_HAS_INIT)
+ Ethernet.init(_csPin);
+ #endif
+
+ Ethernet.begin(_net.mac,_net.ip,_net.dns,_net.gw,_net.mask);
+
+ // сервер UDP:порт 123
+ if (_udpSrv.begin(NTP_PORT) == 0) return false;
+
+ // клиент UDP:любой порт
+ _udpCli.begin(0);
+
+ _nextSyncMs = millis(); // первая попытка скоро
+ _syncRequested = true;
+
+ return true;
+}
+
+void NtpLanService::forceSyncNow()
+{
+ _syncRequested = true;
+ _nextSyncMs = millis();
+}
+
+void NtpLanService::tick()
+{
+ handleNtpServer();
+ handleSyncClient();
+}
+
+// ---- NTP server ----
+void NtpLanService::handleNtpServer()
+{
+ int packetSize = _udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = _udpSrv.read(req,sizeof(req));
+ if (n < 48) return;
+
+ // Клиентский режим обычно 3 (client)
+ uint8_t li_vn_mode = req[0];
+ uint8_t mode = li_vn_mode & 0x07;
+ (void)mode;
+
+ // Получим текущее UTC из RTC (который хранит локальное target TZ)
+ RTCTime tLocal = _rtc.getTime();
+ uint32_t unixUtc = unixFromRtcLocal(tLocal,_cfg.tzTargetHours);
+
+ uint32_t txSec1900 = unixToNtp1900(unixUtc);
+ uint32_t txFrac = millisToFrac(millis() % 1000);
+
+ // Время приёма (rx) можно поставить как tx (достаточно для LAN)
+ uint32_t rxSec1900 = txSec1900;
+ uint32_t rxFrac = txFrac;
+
+ uint8_t resp[48];
+ buildNtpResponse(resp,rxSec1900,rxFrac,txSec1900,txFrac,req);
+
+ _udpSrv.beginPacket(_udpSrv.remoteIP(),_udpSrv.remotePort());
+ _udpSrv.write(resp,48);
+ _udpSrv.endPacket();
+}
+
+// ---- NTP client sync ----
+void NtpLanService::handleSyncClient()
+{
+ uint32_t now = millis();
+
+ if (_syncRequested || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncRequested = false;
+ _nextSyncMs = now + _net.syncPeriodMs;
+
+ // отправим SNTP запрос
+ uint8_t pkt[48] = {0};
+ pkt[0] = 0b11100011; // LI=3 (unknown),VN=4,Mode=3 (client)
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+ // transmit timestamp можно оставить 0
+
+ _udpCli.beginPacket(_net.upstreamIp,_net.upstreamPort);
+ _udpCli.write(pkt,48);
+ _udpCli.endPacket();
+
+ // отметим попытку
+ _lastSyncOk = false;
+ _lastSyncMs = now;
+ }
+
+ // читаем ответ (не блокируем)
+ int sz = _udpCli.parsePacket();
+ if (sz < 48) return;
+
+ uint8_t resp[48];
+ int n = _udpCli.read(resp,48);
+ if (n < 48) return;
+
+ // Transmit Timestamp сервера:байты 40..47
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) | ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 < 2208988800UL) return; // защита
+ uint32_t unixUtc = ntp1900ToUnix(sec1900);
+
+ // выставим RTC в локальном target TZ
+ RTCTime tLocal;
+ rtcLocalFromUnix(unixUtc,_cfg.tzTargetHours,tLocal);
+
+ // dayOfWeek в вашем RTCSupport:1=Mon..7=Sun
+ _rtc.setTime(tLocal.second,tLocal.minute,tLocal.hour,
+ tLocal.dayOfWeek,tLocal.dayOfMonth,tLocal.month,tLocal.year);
+
+ _lastSyncOk = true;
+}
+
+// ---- Build NTP response ----
+void NtpLanService::buildNtpResponse(uint8_t* out48,
+ uint32_t rxSeconds1900,uint32_t rxFrac,
+ uint32_t txSeconds1900,uint32_t txFrac,
+ const uint8_t* clientRequest48)
+{
+ memset(out48,0,48);
+
+ // LI=0,VN=4,Mode=4 (server)
+ out48[0] = (0 << 6) | (4 << 3) | (4);
+ out48[1] = 1; // stratum 1 (мы "локальный" сервер)
+ out48[2] = 6; // poll
+ out48[3] = (uint8_t)-20; // precision ~ -20
+
+ // Reference ID "LOCL"
+ out48[12] = 'L'; out48[13] = 'O'; out48[14] = 'C'; out48[15] = 'L';
+
+ // Originate Timestamp = Transmit Timestamp клиента (байты 40..47 в запросе)
+ memcpy(&out48[24],&clientRequest48[40],8);
+
+ // Receive Timestamp
+ out48[32] = (rxSeconds1900 >> 24) & 0xFF;
+ out48[33] = (rxSeconds1900 >> 16) & 0xFF;
+ out48[34] = (rxSeconds1900 >> 8) & 0xFF;
+ out48[35] = (rxSeconds1900) & 0xFF;
+ out48[36] = (rxFrac >> 24) & 0xFF;
+ out48[37] = (rxFrac >> 16) & 0xFF;
+ out48[38] = (rxFrac >> 8) & 0xFF;
+ out48[39] = (rxFrac) & 0xFF;
+
+ // Transmit Timestamp
+ out48[40] = (txSeconds1900 >> 24) & 0xFF;
+ out48[41] = (txSeconds1900 >> 16) & 0xFF;
+ out48[42] = (txSeconds1900 >> 8) & 0xFF;
+ out48[43] = (txSeconds1900) & 0xFF;
+ out48[44] = (txFrac >> 24) & 0xFF;
+ out48[45] = (txFrac >> 16) & 0xFF;
+ out48[46] = (txFrac >> 8) & 0xFF;
+ out48[47] = (txFrac) & 0xFF;
+}
+
+// ---- RTC local <-> unix UTC helpers ----
+// ВНИМАНИЕ:DS3231 у вас хранит "локальное" время целевого TZ (cfg.tzTargetHours).
+// Переводим его в UTC,а NTP отдаём в UTC.
+
+uint32_t NtpLanService::unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours)
+{
+ // конвертация календаря в unix (UTC) через простую epoch-функцию.
+ // Считаем,что RTCTime — локальное время TZ_target.
+ auto daysFromCivil = [](int y,int m,int d)->int32_t {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+ };
+
+ int32_t days = daysFromCivil((int)t.year,(int)t.month,(int)t.dayOfMonth);
+ int64_t local = (int64_t)days * 86400LL + (int64_t)t.hour * 3600LL + (int64_t)t.minute * 60LL + (int64_t)t.second;
+
+ int64_t utc = local - (int64_t)tzTargetHours * 3600LL;
+ if (utc < 0) utc = 0;
+ return (uint32_t)utc;
+}
+
+void NtpLanService::rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal)
+{
+ // unixUtc -> local target TZ -> civil
+ int64_t t = (int64_t)unixUtc + (int64_t)tzTargetHours * 3600LL;
+
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+
+ auto civilFromDays = [](int32_t z,int &y,int &m,int &d){
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+ };
+
+ int y,mo,d;
+ civilFromDays((int32_t)days,y,mo,d);
+
+ int hh = (int)(rem / 3600LL); rem %= 3600LL;
+ int mm = (int)(rem / 60LL);
+ int ss = (int)(rem % 60LL);
+
+ outLocal.year = (uint16_t)y;
+ outLocal.month = (uint8_t)mo;
+ outLocal.dayOfMonth = (uint8_t)d;
+ outLocal.hour = (uint8_t)hh;
+ outLocal.minute = (uint8_t)mm;
+ outLocal.second = (uint8_t)ss;
+
+ // dayOfWeek для DS3231:1=Mon..7=Sun.
+ // Считаем по Sakamoto (0=Sun..6=Sat) и переводим.
+ static int tt[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ int yy = y;
+ if (mo < 3) yy -= 1;
+ uint8_t dow0 = (uint8_t)((yy + yy/4 - yy/100 + yy/400 + tt[mo-1] + d) % 7);
+ outLocal.dayOfWeek = (dow0 == 0) ? 7 :dow0;
+}
+2) Интеграция в ваш проект (.ino)
+2.1. Подключить файлы и создать объект
+В .ino:
+
+cpp Копировать
+#include "NtpLanService.h"
+
+// глобально:
+NtpLanService ntpLan(rtc,cfg);
+2.2. Настроить сеть W5500 и запустить сервис в setup()
+Добавьте в setup() после Wire.begin(); rtc.begin(); ee.load(cfg,...):
+
+cpp Копировать
+NtpLanService::NetConfig net;
+
+// MAC обязательно уникальный
+net.mac[0]=0x02; net.mac[1]=0x12; net.mac[2]=0x34; net.mac[3]=0x56; net.mac[4]=0x78; net.mac[5]=0x9A;
+
+// Статический IP вашей LAN (пример)
+net.ip = IPAddress(192,168,1,50);
+net.gw = IPAddress(192,168,1,1);
+net.mask = IPAddress(255,255,255,0);
+net.dns = IPAddress(192,168,1,1);
+
+// Внешний NTP (IP чтобы без DNS)
+net.upstreamIp = IPAddress(129,6,15,28); // time.nist.gov
+net.syncPeriodMs = 3600000UL; // 1 час
+
+// CS = PA4
+bool ok = ntpLan.begin(net,PA4);
+Serial.print("NTP LAN service:");
+Serial.println(ok ? "OK" :"FAIL");
+
+// Немедленно синхронизироваться из интернета при старте
+ntpLan.forceSyncNow();
+2.3. Вызывать в loop()
+Добавьте в loop():
+
+cpp Копировать
+ntpLan.tick();
+3) Как будет работать
+DS3231SN остаётся “мастером текущего времени”.
+NTP‑сервер раздаёт время клиентам в UTC (правильно для NTP).
+Раз в час (или по syncPeriodMs) устройство делает SNTP запрос в интернет,и по ответу
+ корректирует DS3231 (в вашем целевом cfg.tzTargetHours).
+4) Замечания по SPI и совместимости
+W5500,TFT и SD на одном SPI:все CS должны быть HIGH,когда устройство не активно.
+INTn PB0 можно не использовать (polling достаточно).
+Если у вас библиотека Ethernet не работает с Ethernet.begin(...) на STM32F1 (бывает),
+скажите,какую конкретно библиотеку W5500 вы используете (Ethernet/Ethernet2/Ethernet3),и я подстрою init под неё.
+Если хотите,я добавлю в Home экран/Serial вывод:
+
+IP адрес,
+статус link (Ethernet.linkStatus() если доступно),
+время последней успешной интернет-синхронизации (lastSyncOk/lastSyncMs).
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — готовый неблокирующий Serial‑вывод для W5500/NTP‑сервиса:IP,link‑статус (если поддерживается вашей библиотекой),и последняя успешная интернет‑синхронизация.
+
+1) Добавьте функцию в .ino (или отдельный файл)
+cpp Копировать
+static void printEthernetNtpStatus1Hz(NtpLanService& ntpLan)
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ // IP
+ IPAddress ip = Ethernet.localIP();
+ Serial.print(F("[ETH] IP="));
+ Serial.print(ip[0]); Serial.print('.');
+ Serial.print(ip[1]); Serial.print('.');
+ Serial.print(ip[2]); Serial.print('.');
+ Serial.print(ip[3]);
+
+ // LINK (если доступно)
+ Serial.print(F(" LINK="));
+#if defined(ETHERNET_LINK_STATUS)
+ auto ls = Ethernet.linkStatus();
+ if (ls == LinkON) Serial.print(F("ON"));
+ else if (ls == LinkOFF) Serial.print(F("OFF"));
+ else Serial.print(F("UNKNOWN"));
+#else
+ Serial.print(F("N/A"));
+#endif
+
+ // Last sync
+ Serial.print(F(" NTPsync="));
+ Serial.print(ntpLan.lastSyncOk() ? F("OK") :F("FAIL"));
+ Serial.print(F(" lastMs="));
+ Serial.println(ntpLan.lastSyncMs());
+}
+Примечание:макрос ETHERNET_LINK_STATUS есть не во всех версиях библиотек. Если его нет — выводится LINK=N/A.
+
+2) В loop() вызывайте
+cpp Копировать
+ntpLan.tick();
+printEthernetNtpStatus1Hz(ntpLan);
+3) (Опционально) Печать “красиво”:сколько секунд назад был успешный sync
+Если хотите именно “время назад”,замените концовку на:
+
+cpp Копировать
+uint32_t last = ntpLan.lastSyncMs();
+uint32_t ago = (last == 0) ? 0xFFFFFFFFUL :(millis() - last);
+
+Serial.print(F(" NTPsync="));
+Serial.print(ntpLan.lastSyncOk() ? F("OK") :F("FAIL"));
+Serial.print(F(" ago="));
+if (ago == 0xFFFFFFFFUL) Serial.println(F("never"));
+else {
+ Serial.print(ago / 1000);
+ Serial.println(F("s"));
+}
+Если при компиляции ругнётся на Ethernet.linkStatus()/LinkON — значит ваша Ethernet‑библиотека 
+не поддерживает linkStatus. Тогда скажите,какая библиотека установлена (Ethernet/Ethernet2/Ethernet3/другая),
+и я дам вариант проверки link через W5500 регистры 
+(через W5500.readPHYCFGR()),который работает почти всегда.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Вывод логичный:
+
+LINK=N/A означает,что ваша текущая Ethernet‑библиотека не предоставляет Ethernet.linkStatus() 
+(поэтому макроса ETHERNET_LINK_STATUS нет).
+NTPsync=FAIL lastMs=4453 у вас сейчас показывает,что ответ от внешнего NTP не пришёл 
+(а lastMs — это время последней попытки/отправки,а не “последнего успеха”).
+Ниже — как сделать (1) чтение LINK для W5500 без Ethernet.linkStatus() и (2)
+ нормальную диагностику/причины FAIL,и (3) “последняя успешная синхронизация”.
+
+1) LINK‑статус через W5500 PHYCFGR (работает без Ethernet.linkStatus)
+Попробуйте добавить в .ino:
+
+cpp Копировать
+#include <utility/w5100.h> // в Ethernet/Ethernet2 обычно есть
+
+static const char* wizLinkStr()
+{
+#if defined(W5500)
+ // W5500 PHYCFGR bit0 = LNK (1=up)
+ uint8_t phy = W5100.readPHYCFGR();
+ return (phy & 0x01) ? "ON" :"OFF";
+#else
+ return "N/A";
+#endif
+}
+И в вашем printEthernetNtpStatus1Hz() замените блок LINK на:
+
+cpp Копировать
+Serial.print(F(" LINK="));
+Serial.print(wizLinkStr());
+Если #include <utility/w5100.h> не находится — скажите,какая именно библиотека Ethernet стоит (Ethernet/Ethernet2/Ethernet3/WIZnet/W5500_Lite),и я дам точный include/вызов для неё.
+
+2) Почему NTPsync=FAIL (типовые причины) и быстрая проверка
+Самые частые причины,когда IP есть,а NTP не отвечает:
+
+нет физического линка (кабель/порт/автосогласование) → проверьте wizLinkStr() выше.
+маршрутизация/шлюз/маска неверные → проверьте:
+GW = 192.168.1.1
+MASK = 255.255.255.0
+UDP/123 блокируется роутером/провайдером (часто бывает).
+Выбранный upstream NTP IP недоступен/ограничивает запросы.
+Проверка “не в коде”:с ПК в этой же сети
+С ПК попробуйте:
+
+ntpdate -q 129.6.15.28 (Linux) или любая утилита NTP
+либо “Time sync” утилитой на Windows к этому IP Если ПК тоже не может — проблема не в STM32.
+Быстро сменить upstream IP
+Поставьте,например,Cloudflare (часто доступен):
+
+162.159.200.123
+162.159.200.1
+или NIST:
+
+129.6.15.28
+132.163.96.1
+3) “Время последней успешной синхронизации”
+Сейчас lastSyncMs() у вас обновляется при отправке запроса,поэтому всегда одно и то же,пока ответ не пришёл.
+
+Правильнее иметь два времени:
+
+lastAttemptMs (последняя попытка)
+lastSuccessMs (последний успех)
+Мини‑патч в NtpLanService
+В NtpLanService.h добавьте:
+
+cpp Копировать
+uint32_t lastAttemptMs() const { return _lastAttemptMs; }
+uint32_t lastSuccessMs() const { return _lastSuccessMs; }
+В private добавьте:
+
+cpp Копировать
+uint32_t _lastAttemptMs = 0;
+uint32_t _lastSuccessMs = 0;
+В handleSyncClient()
+
+при отправке запроса:
+cpp Копировать
+_lastAttemptMs = now;
+_lastSyncOk = false;
+при успешном применении времени:
+cpp Копировать
+_lastSyncOk = true;
+_lastSuccessMs = millis();
+И в Serial печатайте именно lastSuccessMs() (или “never”,если 0).
+
+4) Мини‑диагностика прямо в NtpLanService (очень полезно)
+На время отладки добавьте в handleSyncClient() после parsePacket():
+
+cpp Копировать
+int sz = _udpCli.parsePacket();
+if (sz > 0) {
+ Serial.print("[NTP-CLI] got packet size=");
+ Serial.print(sz);
+ Serial.print(" from ");
+ Serial.print(_udpCli.remoteIP());
+ Serial.print(":");
+ Serial.println(_udpCli.remotePort());
+}
+Если пакеты вообще не приходят — значит блокируется/не маршрутизируется/линк down.
+
+Если скажете,какую Ethernet-библиотеку используете (точное название из Arduino IDE → 
+Sketch → Include Library или папка в libraries),я подберу 100% рабочий вариант LINK‑статуса для W5500 и при 
+необходимости поправлю init (Ethernet.init(csPin)/SPI settings) под неё.
+
+
+81.6.42.224     193.5.216.14     2 u   68 1024  377  158.995   51.220  50.287
+*217.162.232.173 130.149.17.8     2 u  191 1024  176   79.245    3.589  27.454
+-129.132.57.95   131.188.3.222    3 u  766 1024  377   22.302   -2.928   0.508
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — адаптация под ваш проект Ethernet_Generic (W5500):локальный NTP‑server (UDP/123) + синхронизация
+ DS3231SN из интернета (SNTP‑client).
+
+Ключевое:используем ваш defines.h (Ethernet_Generic + custom SPI pins PA5/PA6/PA7,CS=PA4). 
+Время для LAN отдаём из DS3231SN,а синхронизацию DS3231 делаем из внешнего NTP (UTC),переводим в локальный TZ cfg.tzTargetHours.
+
+1) Файлы сервиса NTP для Ethernet_Generic
+NtpLanService_Generic.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+#include "defines.h" // <-- ваш Ethernet_Generic + SPI_New + USE_THIS_SS_PIN + SerialDebug
+#include "RTCSupport.h"
+#include "AT24C128Settings.h"
+
+#include <EthernetUdp.h> // в Ethernet_Generic обычно есть
+// если не находится,замените на:#include <Ethernet_Generic.hpp> (зависит от версии)
+
+class NtpLanService_Generic {
+public:
+ struct NetConfig {
+ // MAC можно взять из вашего mac[][] в defines.h (индекс)
+ uint16_t macIndex = 0;
+
+ // если DHCP не нужен — задайте статический IP
+ bool useDhcp = true;
+
+ IPAddress ip = IPAddress(192,168,1,50);
+ IPAddress dns = IPAddress(192,168,1,1);
+ IPAddress gw = IPAddress(192,168,1,1);
+ IPAddress mask = IPAddress(255,255,255,0);
+
+ // внешний NTP (лучше IP,чтобы не зависеть от DNS)
+ IPAddress upstreamIp = IPAddress(162,159,200,123); // Cloudflare NTP
+ uint16_t upstreamPort = 123;
+
+ uint32_t syncPeriodMs = 3600000UL; // 1 час
+ };
+
+ NtpLanService_Generic(RealtimeClock& rtc,AT24C128Settings::Config& cfg);
+
+ bool begin(const NetConfig& net);
+ void tick(); // вызывать часто
+ void forceSyncNow();
+
+ // статус
+ bool lastSyncOk() const { return _lastSyncOk; }
+ uint32_t lastAttemptMs() const { return _lastAttemptMs; }
+ uint32_t lastSuccessMs() const { return _lastSuccessMs; }
+
+private:
+ RealtimeClock& _rtc;
+ AT24C128Settings::Config& _cfg;
+
+ EthernetUDP _udpSrv;
+ EthernetUDP _udpCli;
+
+ NetConfig _net;
+
+ static const uint16_t NTP_PORT = 123;
+
+ bool _syncRequested = false;
+ uint32_t _nextSyncMs = 0;
+
+ bool _lastSyncOk = false;
+ uint32_t _lastAttemptMs = 0;
+ uint32_t _lastSuccessMs = 0;
+
+ void handleNtpServer();
+ void handleSyncClient();
+
+ // time conversions
+ static uint32_t unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours);
+ static void rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal);
+
+ // NTP helpers
+ static void buildNtpResponse(uint8_t* out48,
+ uint32_t rxSeconds1900,uint32_t rxFrac,
+ uint32_t txSeconds1900,uint32_t txFrac,
+ const uint8_t* clientRequest48);
+
+ static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + 2208988800UL; }
+ static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - 2208988800UL; }
+
+ static uint32_t millisToFrac(uint32_t ms) {
+ return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+ }
+};
+NtpLanService_Generic.cpp
+cpp Копировать
+#include "NtpLanService_Generic.h"
+
+NtpLanService_Generic::NtpLanService_Generic(RealtimeClock& rtc,AT24C128Settings::Config& cfg)
+:_rtc(rtc),_cfg(cfg) {}
+
+bool NtpLanService_Generic::begin(const NetConfig& net)
+{
+ _net = net;
+
+ // Важно для SPI:CS всех остальных устройств HIGH до Ethernet.init/begin
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+
+ uint16_t idx = _net.macIndex % NUMBER_OF_MAC;
+
+ bool ok = false;
+ if (_net.useDhcp) {
+ ok = Ethernet.begin(mac[idx]);
+ if (!ok) {
+ SerialDebug.println(F("[ETH] DHCP failed,fallback to static"));
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask);
+ ok = true;
+ }
+ } else {
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask);
+ ok = true;
+ }
+
+ if (!ok) return false;
+
+ if (_udpSrv.begin(NTP_PORT) == 0) return false;
+ _udpCli.begin(0);
+
+ _syncRequested = true;
+ _nextSyncMs = millis(); // сразу пробовать
+ return true;
+}
+
+void NtpLanService_Generic::forceSyncNow()
+{
+ _syncRequested = true;
+ _nextSyncMs = millis();
+}
+
+void NtpLanService_Generic::tick()
+{
+ handleNtpServer();
+ handleSyncClient();
+
+ // поддержка DHCP lease (если DHCP)
+ if (_net.useDhcp) Ethernet.maintain();
+}
+
+// ---------------- NTP SERVER ----------------
+void NtpLanService_Generic::handleNtpServer()
+{
+ int packetSize = _udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = _udpSrv.read(req,sizeof(req));
+ if (n < 48) return;
+
+ // текущее UTC из RTC (RTC хранит local target TZ)
+ RTCTime tLocal = _rtc.getTime();
+ uint32_t unixUtc = unixFromRtcLocal(tLocal,_cfg.tzTargetHours);
+
+ uint32_t txSec1900 = unixToNtp1900(unixUtc);
+ uint32_t txFrac = millisToFrac(millis() % 1000);
+
+ uint32_t rxSec1900 = txSec1900;
+ uint32_t rxFrac = txFrac;
+
+ uint8_t resp[48];
+ buildNtpResponse(resp,rxSec1900,rxFrac,txSec1900,txFrac,req);
+
+ _udpSrv.beginPacket(_udpSrv.remoteIP(),_udpSrv.remotePort());
+ _udpSrv.write(resp,48);
+ _udpSrv.endPacket();
+}
+
+// ---------------- NTP CLIENT (INTERNET SYNC) ----------------
+void NtpLanService_Generic::handleSyncClient()
+{
+ uint32_t now = millis();
+
+ if (_syncRequested || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncRequested = false;
+ _nextSyncMs = now + _net.syncPeriodMs;
+
+ // SNTP request
+ uint8_t pkt[48] = {0};
+ pkt[0] = 0b11100011; // LI=3,VN=4,Mode=3
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ _udpCli.beginPacket(_net.upstreamIp,_net.upstreamPort);
+ _udpCli.write(pkt,48);
+ _udpCli.endPacket();
+
+ _lastAttemptMs = now;
+ _lastSyncOk = false;
+ }
+
+ // ответ неблокирующе
+ int sz = _udpCli.parsePacket();
+
+ // --- диагностика (можно убрать после отладки) ---
+ if (sz > 0) {
+ SerialDebug.print(F("[NTP-CLI] got packet size="));
+ SerialDebug.print(sz);
+ SerialDebug.print(F(" from "));
+ IPAddress rip = _udpCli.remoteIP();
+ SerialDebug.print(rip[0]); SerialDebug.print('.');
+ SerialDebug.print(rip[1]); SerialDebug.print('.');
+ SerialDebug.print(rip[2]); SerialDebug.print('.');
+ SerialDebug.print(rip[3]);
+ SerialDebug.print(':');
+ SerialDebug.println(_udpCli.remotePort());
+ }
+
+ if (sz < 48) return;
+
+ uint8_t resp[48];
+ int n = _udpCli.read(resp,48);
+ if (n < 48) return;
+
+ // transmit timestamp bytes 40..43
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) | ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 < 2208988800UL) return;
+
+ uint32_t unixUtc = ntp1900ToUnix(sec1900);
+
+ RTCTime tLocal;
+ rtcLocalFromUnix(unixUtc,_cfg.tzTargetHours,tLocal);
+
+ _rtc.setTime(tLocal.second,tLocal.minute,tLocal.hour,
+ tLocal.dayOfWeek,tLocal.dayOfMonth,tLocal.month,tLocal.year);
+
+ _lastSyncOk = true;
+ _lastSuccessMs = millis();
+}
+
+// ---------------- NTP packet builder ----------------
+void NtpLanService_Generic::buildNtpResponse(uint8_t* out48,
+ uint32_t rxSeconds1900,uint32_t rxFrac,
+ uint32_t txSeconds1900,uint32_t txFrac,
+ const uint8_t* clientRequest48)
+{
+ memset(out48,0,48);
+
+ // LI=0,VN=4,Mode=4 (server)
+ out48[0] = (0 << 6) | (4 << 3) | (4);
+ out48[1] = 1;
+ out48[2] = 6;
+ out48[3] = (uint8_t)-20;
+
+ // RefID "LOCL"
+ out48[12]='L'; out48[13]='O'; out48[14]='C'; out48[15]='L';
+
+ // Originate = client's transmit (40..47)
+ memcpy(&out48[24],&clientRequest48[40],8);
+
+ // Receive
+ out48[32]=(rxSeconds1900>>24)&0xFF;
+ out48[33]=(rxSeconds1900>>16)&0xFF;
+ out48[34]=(rxSeconds1900>>8)&0xFF;
+ out48[35]=(rxSeconds1900)&0xFF;
+ out48[36]=(rxFrac>>24)&0xFF;
+ out48[37]=(rxFrac>>16)&0xFF;
+ out48[38]=(rxFrac>>8)&0xFF;
+ out48[39]=(rxFrac)&0xFF;
+
+ // Transmit
+ out48[40]=(txSeconds1900>>24)&0xFF;
+ out48[41]=(txSeconds1900>>16)&0xFF;
+ out48[42]=(txSeconds1900>>8)&0xFF;
+ out48[43]=(txSeconds1900)&0xFF;
+ out48[44]=(txFrac>>24)&0xFF;
+ out48[45]=(txFrac>>16)&0xFF;
+ out48[46]=(txFrac>>8)&0xFF;
+ out48[47]=(txFrac)&0xFF;
+}
+
+// ---------------- RTC local<->UTC ----------------
+uint32_t NtpLanService_Generic::unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours)
+{
+ auto daysFromCivil = [](int y,int m,int d)->int32_t {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+ };
+
+ int32_t days = daysFromCivil((int)t.year,(int)t.month,(int)t.dayOfMonth);
+ int64_t local = (int64_t)days * 86400LL + (int64_t)t.hour*3600LL + (int64_t)t.minute*60LL + (int64_t)t.second;
+
+ int64_t utc = local - (int64_t)tzTargetHours * 3600LL;
+ if (utc < 0) utc = 0;
+ return (uint32_t)utc;
+}
+
+void NtpLanService_Generic::rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal)
+{
+ int64_t t = (int64_t)unixUtc + (int64_t)tzTargetHours * 3600LL;
+
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+
+ auto civilFromDays = [](int32_t z,int &y,int &m,int &d){
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+ };
+
+ int y,mo,d;
+ civilFromDays((int32_t)days,y,mo,d);
+
+ int hh = (int)(rem / 3600LL); rem %= 3600LL;
+ int mm = (int)(rem / 60LL);
+ int ss = (int)(rem % 60LL);
+
+ outLocal.year = (uint16_t)y;
+ outLocal.month = (uint8_t)mo;
+ outLocal.dayOfMonth = (uint8_t)d;
+ outLocal.hour = (uint8_t)hh;
+ outLocal.minute = (uint8_t)mm;
+ outLocal.second = (uint8_t)ss;
+
+ // DOW:1=Mon..7=Sun
+ static int tt[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ int yy = y;
+ if (mo < 3) yy -= 1;
+ uint8_t dow0 = (uint8_t)((yy + yy/4 - yy/100 + yy/400 + tt[mo-1] + d) % 7);
+ outLocal.dayOfWeek = (dow0 == 0) ? 7 :dow0;
+}
+2) Как включить в ваш проект (.ino)
+2.1. Добавьте include и глобальный объект
+cpp Копировать
+#include "NtpLanService_Generic.h"
+NtpLanService_Generic ntpLan(rtc,cfg);
+2.2. В setup() после загрузки cfg и после Wire.begin(); rtc.begin();
+cpp Копировать
+NtpLanService_Generic::NetConfig net;
+net.macIndex = 0; // можно хранить в EEPROM позже
+net.useDhcp = true; // как в примере Ethernet_Generic
+
+// если хотите статический:
+/// net.useDhcp = false;
+/// net.ip = IPAddress(192,168,1,50);
+/// net.gw = IPAddress(192,168,1,1);
+/// net.mask = IPAddress(255,255,255,0);
+/// net.dns = IPAddress(8,8,8,8);
+
+net.upstreamIp = IPAddress(162,159,200,123);
+net.syncPeriodMs = 3600000UL;
+
+bool ok = ntpLan.begin(net);
+SerialDebug.print(F("[ETH] NTP LAN service:"));
+SerialDebug.println(ok ? F("OK") :F("FAIL"));
+
+ntpLan.forceSyncNow();
+2.3. В loop()
+cpp Копировать
+ntpLan.tick();
+3) Serial вывод (IP + Link report + last success)
+Добавьте в .ino:
+
+cpp Копировать
+static void printEthGenericStatus1Hz(NtpLanService_Generic& ntp)
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ IPAddress ip = Ethernet.localIP();
+ SerialDebug.print(F("[ETH] IP="));
+ SerialDebug.print(ip);
+
+ SerialDebug.print(F(" Link="));
+ // Ethernet_Generic умеет linkReport() (у вас в примере)
+ SerialDebug.print(Ethernet.linkReport());
+
+ SerialDebug.print(F(" Speed="));
+ SerialDebug.print(Ethernet.speedReport());
+
+ SerialDebug.print(F(" Duplex="));
+ SerialDebug.print(Ethernet.duplexReport());
+
+ SerialDebug.print(F(" NTP="));
+ SerialDebug.print(ntp.lastSyncOk() ? F("OK") :F("FAIL"));
+
+ SerialDebug.print(F(" attemptMs="));
+ SerialDebug.print(ntp.lastAttemptMs());
+
+ SerialDebug.print(F(" successMs="));
+ uint32_t s = ntp.lastSuccessMs();
+ if (s == 0) SerialDebug.println(F("never"));
+ else { SerialDebug.println(s); }
+}
+И вызывайте в loop():
+
+cpp Копировать
+printEthGenericStatus1Hz(ntpLan);
+4) Что важно в вашем проекте (SPI)
+Так как у вас есть TFT/SD на SPI,перед Ethernet.init/begin обязательно держать CS всех устройств в HIGH,иначе W5500 может не отвечать.
+
+W5500 CS = PA4 (у вас)
+TFT CS и SD CS — выставить HIGH до запуска Ethernet.
+Если напишете,какие CS у TFT и SD (и на каком SPI они реально висят),я дам конкретные строки pinMode(...); digitalWrite(...,HIGH);
+ чтобы исключить конфликт SPI на старте.
+ 
+ //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ Эти ошибки означают,что в сборку одновременно попали две разные Ethernet‑библиотеки:
+
+стандартная Ethernet.h / EthernetUdp.h
+и Ethernet_Generic (Ethernet_Generic.hpp)
+Они обе объявляют EthernetClass,EthernetUDP,EthernetLinkStatus и т.д.,поэтому получаете redefinition / multiple definition.
+
+Нужно ли держать в проекте файлы NtpLanService?
+Да,но только один вариант. В вашем проекте,где вы используете Ethernet_Generic + defines.h,вам нужен только вариант под Ethernet_Generic.
+
+То есть:
+
+Удалить/не использовать старые файлы NtpLanService.h / NtpLanService.cpp (те,что включают <Ethernet.h>).
+Оставить и подключать только NtpLanService_Generic.h / NtpLanService_Generic.cpp 
+(которые включают ваш defines.h и используют Ethernet_Generic).
+Сейчас компилятор показывает,что вы компилируете именно старый NtpLanService.h,где есть #include <Ethernet.h>.
+
+Что сделать точно (пошагово)
+Шаг 1. Уберите старые файлы
+В папке скетча (где .ino) сделайте одно из двух:
+
+Вариант A (лучше): Удалите из проекта/папки:
+
+NtpLanService.h
+NtpLanService.cpp
+Вариант B: Переименуйте их,например в:
+
+NtpLanService_old.h/.cpp
+Чтобы Arduino IDE не подхватывала их при сборке.
+
+Arduino IDE компилирует все .cpp в папке скетча,даже если вы их не #include.
+
+Шаг 2. Подключайте только Ethernet_Generic версию
+В .ino должно быть:
+
+cpp Копировать
+#include "defines.h" // ваш Ethernet_Generic
+#include "NtpLanService_Generic.h" // только этот сервис
+И нигде в проекте НЕ должно быть:
+
+cpp Копировать
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+Шаг 3. В NtpLanService_Generic.h НЕ подключайте стандартные Ethernet заголовки
+Если у вас там сейчас есть #include <Ethernet.h> или #include <EthernetUdp.h> — уберите.
+
+Правильно так:
+
+cpp Копировать
+#include "defines.h" // тут уже подключается Ethernet_Generic.h
+#include <EthernetUdp.h> // ВНИМАНИЕ:это может тянуть стандартную EthernetUdp!
+Чтобы не ловить конфликт,делаем безопасно:не включаем EthernetUdp.h вообще,а используем
+ EthernetUDP,который уже определён в Ethernet_Generic.
+
+То есть в NtpLanService_Generic.h оставьте просто:
+
+cpp Копировать
+#include "defines.h"
+и используйте EthernetUDP (он есть в Ethernet_Generic).
+
+Почему ошибка у вас именно сейчас
+В логе:
+
+EthernetUdp.h ... included from NtpLanService.h
+Ethernet_Generic.hpp ... multiple definition ... previous definition in Ethernet.h
+Это 100% означает:в сборку попал NtpLanService.h,который включает стандартные Ethernet.h/EthernetUdp.h.
+
+Быстрая проверка
+После удаления NtpLanService.h/.cpp пересоберите. Если ошибки redefinition EthernetClass исчезли — значит всё сделано правильно.
+
+Если хотите — пришлите список файлов в папке скетча (10–20 строк) и какие NTP файлы у вас реально лежат там,я скажу конкретно какие
+ удалить/переименовать,чтобы Arduino IDE их не компилировала.
+ 
+ //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ Ошибки линковки multiple definition у вас из‑за того,что вы используете Ethernet_Generic примерный defines.h,который создаёт глобальные объекты (SPI_New,mac[][],ip,myDns и т.п.). Как только этот defines.h попадает в два .cpp,линкер видит две одинаковые копии и падает.
+
+Сейчас defines.h попадает:
+
+в ваш основной .ino (он компилируется в Ver....cpp.o)
+и в NtpLanService_Generic.cpp (второй объектный файл)
+Отсюда:
+
+multiple definition of SPI_New
+multiple definition of Ethernet,W5100,DhcpClass,...
+multiple definition of mac / ip / myDns
+Нужно ли оставлять файлы NtpLanService в проекте?
+Да,но нельзя собирать Ethernet_Generic через defines.h в нескольких единицах трансляции. Самый простой и правильный вариант для Arduino IDE:
+
+Решение:сделать NTP‑сервис “header-only” и удалить .cpp
+То есть:
+
+оставить только NtpLanService_Generic.h (в котором будет и объявление и реализация),
+удалить/переименовать NtpLanService_Generic.cpp,чтобы Arduino IDE его не компилировала.
+Тогда defines.h будет включён только в .ino,и конфликтов не будет.
+
+Что сделать точно (шаги)
+1) Удалите/переименуйте файл
+В папке скетча переименуйте:
+
+NtpLanService_Generic.cpp → NtpLanService_Generic.cpp.off (или удалите)
+Arduino IDE компилирует все .cpp в папке скетча — нам нужно,чтобы он не компилировался.
+
+2) Замените NtpLanService_Generic.h на header-only версию
+Сделайте так,чтобы NtpLanService_Generic.h не подключал defines.h сам,а предполагал,что вы подключили defines.h в .ino до него.
+
+В .ino порядок include должен быть:
+
+cpp Копировать
+#include "defines.h" // Ethernet_Generic + SPI_New + mac[] + ...
+#include "NtpLanService_Generic.h" // header-only сервис
+3) Убедитесь,что НИГДЕ больше defines.h не включается
+То есть не включайте defines.h внутри других .cpp/.h (кроме .ino).
+
+Готовая header-only версия NtpLanService_Generic.h
+Скопируйте этот файл целиком (и как сказано выше — без .cpp):
+
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// ВАЖНО:этот заголовок должен подключаться ПОСЛЕ "defines.h"
+// т.к. defines.h создаёт SPI_New / mac[][] и включает Ethernet_Generic.h
+
+#include "RTCSupport.h"
+#include "AT24C128Settings.h"
+
+class NtpLanService_Generic {
+public:
+ struct NetConfig {
+ uint16_t macIndex = 0;
+ bool useDhcp = true;
+
+ IPAddress ip = IPAddress(192,168,1,50);
+ IPAddress dns = IPAddress(192,168,1,1);
+ IPAddress gw = IPAddress(192,168,1,1);
+ IPAddress mask = IPAddress(255,255,255,0);
+
+ IPAddress upstreamIp = IPAddress(162,159,200,123);
+ uint16_t upstreamPort = 123;
+
+ uint32_t syncPeriodMs = 3600000UL;
+ };
+
+ NtpLanService_Generic(RealtimeClock& rtc,AT24C128Settings::Config& cfg)
+ :_rtc(rtc),_cfg(cfg) {}
+
+ bool begin(const NetConfig& net) {
+ _net = net;
+
+ // SPI CS для W5500 (из defines.h)
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+
+ uint16_t idx = _net.macIndex % NUMBER_OF_MAC;
+
+ if (_net.useDhcp) {
+ bool ok = Ethernet.begin(mac[idx]);
+ if (!ok) {
+ SerialDebug.println(F("[ETH] DHCP failed,fallback to static"));
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask);
+ }
+ } else {
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask);
+ }
+
+ if (_udpSrv.begin(NTP_PORT) == 0) return false;
+ _udpCli.begin(0);
+
+ _syncRequested = true;
+ _nextSyncMs = millis();
+ return true;
+ }
+
+ void tick() {
+ handleNtpServer();
+ handleSyncClient();
+ if (_net.useDhcp) Ethernet.maintain();
+ }
+
+ void forceSyncNow() {
+ _syncRequested = true;
+ _nextSyncMs = millis();
+ }
+
+ bool lastSyncOk() const { return _lastSyncOk; }
+ uint32_t lastAttemptMs() const { return _lastAttemptMs; }
+ uint32_t lastSuccessMs() const { return _lastSuccessMs; }
+
+private:
+ RealtimeClock& _rtc;
+ AT24C128Settings::Config& _cfg;
+
+ EthernetUDP _udpSrv;
+ EthernetUDP _udpCli;
+
+ NetConfig _net;
+
+ static const uint16_t NTP_PORT = 123;
+
+ bool _syncRequested = false;
+ uint32_t _nextSyncMs = 0;
+
+ bool _lastSyncOk = false;
+ uint32_t _lastAttemptMs = 0;
+ uint32_t _lastSuccessMs = 0;
+
+ static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + 2208988800UL; }
+ static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - 2208988800UL; }
+
+ static uint32_t millisToFrac(uint32_t ms) {
+ return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+ }
+
+ void handleNtpServer() {
+ int packetSize = _udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = _udpSrv.read(req,sizeof(req));
+ if (n < 48) return;
+
+ RTCTime tLocal = _rtc.getTime();
+ uint32_t unixUtc = unixFromRtcLocal(tLocal,_cfg.tzTargetHours);
+
+ uint32_t txSec1900 = unixToNtp1900(unixUtc);
+ uint32_t txFrac = millisToFrac(millis() % 1000);
+
+ uint8_t resp[48];
+ buildNtpResponse(resp,txSec1900,txFrac,req);
+
+ _udpSrv.beginPacket(_udpSrv.remoteIP(),_udpSrv.remotePort());
+ _udpSrv.write(resp,48);
+ _udpSrv.endPacket();
+ }
+
+ void handleSyncClient() {
+ uint32_t now = millis();
+
+ if (_syncRequested || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncRequested = false;
+ _nextSyncMs = now + _net.syncPeriodMs;
+
+ uint8_t pkt[48] = {0};
+ pkt[0] = 0b11100011; // LI=3,VN=4,Mode=3
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ _udpCli.beginPacket(_net.upstreamIp,_net.upstreamPort);
+ _udpCli.write(pkt,48);
+ _udpCli.endPacket();
+
+ _lastAttemptMs = now;
+ _lastSyncOk = false;
+ }
+
+ int sz = _udpCli.parsePacket();
+ if (sz > 0) {
+ SerialDebug.print(F("[NTP-CLI] got packet size="));
+ SerialDebug.print(sz);
+ SerialDebug.print(F(" from "));
+ SerialDebug.print(_udpCli.remoteIP());
+ SerialDebug.print(':');
+ SerialDebug.println(_udpCli.remotePort());
+ }
+ if (sz < 48) return;
+
+ uint8_t resp[48];
+ int n = _udpCli.read(resp,48);
+ if (n < 48) return;
+
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 < 2208988800UL) return;
+
+ uint32_t unixUtc = ntp1900ToUnix(sec1900);
+
+ RTCTime tLocal;
+ rtcLocalFromUnix(unixUtc,_cfg.tzTargetHours,tLocal);
+
+ _rtc.setTime(tLocal.second,tLocal.minute,tLocal.hour,
+ tLocal.dayOfWeek,tLocal.dayOfMonth,tLocal.month,tLocal.year);
+
+ _lastSyncOk = true;
+ _lastSuccessMs = millis();
+ }
+
+ static void buildNtpResponse(uint8_t* out48,uint32_t txSec1900,uint32_t txFrac,const uint8_t* req48) {
+ memset(out48,0,48);
+ out48[0] = (0 << 6) | (4 << 3) | (4); // server
+ out48[1] = 1;
+ out48[2] = 6;
+ out48[3] = (uint8_t)-20;
+ out48[12]='L'; out48[13]='O'; out48[14]='C'; out48[15]='L';
+
+ // Originate = client's transmit
+ memcpy(&out48[24],&req48[40],8);
+
+ // Receive (упростим = Transmit)
+ out48[32]=(txSec1900>>24)&0xFF;
+ out48[33]=(txSec1900>>16)&0xFF;
+ out48[34]=(txSec1900>>8)&0xFF;
+ out48[35]=(txSec1900)&0xFF;
+ out48[36]=(txFrac>>24)&0xFF;
+ out48[37]=(txFrac>>16)&0xFF;
+ out48[38]=(txFrac>>8)&0xFF;
+ out48[39]=(txFrac)&0xFF;
+
+ // Transmit
+ out48[40]=(txSec1900>>24)&0xFF;
+ out48[41]=(txSec1900>>16)&0xFF;
+ out48[42]=(txSec1900>>8)&0xFF;
+ out48[43]=(txSec1900)&0xFF;
+ out48[44]=(txFrac>>24)&0xFF;
+ out48[45]=(txFrac>>16)&0xFF;
+ out48[46]=(txFrac>>8)&0xFF;
+ out48[47]=(txFrac)&0xFF;
+ }
+
+ static uint32_t unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours) {
+ auto daysFromCivil = [](int y,int m,int d)->int32_t {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+ };
+ int32_t days = daysFromCivil((int)t.year,(int)t.month,(int)t.dayOfMonth);
+ int64_t local = (int64_t)days*86400LL + (int64_t)t.hour*3600LL + (int64_t)t.minute*60LL + (int64_t)t.second;
+ int64_t utc = local - (int64_t)tzTargetHours*3600LL;
+ if (utc < 0) utc = 0;
+ return (uint32_t)utc;
+ }
+
+ static void rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal) {
+ int64_t t = (int64_t)unixUtc + (int64_t)tzTargetHours*3600LL;
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+
+ auto civilFromDays = [](int32_t z,int &y,int &m,int &d){
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+ };
+
+ int y,mo,d;
+ civilFromDays((int32_t)days,y,mo,d);
+
+ int hh = (int)(rem / 3600LL); rem %= 3600LL;
+ int mm = (int)(rem / 60LL);
+ int ss = (int)(rem % 60LL);
+
+ outLocal.year = (uint16_t)y;
+ outLocal.month = (uint8_t)mo;
+ outLocal.dayOfMonth = (uint8_t)d;
+ outLocal.hour = (uint8_t)hh;
+ outLocal.minute = (uint8_t)mm;
+ outLocal.second = (uint8_t)ss;
+
+ static int tt[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ int yy = y;
+ if (mo < 3) yy -= 1;
+ uint8_t dow0 = (uint8_t)((yy + yy/4 - yy/100 + yy/400 + tt[mo-1] + d) % 7);
+ outLocal.dayOfWeek = (dow0 == 0) ? 7 :dow0;
+ }
+};
+3) Пример использования в .ino
+cpp Копировать
+#include "defines.h"
+#include "NtpLanService_Generic.h"
+
+NtpLanService_Generic ntpLan(rtc,cfg);
+
+void setup() {
+ SerialDebug.begin(115200);
+ ...
+ NtpLanService_Generic::NetConfig net;
+ net.macIndex = 0;
+ net.useDhcp = true;
+ net.upstreamIp = IPAddress(162,159,200,123);
+ net.syncPeriodMs = 3600000UL;
+
+ bool ok = ntpLan.begin(net);
+ SerialDebug.println(ok ? "NTP LAN OK" :"NTP LAN FAIL");
+ ntpLan.forceSyncNow();
+}
+
+void loop() {
+ ntpLan.tick();
+}
+Почему так
+Ethernet_Generic примерный defines.h не предназначен для включения в несколько .cpp в одном проекте 
+(он определяет глобальные объекты). Поэтому либо:
+
+“header-only” как выше,
+либо переработка defines.h на extern + отдельный .cpp с определениями (дольше,но можно).
+Если вы хотите именно второй,«правильный библиотечный» вариант — скажите,и я дам комплект EthGlobals.h/.cpp,где 
+SPI_New/mac/ip/myDns будут определены только один раз.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Да. Ваши ошибки multiple definition — это классическая проблема “примерного” defines.h из Ethernet_Generic:он создаёт реальные объекты (SPI_New,mac[][],ip,myDns и т.п.) прямо в заголовке. Как только этот заголовок включается в более чем один .cpp,линкер падает.
+
+Вы просите “правильный библиотечный” вариант — делаем как положено:
+
+в .h — только объявления (extern)
+в одном .cpp — единственные определения
+И важно:чтобы Ethernet_Generic.h (который тянет реализацию) не попадал в несколько единиц трансляции. Поэтому мы полностью убираем defines.h из .ino и других .cpp,а Ethernet_Generic подключаем только там,где реально нужен Ethernet (в сервисе).
+
+Ниже готовый комплект.
+
+1) Новый модуль вместо defines.h
+EthConfig.h (только объявления/макросы)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <SPI.h>
+
+// --- Debug ---
+#define SerialDebug Serial
+#define DEBUG_ETHERNET_GENERIC_PORT SerialDebug
+#define _ETG_LOGLEVEL_ 2
+
+// --- W5500 pins (SPI1) ---
+#define USE_THIS_SS_PIN PA4
+
+// Custom SPI pins for STM32F1
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+#define CUR_PIN_SS PA4
+
+// Экземпляр SPI для Ethernet_Generic (ОБЪЯВЛЕНИЕ)
+extern SPIClass SPI_New;
+
+// MAC pool (ОБЪЯВЛЕНИЯ)
+extern const uint16_t NUMBER_OF_MAC;
+extern byte mac[][6];
+
+// Default static IP options (ОБЪЯВЛЕНИЯ)
+extern IPAddress ip;
+extern IPAddress myDns;
+EthConfig.cpp (единственные определения)
+cpp Копировать
+#include "EthConfig.h"
+
+// ВАЖНО:НЕ подключать сюда Ethernet_Generic.h / Ethernet_Generic.hpp
+
+const uint16_t NUMBER_OF_MAC = 20;
+
+// Определяем SPI_New один раз
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+
+// MAC pool
+byte mac[][6] =
+{
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x01 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x02 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x03 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x04 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x05 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x06 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x07 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x08 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x09 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x0A },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x0B },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x0C },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x0D },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x0E },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x0F },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x10 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x11 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x12 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x13 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x14 },
+};
+
+// Default IPs (если захотите static)
+IPAddress ip(192,168,75,180);
+IPAddress myDns(8,8,8,8);
+2) Обновлённый NTP LAN сервис под Ethernet_Generic (без defines.h)
+NtpLanService_Generic.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+#include "EthConfig.h"
+#include "RTCSupport.h"
+#include "AT24C128Settings.h"
+
+// Ethernet_Generic подключаем ТОЛЬКО здесь (и больше нигде в проекте не подключать!)
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+
+class NtpLanService_Generic {
+public:
+ struct NetConfig {
+ uint16_t macIndex = 0;
+ bool useDhcp = true;
+
+ IPAddress ip = IPAddress(192,168,1,50);
+ IPAddress dns = IPAddress(192,168,1,1);
+ IPAddress gw = IPAddress(192,168,1,1);
+ IPAddress mask = IPAddress(255,255,255,0);
+
+ IPAddress upstreamIp = IPAddress(162,159,200,123);
+ uint16_t upstreamPort = 123;
+
+ uint32_t syncPeriodMs = 3600000UL;
+ };
+
+ NtpLanService_Generic(RealtimeClock& rtc,AT24C128Settings::Config& cfg);
+
+ bool begin(const NetConfig& net);
+ void tick();
+ void forceSyncNow();
+
+ // статус для Serial
+ void printStatus1Hz();
+
+ bool lastSyncOk() const { return _lastSyncOk; }
+ uint32_t lastAttemptMs() const { return _lastAttemptMs; }
+ uint32_t lastSuccessMs() const { return _lastSuccessMs; }
+
+private:
+ RealtimeClock& _rtc;
+ AT24C128Settings::Config& _cfg;
+
+ EthernetUDP _udpSrv;
+ EthernetUDP _udpCli;
+
+ NetConfig _net;
+
+ static const uint16_t NTP_PORT = 123;
+
+ bool _syncRequested = false;
+ uint32_t _nextSyncMs = 0;
+
+ bool _lastSyncOk = false;
+ uint32_t _lastAttemptMs = 0;
+ uint32_t _lastSuccessMs = 0;
+
+ void handleNtpServer();
+ void handleSyncClient();
+
+ static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + 2208988800UL; }
+ static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - 2208988800UL; }
+ static uint32_t millisToFrac(uint32_t ms) { return (uint32_t)(((uint64_t)ms << 32) / 1000ULL); }
+
+ static void buildNtpResponse(uint8_t* out48,uint32_t txSec1900,uint32_t txFrac,const uint8_t* req48);
+
+ static uint32_t unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours);
+ static void rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal);
+};
+NtpLanService_Generic.cpp
+cpp Копировать
+#include "NtpLanService_Generic.h"
+
+NtpLanService_Generic::NtpLanService_Generic(RealtimeClock& rtc,AT24C128Settings::Config& cfg)
+:_rtc(rtc),_cfg(cfg) {}
+
+bool NtpLanService_Generic::begin(const NetConfig& net)
+{
+ _net = net;
+
+ // Важно:CS W5500
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+
+ uint16_t idx = _net.macIndex % NUMBER_OF_MAC;
+
+ if (_net.useDhcp) {
+ bool ok = Ethernet.begin(mac[idx],&SPI_New);
+ if (!ok) {
+ SerialDebug.println(F("[ETH] DHCP failed,fallback to static"));
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask,&SPI_New);
+ }
+ } else {
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask,&SPI_New);
+ }
+
+ if (_udpSrv.begin(NTP_PORT) == 0) return false;
+ _udpCli.begin(0);
+
+ _syncRequested = true;
+ _nextSyncMs = millis();
+ return true;
+}
+
+void NtpLanService_Generic::forceSyncNow()
+{
+ _syncRequested = true;
+ _nextSyncMs = millis();
+}
+
+void NtpLanService_Generic::tick()
+{
+ handleNtpServer();
+ handleSyncClient();
+ if (_net.useDhcp) Ethernet.maintain();
+}
+
+void NtpLanService_Generic::printStatus1Hz()
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ SerialDebug.print(F("[ETH] IP="));
+ SerialDebug.print(Ethernet.localIP());
+
+ SerialDebug.print(F(" Link="));
+ SerialDebug.print(Ethernet.linkReport());
+ SerialDebug.print(F(" Speed="));
+ SerialDebug.print(Ethernet.speedReport());
+ SerialDebug.print(F(" Duplex="));
+ SerialDebug.print(Ethernet.duplexReport());
+
+ SerialDebug.print(F(" NTP="));
+ SerialDebug.print(_lastSyncOk ? F("OK") :F("FAIL"));
+
+ SerialDebug.print(F(" attemptMs="));
+ SerialDebug.print(_lastAttemptMs);
+
+ SerialDebug.print(F(" successMs="));
+ if (_lastSuccessMs == 0) SerialDebug.println(F("never"));
+ else SerialDebug.println(_lastSuccessMs);
+}
+
+void NtpLanService_Generic::handleNtpServer()
+{
+ int packetSize = _udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = _udpSrv.read(req,48);
+ if (n < 48) return;
+
+ RTCTime tLocal = _rtc.getTime();
+ uint32_t unixUtc = unixFromRtcLocal(tLocal,_cfg.tzTargetHours);
+
+ uint32_t txSec1900 = unixToNtp1900(unixUtc);
+ uint32_t txFrac = millisToFrac(millis() % 1000);
+
+ uint8_t resp[48];
+ buildNtpResponse(resp,txSec1900,txFrac,req);
+
+ _udpSrv.beginPacket(_udpSrv.remoteIP(),_udpSrv.remotePort());
+ _udpSrv.write(resp,48);
+ _udpSrv.endPacket();
+}
+
+void NtpLanService_Generic::handleSyncClient()
+{
+ uint32_t now = millis();
+
+ if (_syncRequested || (int32_t)(now - _nextSyncMs) >= 0) {
+ _syncRequested = false;
+ _nextSyncMs = now + _net.syncPeriodMs;
+
+ uint8_t pkt[48] = {0};
+ pkt[0] = 0b11100011;
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ _udpCli.beginPacket(_net.upstreamIp,_net.upstreamPort);
+ _udpCli.write(pkt,48);
+ _udpCli.endPacket();
+
+ _lastAttemptMs = now;
+ _lastSyncOk = false;
+ }
+
+ int sz = _udpCli.parsePacket();
+ if (sz < 48) return;
+
+ uint8_t resp[48];
+ int n = _udpCli.read(resp,48);
+ if (n < 48) return;
+
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 < 2208988800UL) return;
+
+ uint32_t unixUtc = ntp1900ToUnix(sec1900);
+
+ RTCTime tLocal;
+ rtcLocalFromUnix(unixUtc,_cfg.tzTargetHours,tLocal);
+
+ _rtc.setTime(tLocal.second,tLocal.minute,tLocal.hour,
+ tLocal.dayOfWeek,tLocal.dayOfMonth,tLocal.month,tLocal.year);
+
+ _lastSyncOk = true;
+ _lastSuccessMs = millis();
+}
+
+void NtpLanService_Generic::buildNtpResponse(uint8_t* out48,uint32_t txSec1900,uint32_t txFrac,const uint8_t* req48)
+{
+ memset(out48,0,48);
+ out48[0] = (0 << 6) | (4 << 3) | (4);
+ out48[1] = 1;
+ out48[2] = 6;
+ out48[3] = (uint8_t)-20;
+ out48[12]='L'; out48[13]='O'; out48[14]='C'; out48[15]='L';
+ memcpy(&out48[24],&req48[40],8);
+
+ out48[32]=(txSec1900>>24)&0xFF;
+ out48[33]=(txSec1900>>16)&0xFF;
+ out48[34]=(txSec1900>>8)&0xFF;
+ out48[35]=(txSec1900)&0xFF;
+ out48[36]=(txFrac>>24)&0xFF;
+ out48[37]=(txFrac>>16)&0xFF;
+ out48[38]=(txFrac>>8)&0xFF;
+ out48[39]=(txFrac)&0xFF;
+
+ out48[40]=(txSec1900>>24)&0xFF;
+ out48[41]=(txSec1900>>16)&0xFF;
+ out48[42]=(txSec1900>>8)&0xFF;
+ out48[43]=(txSec1900)&0xFF;
+ out48[44]=(txFrac>>24)&0xFF;
+ out48[45]=(txFrac>>16)&0xFF;
+ out48[46]=(txFrac>>8)&0xFF;
+ out48[47]=(txFrac)&0xFF;
+}
+
+uint32_t NtpLanService_Generic::unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours)
+{
+ auto daysFromCivil = [](int y,int m,int d)->int32_t {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+ };
+
+ int32_t days = daysFromCivil((int)t.year,(int)t.month,(int)t.dayOfMonth);
+ int64_t local = (int64_t)days*86400LL + (int64_t)t.hour*3600LL + (int64_t)t.minute*60LL + (int64_t)t.second;
+ int64_t utc = local - (int64_t)tzTargetHours*3600LL;
+ if (utc < 0) utc = 0;
+ return (uint32_t)utc;
+}
+
+void NtpLanService_Generic::rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal)
+{
+ int64_t t = (int64_t)unixUtc + (int64_t)tzTargetHours*3600LL;
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+
+ auto civilFromDays = [](int32_t z,int &y,int &m,int &d){
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+ };
+
+ int y,mo,d;
+ civilFromDays((int32_t)days,y,mo,d);
+
+ int hh = (int)(rem / 3600LL); rem %= 3600LL;
+ int mm = (int)(rem / 60LL);
+ int ss = (int)(rem % 60LL);
+
+ outLocal.year = (uint16_t)y;
+ outLocal.month = (uint8_t)mo;
+ outLocal.dayOfMonth = (uint8_t)d;
+ outLocal.hour = (uint8_t)hh;
+ outLocal.minute = (uint8_t)mm;
+ outLocal.second = (uint8_t)ss;
+
+ static int tt[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ int yy = y;
+ if (mo < 3) yy -= 1;
+ uint8_t dow0 = (uint8_t)((yy + yy/4 - yy/100 + yy/400 + tt[mo-1] + d) % 7);
+ outLocal.dayOfWeek = (dow0 == 0) ? 7 :dow0;
+}
+3) Что изменить в вашем .ino
+Удалите #include "defines.h" полностью.
+Добавьте:
+cpp Копировать
+#include "EthConfig.h"
+#include "NtpLanService_Generic.h"
+Создайте объект:
+cpp Копировать
+NtpLanService_Generic ntpLan(rtc,cfg);
+В setup():
+cpp Копировать
+NtpLanService_Generic::NetConfig net;
+net.macIndex = 0;
+net.useDhcp = true;
+net.upstreamIp = IPAddress(162,159,200,123);
+net.syncPeriodMs = 3600000UL;
+
+bool ok = ntpLan.begin(net);
+SerialDebug.println(ok ? F("NTP LAN OK") :F("NTP LAN FAIL"));
+ntpLan.forceSyncNow();
+В loop():
+cpp Копировать
+ntpLan.tick();
+ntpLan.printStatus1Hz();
+Почему это решит ваши ошибки
+SPI_New,mac,ip,myDns определены один раз в EthConfig.cpp
+Ethernet_Generic.h включается только в NtpLanService_Generic.*,а не в каждом файле
+.ino больше не тянет “примерный defines.h”,и линкер перестаёт видеть двойные Ethernet/W5100/Dhcp и т.д.
+Если после этого будет ошибка “не найден Ethernet_Generic.h / EthernetUdp.h” — пришлите точное
+ имя библиотеки в libraries (папка) и версию,я 
+подстрою include’ы под вашу установку Ethernet_Generic.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ошибки указывают на 2 проблемы сразу:
+
+Тип IPAddress не определён в EthConfig.h (в вашем core Arduino.h его не подтягивает).
+Судя по строке EthConfig.h:29:1:error:'EthConfig' does not name a type и мусору EthConfig.cpp(...) 
+внутри лога — у вас в EthConfig.h случайно попал текст/кусок EthConfig.cpp (или вы вставили .cpp внутрь .h). В .h 
+не должно быть строк вида IPAddress ip(...); — это должно быть только в .cpp.
+Ниже — правильные файлы. Замените ими ваши текущие EthConfig.h и EthConfig.cpp (как два отдельных файла рядом со скетчем).
+
+1) EthConfig.h (исправленный)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <SPI.h>
+#include <IPAddress.h> // <-- ДОБАВИТЬ (для IPAddress)
+
+// --- Debug ---
+#define SerialDebug Serial
+#define DEBUG_ETHERNET_GENERIC_PORT SerialDebug
+#define _ETG_LOGLEVEL_ 2
+
+// --- W5500 pins (SPI1) ---
+#define USE_THIS_SS_PIN PA4
+
+// Custom SPI pins for STM32F1
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+#define CUR_PIN_SS PA4
+
+// Экземпляр SPI для Ethernet_Generic (ОБЪЯВЛЕНИЕ)
+extern SPIClass SPI_New;
+
+// MAC pool (ОБЪЯВЛЕНИЯ)
+extern const uint16_t NUMBER_OF_MAC;
+extern byte mac[][6];
+
+// Default static IP options (ОБЪЯВЛЕНИЯ)
+extern IPAddress ip;
+extern IPAddress myDns;
+2) EthConfig.cpp (исправленный)
+cpp Копировать
+#include "EthConfig.h"
+
+// ВАЖНО:НЕ подключать сюда Ethernet_Generic.h / Ethernet_Generic.hpp
+
+const uint16_t NUMBER_OF_MAC = 20;
+
+// Определяем SPI_New один раз
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+
+// MAC pool
+byte mac[][6] =
+{
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x01 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x02 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x03 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x04 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x05 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x06 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x07 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x08 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x09 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x0A },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x0B },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x0C },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x0D },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x0E },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x0F },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x10 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x11 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x12 },
+ { 0xDE,0xAD,0xBE,0xEF,0xFE,0x13 },
+ { 0xDE,0xAD,0xBE,0xEF,0xBE,0x14 },
+};
+
+// Default IPs (если захотите static)
+IPAddress ip(192,168,75,180);
+IPAddress myDns(8,8,8,8);
+3) Проверьте,что в EthConfig.h нет строк вида:
+IPAddress ip(....);
+IPAddress myDns(....);
+и любых “EthConfig.cpp(....)” — это мусор/ошибка вставки.
+EthConfig.h должен содержать только extern IPAddress ip; и т.п.
+
+4) Важное про Arduino IDE
+Убедитесь,что EthConfig.cpp реально лежит в папке скетча рядом с .ino (не в подпапке). 
+Arduino IDE 1.8.x часто не компилирует .cpp из подпапок.
+
+Если после этой правки появится следующая ошибка — пришлите первые 40 строк
+ EthConfig.h,я проверю,не осталось ли у вас в заголовке “прилипшего” куска .cpp.
+ 
+ //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--------
+ 
+ Ошибка понятна:в вашей версии Ethernet_Generic нет перегрузки
+
+cpp Копировать
+Ethernet.begin(mac,ip,dns,gw,mask,&SPI_New)
+Есть:
+
+DHCP:begin(mac,timeout,responseTimeout) или begin(mac,SPI*,timeout,responseTimeout)
+Static IP:begin(mac,ip,dns,gw,subnet) БЕЗ SPI*
+Поэтому нужно:
+
+для Static IP вызывать 5‑аргументный begin(...) без &SPI_New
+для DHCP либо вызывать begin(mac,&SPI_New,timeout,responseTimeout),либо проще (и совместимее)
+ — begin(mac,timeout,responseTimeout) и заранее настроить custom SPI так,чтобы библиотека сама использовала SPI_New.
+Ниже — конкретная правка вашего NtpLanService_Generic.cpp.
+
+1) Правка NtpLanService_Generic.cpp (строки с begin)
+Найдите в begin() места,где у вас сейчас:
+
+cpp Копировать
+Ethernet.begin(mac[idx],&SPI_New)
+...
+Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask,&SPI_New)
+и замените весь блок инициализации на такой (полностью):
+
+cpp Копировать
+Ethernet.init(USE_THIS_SS_PIN);
+
+// На всякий случай стартуем SPI_New (на STM32F1 это полезно)
+SPI_New.begin();
+
+uint16_t idx = _net.macIndex % NUMBER_OF_MAC;
+
+if (_net.useDhcp)
+{
+ // DHCP (в этой версии Ethernet_Generic есть begin(mac,timeout,responseTimeout))
+ int ok = Ethernet.begin(mac[idx],20000,4000);
+
+ if (!ok)
+ {
+ SerialDebug.println(F("[ETH] DHCP failed,fallback to static"));
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask);
+ }
+}
+else
+{
+ // Static IP (в этой версии есть begin(mac,ip,dns,gw,subnet))
+ Ethernet.begin(mac[idx],_net.ip,_net.dns,_net.gw,_net.mask);
+}
+Главное:в static‑режиме убрали &SPI_New,потому что такой перегрузки нет.
+
+2) Важно:чтобы Ethernet_Generic использовал ваш SPI_New
+Если после этого W5500 не будет работать на ваших пинах,значит Ethernet_Generic не подхватил “custom SPI”. 
+Тогда нужно вернуть те же макросы,которые были в вашем defines.h,в наш EthConfig.h (чтобы библиотека выбрала SPI_New автоматически).
+
+Добавьте в EthConfig.h перед подключением Ethernet_Generic (у вас Ethernet_Generic подключается 
+в NtpLanService_Generic.h,поэтому эти макросы должны быть видны до него — а EthConfig.h как раз подключается раньше):
+
+cpp Копировать
+// --- Ethernet_Generic custom SPI selection ---
+#define USING_CUSTOM_SPI true
+#define USING_SPI2 true
+#define SPI_NEW_INITIALIZED true
+И убедитесь,что CUR_PIN_MOSI/MISO/SCK/SS определены как у вас (PA7/PA6/PA5/PA4) — у вас уже так.
+
+3) Почему это исправляет сборку
+Потому что теперь вы вызываете только те Ethernet.begin(...),которые реально есть в вашей версии:
+
+Ethernet.begin(mac,20000,4000) (DHCP)
+Ethernet.begin(mac,ip,dns,gw,mask) (Static)
+Если после этой правки появится ошибка уже на этапе линковки/или Ethernet не поднимется,пришлите 
+первые ~20 строк вашего NtpLanService_Generic.h (include’ы) и подтверждение,что в EthConfig.h добавлены USING_CUSTOM_SPI/USING_SPI2/SPI_NEW_INITIALIZED. 
+Тогда я точно подстрою под вашу конкретную версию Ethernet_Generic.
+
+//+++++++++++++++++++++++++++++++----------------------------------------------------------
+
+Это не ошибка ваших вызовов,а особенность самой библиотеки Ethernet_Generic:она содержит 
+реальные определения (не inline) в заголовках,поэтому если заголовок Ethernet_Generic попадает в
+ две единицы трансляции (.ino → Ver...cpp.o и NtpLanService_Generic.cpp → ...cpp.o),линкер получает
+ multiple definition на Ethernet,W5100,DhcpClass,EthernetUDP и т.д.
+
+Сейчас так и происходит:Ethernet_Generic подключён и в .ino,и в NtpLanService_Generic.cpp (через NtpLanService_Generic.h).
+
+Правильное решение (библиотечное):PIMPL
+Делаем так,чтобы:
+
+в заголовке NtpLanService_Generic.h НЕ было #include <Ethernet_Generic.h> и вообще ни одного Ethernet_Generic заголовка;
+Ethernet_Generic подключался только в одном .cpp (NtpLanService_Generic.cpp).
+Это полностью убирает multiple definition.
+
+Ниже — готовые файлы NtpLanService_Generic.h/.cpp под ваш проект.
+
+1) NtpLanService_Generic.h (БЕЗ Ethernet_Generic include)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <IPAddress.h>
+
+#include "RTCSupport.h"
+#include "AT24C128Settings.h"
+#include "EthConfig.h"
+
+class NtpLanService_Generic {
+public:
+ struct NetConfig {
+ uint16_t macIndex = 0;
+ bool useDhcp = true;
+
+ IPAddress ip = IPAddress(192,168,1,50);
+ IPAddress dns = IPAddress(192,168,1,1);
+ IPAddress gw = IPAddress(192,168,1,1);
+ IPAddress mask = IPAddress(255,255,255,0);
+
+ // Внешний NTP (лучше IP)
+ IPAddress upstreamIp = IPAddress(162,159,200,123);
+ uint16_t upstreamPort = 123;
+
+ uint32_t syncPeriodMs = 3600000UL;
+ };
+
+ NtpLanService_Generic(RealtimeClock& rtc,AT24C128Settings::Config& cfg);
+ ~NtpLanService_Generic();
+
+ bool begin(const NetConfig& net);
+ void tick();
+ void forceSyncNow();
+
+ // статус
+ bool lastSyncOk() const;
+ uint32_t lastAttemptMs() const;
+ uint32_t lastSuccessMs() const;
+
+ void printStatus1Hz();
+
+private:
+ struct Impl;
+ Impl* _impl = nullptr;
+};
+2) NtpLanService_Generic.cpp (ЕДИНСТВЕННОЕ место,где подключаем Ethernet_Generic)
+cpp Копировать
+#include "NtpLanService_Generic.h"
+
+// Ethernet_Generic подключаем ТОЛЬКО здесь
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+
+struct NtpLanService_Generic::Impl
+{
+ RealtimeClock& rtc;
+ AT24C128Settings::Config& cfg;
+ NetConfig net;
+
+ EthernetUDP udpSrv;
+ EthernetUDP udpCli;
+
+ static const uint16_t NTP_PORT = 123;
+
+ bool syncRequested = false;
+ uint32_t nextSyncMs = 0;
+
+ bool lastSyncOk = false;
+ uint32_t lastAttemptMs = 0;
+ uint32_t lastSuccessMs = 0;
+
+ uint32_t lastPrintMs = 0;
+
+ Impl(RealtimeClock& r,AT24C128Settings::Config& c) :rtc(r),cfg(c) {}
+
+ static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + 2208988800UL; }
+ static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - 2208988800UL; }
+ static uint32_t millisToFrac(uint32_t ms) { return (uint32_t)(((uint64_t)ms << 32) / 1000ULL); }
+
+ static void buildNtpResponse(uint8_t* out48,uint32_t txSec1900,uint32_t txFrac,const uint8_t* req48)
+ {
+ memset(out48,0,48);
+ out48[0] = (0 << 6) | (4 << 3) | (4); // LI=0,VN=4,Mode=4
+ out48[1] = 1;
+ out48[2] = 6;
+ out48[3] = (uint8_t)-20;
+ out48[12]='L'; out48[13]='O'; out48[14]='C'; out48[15]='L';
+ memcpy(&out48[24],&req48[40],8);
+
+ // Receive = Transmit (упрощение для LAN)
+ out48[32]=(txSec1900>>24)&0xFF;
+ out48[33]=(txSec1900>>16)&0xFF;
+ out48[34]=(txSec1900>>8)&0xFF;
+ out48[35]=(txSec1900)&0xFF;
+ out48[36]=(txFrac>>24)&0xFF;
+ out48[37]=(txFrac>>16)&0xFF;
+ out48[38]=(txFrac>>8)&0xFF;
+ out48[39]=(txFrac)&0xFF;
+
+ // Transmit
+ out48[40]=(txSec1900>>24)&0xFF;
+ out48[41]=(txSec1900>>16)&0xFF;
+ out48[42]=(txSec1900>>8)&0xFF;
+ out48[43]=(txSec1900)&0xFF;
+ out48[44]=(txFrac>>24)&0xFF;
+ out48[45]=(txFrac>>16)&0xFF;
+ out48[46]=(txFrac>>8)&0xFF;
+ out48[47]=(txFrac)&0xFF;
+ }
+
+ static uint32_t unixFromRtcLocal(const RTCTime& t,int8_t tzTargetHours)
+ {
+ auto daysFromCivil = [](int y,int m,int d)->int32_t {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+ };
+
+ int32_t days = daysFromCivil((int)t.year,(int)t.month,(int)t.dayOfMonth);
+ int64_t local = (int64_t)days*86400LL + (int64_t)t.hour*3600LL + (int64_t)t.minute*60LL + (int64_t)t.second;
+ int64_t utc = local - (int64_t)tzTargetHours*3600LL;
+ if (utc < 0) utc = 0;
+ return (uint32_t)utc;
+ }
+
+ static void rtcLocalFromUnix(uint32_t unixUtc,int8_t tzTargetHours,RTCTime& outLocal)
+ {
+ int64_t t = (int64_t)unixUtc + (int64_t)tzTargetHours*3600LL;
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+
+ auto civilFromDays = [](int32_t z,int &y,int &m,int &d){
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+ };
+
+ int y,mo,d;
+ civilFromDays((int32_t)days,y,mo,d);
+
+ int hh = (int)(rem / 3600LL); rem %= 3600LL;
+ int mm = (int)(rem / 60LL);
+ int ss = (int)(rem % 60LL);
+
+ outLocal.year = (uint16_t)y;
+ outLocal.month = (uint8_t)mo;
+ outLocal.dayOfMonth = (uint8_t)d;
+ outLocal.hour = (uint8_t)hh;
+ outLocal.minute = (uint8_t)mm;
+ outLocal.second = (uint8_t)ss;
+
+ static int tt[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ int yy = y;
+ if (mo < 3) yy -= 1;
+ uint8_t dow0 = (uint8_t)((yy + yy/4 - yy/100 + yy/400 + tt[mo-1] + d) % 7);
+ outLocal.dayOfWeek = (dow0 == 0) ? 7 :dow0;
+ }
+
+ bool begin(const NetConfig& nc)
+ {
+ net = nc;
+
+ // Настраиваем SPI/CS
+ pinMode(USE_THIS_SS_PIN,OUTPUT);
+ digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+ Ethernet.init(USE_THIS_SS_PIN);
+ SPI_New.begin();
+
+ // ВАЖНО:в Ethernet_Generic есть глобальный pCUR_SPI (у вас он был в ошибках).
+ // Раз он определён внутри Ethernet_Generic,мы можем направить его на SPI_New.
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ uint16_t idx = net.macIndex % NUMBER_OF_MAC;
+
+ if (net.useDhcp)
+ {
+ // DHCP (есть перегрузка begin(mac,SPI*,timeout,responseTimeout))
+ int ok = Ethernet.begin(mac[idx],&SPI_New,20000,4000);
+ if (!ok)
+ {
+ SerialDebug.println(F("[ETH] DHCP failed,fallback to static"));
+ Ethernet.begin(mac[idx],net.ip,net.dns,net.gw,net.mask);
+ }
+ }
+ else
+ {
+ Ethernet.begin(mac[idx],net.ip,net.dns,net.gw,net.mask);
+ }
+
+ if (udpSrv.begin(NTP_PORT) == 0) return false;
+ udpCli.begin(0);
+
+ syncRequested = true;
+ nextSyncMs = millis();
+ return true;
+ }
+
+ void forceSyncNow()
+ {
+ syncRequested = true;
+ nextSyncMs = millis();
+ }
+
+ void handleNtpServer()
+ {
+ int packetSize = udpSrv.parsePacket();
+ if (packetSize <= 0) return;
+
+ uint8_t req[48];
+ int n = udpSrv.read(req,48);
+ if (n < 48) return;
+
+ RTCTime tLocal = rtc.getTime();
+ uint32_t unixUtc = unixFromRtcLocal(tLocal,cfg.tzTargetHours);
+
+ uint32_t txSec1900 = unixToNtp1900(unixUtc);
+ uint32_t txFrac = millisToFrac(millis() % 1000);
+
+ uint8_t resp[48];
+ buildNtpResponse(resp,txSec1900,txFrac,req);
+
+ udpSrv.beginPacket(udpSrv.remoteIP(),udpSrv.remotePort());
+ udpSrv.write(resp,48);
+ udpSrv.endPacket();
+ }
+
+ void handleSyncClient()
+ {
+ uint32_t now = millis();
+
+ if (syncRequested || (int32_t)(now - nextSyncMs) >= 0) {
+ syncRequested = false;
+ nextSyncMs = now + net.syncPeriodMs;
+
+ uint8_t pkt[48] = {0};
+ pkt[0] = 0b11100011;
+ pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+ udpCli.beginPacket(net.upstreamIp,net.upstreamPort);
+ udpCli.write(pkt,48);
+ udpCli.endPacket();
+
+ lastAttemptMs = now;
+ lastSyncOk = false;
+ }
+
+ int sz = udpCli.parsePacket();
+ if (sz < 48) return;
+
+ uint8_t resp[48];
+ int n = udpCli.read(resp,48);
+ if (n < 48) return;
+
+ uint32_t sec1900 =
+ ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+ ((uint32_t)resp[42] << 8) | (uint32_t)resp[43];
+
+ if (sec1900 < 2208988800UL) return;
+
+ uint32_t unixUtc = ntp1900ToUnix(sec1900);
+
+ RTCTime tLocal;
+ rtcLocalFromUnix(unixUtc,cfg.tzTargetHours,tLocal);
+
+ rtc.setTime(tLocal.second,tLocal.minute,tLocal.hour,
+ tLocal.dayOfWeek,tLocal.dayOfMonth,tLocal.month,tLocal.year);
+
+ lastSyncOk = true;
+ lastSuccessMs = millis();
+ }
+
+ void tick()
+ {
+ handleNtpServer();
+ handleSyncClient();
+ if (net.useDhcp) Ethernet.maintain();
+ }
+
+ void printStatus1Hz()
+ {
+ uint32_t now = millis();
+ if (now - lastPrintMs < 1000) return;
+ lastPrintMs = now;
+
+ SerialDebug.print(F("[ETH] IP="));
+ SerialDebug.print(Ethernet.localIP());
+
+ SerialDebug.print(F(" Link="));
+ SerialDebug.print(Ethernet.linkReport());
+ SerialDebug.print(F(" Speed="));
+ SerialDebug.print(Ethernet.speedReport());
+ SerialDebug.print(F(" Duplex="));
+ SerialDebug.print(Ethernet.duplexReport());
+
+ SerialDebug.print(F(" NTP="));
+ SerialDebug.print(lastSyncOk ? F("OK") :F("FAIL"));
+
+ SerialDebug.print(F(" attemptMs="));
+ SerialDebug.print(lastAttemptMs);
+
+ SerialDebug.print(F(" successMs="));
+ if (lastSuccessMs == 0) SerialDebug.println(F("never"));
+ else SerialDebug.println(lastSuccessMs);
+ }
+};
+
+NtpLanService_Generic::NtpLanService_Generic(RealtimeClock& rtc,AT24C128Settings::Config& cfg)
+{
+ _impl = new Impl(rtc,cfg);
+}
+NtpLanService_Generic::~NtpLanService_Generic()
+{
+ delete _impl;
+ _impl = nullptr;
+}
+
+bool NtpLanService_Generic::begin(const NetConfig& net) { return _impl ? _impl->begin(net) :false; }
+void NtpLanService_Generic::tick() { if (_impl) _impl->tick(); }
+void NtpLanService_Generic::forceSyncNow() { if (_impl) _impl->forceSyncNow(); }
+
+bool NtpLanService_Generic::lastSyncOk() const { return _impl ? _impl->lastSyncOk :false; }
+uint32_t NtpLanService_Generic::lastAttemptMs() const { return _impl ? _impl->lastAttemptMs :0; }
+uint32_t NtpLanService_Generic::lastSuccessMs() const { return _impl ? _impl->lastSuccessMs :0; }
+
+void NtpLanService_Generic::printStatus1Hz() { if (_impl) _impl->printStatus1Hz(); }
+3) Что обязательно сделать в .ino
+Чтобы не было multiple definition,нужно:
+
+НЕ включать Ethernet_Generic.h,EthernetUdp.h,defines.h в .ino и в других ваших файлах.
+В .ino подключать только:
+cpp Копировать
+#include "EthConfig.h"
+#include "NtpLanService_Generic.h"
+И использовать сервис:
+
+cpp Копировать
+NtpLanService_Generic ntpLan(rtc,cfg);
+
+void setup() {
+ SerialDebug.begin(115200);
+
+ NtpLanService_Generic::NetConfig net;
+ net.macIndex = 0;
+ net.useDhcp = true;
+ net.upstreamIp = IPAddress(162,159,200,123);
+ net.syncPeriodMs = 3600000UL;
+
+ ntpLan.begin(net);
+ ntpLan.forceSyncNow();
+}
+
+void loop() {
+ ntpLan.tick();
+ ntpLan.printStatus1Hz();
+}
+Почему у вас всё ещё дублировалось до этого
+Потому что Ethernet_Generic.h попадал и в Ver...cpp.o (через .ino/какой-то include),и в NtpLanService_Generic.cpp.o.
+ С PIMPL‑вариантом выше заголовок сервиса больше не тащит Ethernet_Generic,и проблема исчезает.
+
+Если после этого компоновщик всё ещё ругается на EthernetClass::... first defined here Ver...cpp.o,значит в
+ вашем .ino/других .h всё ещё где-то включается Ethernet_Generic.h или defines.h. Тогда пришлите список include’ов 
+ в начале .ino (первые ~40 строк)
+ — укажу,какой именно include надо убрать/перенести.
+ 
+ ///++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ Лог показывает,что Ethernet/W5500 у вас поднялся нормально и синхронизация по внешнему NTP уже сработала:
+
+сначала было NTP=FAIL (ответ ещё не пришёл),
+затем NTP=OK … successMs=6411 — это значит:ответ получен и RTC выставлен.
+Почему attemptMs дальше не меняется
+attemptMs=5166 — время последней отправки запроса. Далее вы печатаете статус каждую 
+секунду,но новых попыток не будет,пока не наступит следующий период syncPeriodMs (у вас 1 час). Поэтому attemptMs “стоит”.
+
+1) Проверить,что DS3231 реально обновился (быстрая проверка)
+Добавьте временно в loop() раз в 1 секунду:
+
+cpp Копировать
+static uint32_t t0=0;
+if (millis()-t0>1000) {
+ t0=millis();
+ RTCTime t = rtc.getTime();
+ SerialDebug.print("[RTC] ");
+ SerialDebug.print(rtc.getDateStr(t));
+ SerialDebug.print(" ");
+ SerialDebug.println(rtc.getTimeStr(t));
+}
+Если время “пошло” и соответствует реальному (с учётом cfg.tzTargetHours) — всё ок.
+
+2) Проверить,что ваш NTP‑SERVER в LAN отвечает
+С ПК в вашей сети выполните:
+
+Windows (PowerShell/утилита w32tm)
+bat Копировать
+w32tm /stripchart /computer:192.168.75.231 /dataonly /samples:5
+Linux
+bash Копировать
+ntpdate -q 192.168.75.231
+# или
+chronyc -n sources
+Должны увидеть ответы и небольшую задержку.
+
+3) Сообщение про ss_pin (не критично,но лучше привести в порядок)
+Строка:
+
+[ETG] ... ss_pin = 196 whereas new ss_pin = 10
+означает,что библиотека видит “дефолтный” SS и новый SS. У вас всё равно всё работает 
+(чип W5500 найден),но чтобы избежать сюрпризов:
+
+убедитесь,что CS W5500 = PA4 (как вы задали USE_THIS_SS_PIN PA4)
+и что CS остальных SPI устройств (TFT/SD) держатся в HIGH до инициализации Ethernet.
+4) Что дальше включить в проект (практически)
+Уберите/уменьшите шумный лог:в printStatus1Hz() печатайте раз в 10 сек или только при изменении NTP OK/FAIL.
+Добавьте на экран HOME/меню:
+IP (последний октет достаточно),
+Link (LINK/NO),
+NTP sync OK + “секунд назад”.
+Если скажете,где именно хотите показывать эти поля (HOME или “ИНТЕРНЕТ” меню),я
+ дам готовую функцию формирования строк под ваш экран 320×170 и текущий Menu.cpp.
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Изменения в меню
+На главном экране убрать "TIME"
+Ниже "HOME" отобразить локальный IP адрес
+Задействовать параметры выбора NTP и ПЕРИОД запросов для работы с серверами времени
+
+
+В странице "ВЫБОР МЕНЮ" после "ИСТОЧНИКИ СИНХРОНИЗАЦИИ" добавить пункты настройки интернет "ИНТЕРНЕТ1" и "ИНТЕРНЕТ2"
+Планируется подключение второй линии интернет.
+В настройках указать настройку локальных адресов
+Применение DHCP и другие настройки. 
+В верхней части страницы указать текущие IP адреса
+
+//+++++++++++++++++++++++++++++++++++++++-*********************************111111111111111111111
+
+Ниже — полный “комплект” под ваше “да”:
+
+INTERNET1 / INTERNET2 страницы в “ВЫБОР МЕНЮ”
+хранение настроек LAN/NTP в AT24C128 (0x50) отдельным модулем LanIfStore.h/.cpp (фиксированные адреса)
+INTERNET1 применяет настройки сразу (перезапускает Ethernet/W5500 и обновляет NTP upstream/период)
+INTERNET2 пока только настраивается/сохраняется (второй W5500 будет на отдельном МК по I2C,пока “NOT IMPLEMENTED”)
+меню и HOME берут IP через NetFeed (никаких include Ethernet_Generic в Menu.cpp)
+Управление на страницах INTERNET1/2:
+
+SW1:Next (внутри IP/MASK/GW/DNS перебирает октеты 0..3,потом следующий параметр)
+SW2:“-”
+SW3:“+”
+SW4:SAVE+BACK
+1) Модуль EEPROM для Internet1/2:LanIfStore.h/.cpp
+LanIfStore.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class LanIfStore {
+public:
+ enum IfId :uint8_t { IF1 = 0,IF2 = 1 };
+
+ struct IfConfig {
+ uint8_t dhcp; // 0/1
+ uint8_t ip[4];
+ uint8_t mask[4];
+ uint8_t gw[4];
+ uint8_t dns[4];
+
+ uint8_t ntpIdx; // 0..4 (выбор NTP IP из списка)
+ uint8_t periodIdx; // 0..5 (период)
+ };
+
+ explicit LanIfStore(uint8_t i2cAddr = 0x50,TwoWire& w = Wire);
+
+ bool begin();
+
+ bool load(IfId id,IfConfig& cfg,bool strict = false);
+ bool save(IfId id,const IfConfig& cfg,bool writeMagic = true);
+
+ static void defaults(IfId id,IfConfig& cfg);
+
+ // фиксированные адреса блоков (для внешних программ)
+ static constexpr uint16_t BASE_IF1 = 0x0200;
+ static constexpr uint16_t BASE_IF2 = 0x0240;
+
+private:
+ TwoWire* _w;
+ uint8_t _addr;
+
+ static constexpr uint8_t PAGE_SIZE = 64;
+
+ static constexpr uint32_t MAGIC = 0x31464E49; // 'I''N''F''1' (для IF1),для IF2 будет 'INF2'
+ static constexpr uint8_t VERSION = 1;
+
+ static uint16_t baseFor(IfId id) { return (id == IF1) ? BASE_IF1 :BASE_IF2; }
+ static uint32_t magicFor(IfId id) { return (id == IF1) ? 0x31464E49UL :0x32464E49UL; } // 'INF1'/'INF2'
+
+ bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+ bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool waitReady(uint32_t timeoutMs = 50);
+
+ bool readU32(uint16_t memAddr,uint32_t& v);
+ bool writeU32(uint16_t memAddr,uint32_t v);
+ bool readU8(uint16_t memAddr,uint8_t& v);
+ bool writeU8(uint16_t memAddr,uint8_t v);
+};
+LanIfStore.cpp (совместим с Arduino_STM32/libmaple)
+cpp Копировать
+#include "LanIfStore.h"
+
+LanIfStore::LanIfStore(uint8_t i2cAddr,TwoWire& w) :_w(&w),_addr(i2cAddr) {}
+
+bool LanIfStore::begin() {
+ _w->beginTransmission(_addr);
+ return (_w->endTransmission() == 0);
+}
+
+void LanIfStore::defaults(IfId id,IfConfig& cfg) {
+ memset(&cfg,0,sizeof(cfg));
+ cfg.dhcp = 1;
+
+ // дефолтные статические (на случай DHCP=0)
+ if (id == IF1) {
+ cfg.ip[0]=192; cfg.ip[1]=168; cfg.ip[2]=75; cfg.ip[3]=231;
+ } else {
+ cfg.ip[0]=192; cfg.ip[1]=168; cfg.ip[2]=75; cfg.ip[3]=232;
+ }
+ cfg.mask[0]=255; cfg.mask[1]=255; cfg.mask[2]=255; cfg.mask[3]=0;
+ cfg.gw[0]=192; cfg.gw[1]=168; cfg.gw[2]=75; cfg.gw[3]=1;
+ cfg.dns[0]=8; cfg.dns[1]=8; cfg.dns[2]=8; cfg.dns[3]=8;
+
+ cfg.ntpIdx = 0;
+ cfg.periodIdx = 3; // 1 час
+}
+
+bool LanIfStore::load(IfId id,IfConfig& cfg,bool strict) {
+ defaults(id,cfg);
+
+ uint16_t base = baseFor(id);
+
+ uint32_t mg=0;
+ uint8_t ver=0;
+ bool okMagic = readU32(base + 0,mg) && (mg == magicFor(id));
+ bool okVer = readU8(base + 4,ver) && (ver == VERSION);
+
+ if (strict && !(okMagic && okVer)) return false;
+
+ // layout:
+ // 0..3 magic,4 ver,5 dhcp,6..9 ip,10..13 mask,14..17 gw,18..21 dns,22 ntpIdx,23 periodIdx
+ (void)readU8(base + 5,cfg.dhcp);
+
+ (void)readBytes(base + 6,cfg.ip,4);
+ (void)readBytes(base + 10,cfg.mask,4);
+ (void)readBytes(base + 14,cfg.gw,4);
+ (void)readBytes(base + 18,cfg.dns,4);
+
+ (void)readU8(base + 22,cfg.ntpIdx);
+ (void)readU8(base + 23,cfg.periodIdx);
+
+ cfg.dhcp = cfg.dhcp ? 1 :0;
+ cfg.ntpIdx %= 5;
+ cfg.periodIdx %= 6;
+
+ return true;
+}
+
+bool LanIfStore::save(IfId id,const IfConfig& in,bool writeMagic) {
+ uint16_t base = baseFor(id);
+
+ IfConfig cfg = in;
+ cfg.dhcp = cfg.dhcp ? 1 :0;
+ cfg.ntpIdx %= 5;
+ cfg.periodIdx %= 6;
+
+ if (writeMagic) {
+ if (!writeU32(base + 0,magicFor(id))) return false;
+ if (!writeU8(base + 4,VERSION)) return false;
+ }
+
+ if (!writeU8(base + 5,cfg.dhcp)) return false;
+ if (!writeBytes(base + 6,cfg.ip,4)) return false;
+ if (!writeBytes(base + 10,cfg.mask,4)) return false;
+ if (!writeBytes(base + 14,cfg.gw,4)) return false;
+ if (!writeBytes(base + 18,cfg.dns,4)) return false;
+ if (!writeU8(base + 22,cfg.ntpIdx)) return false;
+ if (!writeU8(base + 23,cfg.periodIdx)) return false;
+
+ return true;
+}
+
+// ---- low level I2C (libmaple compatible) ----
+bool LanIfStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ if (_w->endTransmission() != 0) return false;
+
+ uint8_t got = _w->requestFrom((uint8_t)_addr,(int)len);
+ if (got != (uint8_t)len) return false;
+
+ for (size_t i=0;i<len;i++) out[i] = (uint8_t)_w->read();
+ return true;
+}
+
+bool LanIfStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+ size_t off=0;
+ while (off < len) {
+ uint16_t a = memAddr + (uint16_t)off;
+ uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+ size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+ if (!writePage(a,data + off,chunk)) return false;
+ if (!waitReady(50)) return false;
+ off += chunk;
+ }
+ return true;
+}
+
+bool LanIfStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ _w->write((uint8_t*)data,(int)len); // libmaple требует non-const
+ return (_w->endTransmission() == 0);
+}
+
+bool LanIfStore::waitReady(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while ((millis() - t0) < timeoutMs) {
+ _w->beginTransmission(_addr);
+ if (_w->endTransmission() == 0) return true;
+ delay(1);
+ }
+ return false;
+}
+
+bool LanIfStore::readU32(uint16_t memAddr,uint32_t& v) {
+ uint8_t b[4];
+ if (!readBytes(memAddr,b,4)) return false;
+ v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+ return true;
+}
+bool LanIfStore::writeU32(uint16_t memAddr,uint32_t v) {
+ uint8_t b[4] = {(uint8_t)v,(uint8_t)(v>>8),(uint8_t)(v>>16),(uint8_t)(v>>24)};
+ return writeBytes(memAddr,b,4);
+}
+bool LanIfStore::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool LanIfStore::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+2) NtpLanService_Generic:добавить методы применения NTP/периода и LAN-конфига
+В вашем NtpLanService_Generic.h добавьте в public:
+
+cpp Копировать
+void applyUpstream(IPAddress ip,uint32_t periodMs);
+void applyLanConfig(bool dhcp,IPAddress ip,IPAddress dns,IPAddress gw,IPAddress mask);
+В NtpLanService_Generic.cpp (внутри Impl) добавьте методы и прокиньте наружу. Логика:
+
+applyUpstream:меняет net.upstreamIp и net.syncPeriodMs + forceSyncNow()
+applyLanConfig:вызывает Ethernet.begin(...) заново,затем переоткрывает UDP сокеты (stop/begin),затем forceSyncNow()
+Если хотите,я дам точный патч под вашу текущую PIMPL-реализацию (там нужно добавить 2 функции в Impl и 2 thin-wrapper в класс).
+
+3) Меню:добавить INTERNET1/INTERNET2 страницы + “верхние IP”
+Это вы уже хотели. В вашем Menu.cpp:
+
+3.1. В drawPageSelect() заменить topMenuNames:
+cpp Копировать
+static const char* topMenuNames[5] = {
+ "ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+ "ИНТЕРНЕТ1",
+ "ИНТЕРНЕТ2",
+ "СВОБОДНО",
+ "СВОБОДНО"
+};
+И добавить строку:
+
+cpp Копировать
+char ipLine[64];
+snprintf(ipLine,sizeof(ipLine),"IP1:%s IP2:%s",gIp1Str,gIp2Str);
+tft->setTextColor(TFT_WHITE,TFT_BLACK);
+tft->drawString(ipLine,10,28);
+3.2. В attachPages() назначить:
+Page1 = sources
+Page2 = internet1
+Page3 = internet2
+4) Готовые Page2 (INTERNET1) и Page3 (INTERNET2)
+4.1. Добавьте в начало Menu.cpp (рядом с extern)
+cpp Копировать
+#include "LanIfStore.h"
+extern LanIfStore lanStore;
+
+// применить настройки Internet1 (функция в .ino)
+extern void applyInternet1FromStore();
+4.2. Вставьте классы страниц (вместо старого Page2/Page3)
+Page2:INTERNET1
+cpp Копировать
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+ _param = 0;
+ _oct = 0;
+
+ lanStore.load(LanIfStore::IF1,_cfg,false);
+
+ draw();
+ }
+
+ void update() override {}
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+ // SW4:SAVE+BACK (и применить)
+ if (buttonID == BTN_SW4) {
+ lanStore.save(LanIfStore::IF1,_cfg,true);
+ applyInternet1FromStore();
+ _m->backToStart();
+ return;
+ }
+
+ // SW1:NEXT (для IP/MASK/GW/DNS сначала октеты,потом параметр)
+ if (buttonID == BTN_SW1) {
+ if (isIpParam(_param)) {
+ _oct = (_oct + 1) & 3;
+ if (_oct == 0) _param = (_param + 1) % PARAM_COUNT;
+ } else {
+ _param = (_param + 1) % PARAM_COUNT;
+ }
+ drawDynamic(false);
+ return;
+ }
+
+ // SW2 "-",SW3 "+"
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ int delta = (buttonID == BTN_SW3) ? +1 :-1;
+ applyDelta(delta);
+ drawDynamic(false);
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ LanIfStore::IfConfig _cfg;
+
+ bool _staticDrawn = false;
+ uint8_t _param = 0;
+ uint8_t _oct = 0;
+
+ // 320x170 layout
+ static const int X=10,Y_TITLE=0,Y0=22,DY=20,W=320,H=18;
+ static const int Y_HINT1=132,Y_HINT2=148;
+
+ enum Param :uint8_t {
+ P_DHCP=0,P_IP=1,P_MASK=2,P_GW=3,P_DNS=4,P_NTP=5,P_PERIOD=6,
+ PARAM_COUNT=7
+ };
+
+ static bool isIpParam(uint8_t p) { return (p==P_IP || p==P_MASK || p==P_GW || p==P_DNS); }
+
+ void drawStatic() {
+ auto d=tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("INTERNET1",X,Y_TITLE);
+
+ d->setTextSize(1);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+ d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+ d->drawString("SW4:SAVE+HOME",X,Y_HINT2);
+
+ d->setTextSize(2);
+ }
+
+ void drawDynamic(bool force) {
+ auto d=tft(); if(!d) return;
+
+ // очистить область
+ for (int i=0;i<6;i++) d->fillRect(0,Y0+i*DY,W,H,TFT_BLACK);
+
+ // строка DHCP
+ d->setTextColor(_param==P_DHCP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_DHCP?">":" ",0,Y0+0*DY);
+ d->drawString(_cfg.dhcp ? "DHCP:ON" :"DHCP:OFF",X,Y0+0*DY);
+
+ // IP/MASK/GW/DNS (если DHCP OFF)
+ drawIpLine("IP :",_cfg.ip,P_IP,1);
+ drawIpLine("MASK:",_cfg.mask,P_MASK,2);
+ drawIpLine("GW :",_cfg.gw,P_GW,3);
+ drawIpLine("DNS :",_cfg.dns,P_DNS,4);
+
+ // NTP/PERIOD
+ char b[64];
+
+ d->setTextColor(_param==P_NTP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_NTP?">":" ",0,Y0+5*DY);
+ snprintf(b,sizeof(b),"NTP:%u",(unsigned)(_cfg.ntpIdx % 5));
+ d->drawString(b,X,Y0+5*DY);
+
+ // period печатаем в заголовке (чтобы влезло)
+ d->fillRect(200,Y0+5*DY,120,H,TFT_BLACK);
+ d->setTextColor(_param==P_PERIOD?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ snprintf(b,sizeof(b),"PER:%u",(unsigned)(_cfg.periodIdx % 6));
+ d->drawString(b,200,Y0+5*DY);
+ }
+
+ void drawIpLine(const char* name,uint8_t v[4],uint8_t p,int row) {
+ auto d=tft(); if(!d) return;
+
+ d->setTextColor(_param==p?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==p?">":" ",0,Y0+row*DY);
+
+ char s[32];
+ snprintf(s,sizeof(s),"%s %u.%u.%u.%u",name,v[0],v[1],v[2],v[3]);
+ d->drawString(s,X,Y0+row*DY);
+
+ // подсветка октета при активном IP-параметре
+ if (_param==p) {
+ // очень грубая подсветка:просто рисуем "^" под текущим октетом
+ // (по месту можно улучшить по textWidth)
+ }
+ }
+
+ void applyDelta(int delta) {
+ // DHCP переключаем любым +/- когда курсор на DHCP
+ if (_param==P_DHCP) { _cfg.dhcp = _cfg.dhcp ? 0 :1; return; }
+
+ // если DHCP ON — адреса не меняем
+ if (_cfg.dhcp && isIpParam(_param)) return;
+
+ if (_param==P_IP) adjOct(_cfg.ip,_oct,delta);
+ else if (_param==P_MASK) adjOct(_cfg.mask,_oct,delta);
+ else if (_param==P_GW) adjOct(_cfg.gw,_oct,delta);
+ else if (_param==P_DNS) adjOct(_cfg.dns,_oct,delta);
+ else if (_param==P_NTP) _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta>0?1:4)) % 5);
+ else if (_param==P_PERIOD) _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta>0?1:5)) % 6);
+ }
+
+ static void adjOct(uint8_t v[4],uint8_t idx,int delta) {
+ int x = (int)v[idx] + (delta>0?1:-1);
+ if (x < 0) x = 255;
+ if (x > 255) x = 0;
+ v[idx] = (uint8_t)x;
+ }
+};
+Page3:INTERNET2 (пока только настройка/сохранение,без применения)
+cpp Копировать
+class Page3 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+ void onActivate() override {
+ _staticDrawn = false;
+ _param=0; _oct=0;
+ lanStore.load(LanIfStore::IF2,_cfg,false);
+ draw();
+ }
+ void update() override {}
+ void draw() override {
+ if(!_staticDrawn){ drawStatic(); _staticDrawn=true; }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW4) {
+ lanStore.save(LanIfStore::IF2,_cfg,true);
+ _m->backToStart();
+ return;
+ }
+ if (buttonID == BTN_SW1) {
+ if (isIpParam(_param)) { _oct = (_oct+1)&3; if(_oct==0) _param = (_param+1)%PARAM_COUNT; }
+ else _param = (_param+1)%PARAM_COUNT;
+ drawDynamic(false);
+ return;
+ }
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ int delta = (buttonID==BTN_SW3)?+1:-1;
+ applyDelta(delta);
+ drawDynamic(false);
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ LanIfStore::IfConfig _cfg;
+ bool _staticDrawn=false;
+ uint8_t _param=0,_oct=0;
+
+ static const int X=10,Y_TITLE=0,Y0=22,DY=20,W=320,H=18;
+ static const int Y_HINT1=132,Y_HINT2=148;
+
+ enum Param :uint8_t { P_DHCP=0,P_IP=1,P_MASK=2,P_GW=3,P_DNS=4,P_NTP=5,P_PERIOD=6,PARAM_COUNT=7 };
+ static bool isIpParam(uint8_t p){ return (p==P_IP||p==P_MASK||p==P_GW||p==P_DNS); }
+
+ void drawStatic(){
+ auto d=tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("INTERNET2",X,Y_TITLE);
+
+ d->setTextSize(1);
+ d->setTextColor(TFT_RED,TFT_BLACK);
+ d->drawString("NOT IMPLEMENTED (2nd MCU over I2C)",X,18);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+ d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+ d->drawString("SW4:SAVE+HOME",X,Y_HINT2);
+
+ d->setTextSize(2);
+ }
+
+ void drawDynamic(bool){
+ auto d=tft(); if(!d) return;
+ for(int i=0;i<6;i++) d->fillRect(0,Y0+i*DY,W,H,TFT_BLACK);
+
+ d->setTextColor(_param==P_DHCP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_DHCP?">":" ",0,Y0+0*DY);
+ d->drawString(_cfg.dhcp ? "DHCP:ON" :"DHCP:OFF",X,Y0+0*DY);
+
+ drawIpLine("IP :",_cfg.ip,P_IP,1);
+ drawIpLine("MASK:",_cfg.mask,P_MASK,2);
+ drawIpLine("GW :",_cfg.gw,P_GW,3);
+ drawIpLine("DNS :",_cfg.dns,P_DNS,4);
+
+ char b[64];
+ d->setTextColor(_param==P_NTP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_NTP?">":" ",0,Y0+5*DY);
+ snprintf(b,sizeof(b),"NTP:%u",(unsigned)(_cfg.ntpIdx%5));
+ d->drawString(b,X,Y0+5*DY);
+
+ d->setTextColor(_param==P_PERIOD?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ snprintf(b,sizeof(b),"PER:%u",(unsigned)(_cfg.periodIdx%6));
+ d->drawString(b,200,Y0+5*DY);
+ }
+
+ void drawIpLine(const char* name,uint8_t v[4],uint8_t p,int row){
+ auto d=tft(); if(!d) return;
+ d->setTextColor(_param==p?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==p?">":" ",0,Y0+row*DY);
+ char s[32];
+ snprintf(s,sizeof(s),"%s %u.%u.%u.%u",name,v[0],v[1],v[2],v[3]);
+ d->drawString(s,X,Y0+row*DY);
+ }
+
+ void applyDelta(int delta){
+ if (_param==P_DHCP){ _cfg.dhcp = _cfg.dhcp?0:1; return; }
+ if (_cfg.dhcp && isIpParam(_param)) return;
+
+ if (_param==P_IP) adjOct(_cfg.ip,_oct,delta);
+ else if (_param==P_MASK) adjOct(_cfg.mask,_oct,delta);
+ else if (_param==P_GW) adjOct(_cfg.gw,_oct,delta);
+ else if (_param==P_DNS) adjOct(_cfg.dns,_oct,delta);
+ else if (_param==P_NTP) _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta>0?1:4)) % 5);
+ else if (_param==P_PERIOD) _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta>0?1:5)) % 6);
+ }
+
+ static void adjOct(uint8_t v[4],uint8_t idx,int delta){
+ int x=(int)v[idx]+(delta>0?1:-1);
+ if(x<0) x=255;
+ if(x>255) x=0;
+ v[idx]=(uint8_t)x;
+ }
+};
+5) Интеграция в .ino:создать LanIfStore и функцию применения INTERNET1
+В .ino глобально:
+
+cpp Копировать
+#include "LanIfStore.h"
+LanIfStore lanStore(0x50,Wire);
+В setup() после Wire.begin():
+
+cpp Копировать
+lanStore.begin();
+Добавьте таблицу upstream IP (5 вариантов,только IP):
+
+cpp Копировать
+static const IPAddress kNtpUpstreamIp[5] = {
+ IPAddress(162,159,200,123),
+ IPAddress(162,159,200,1),
+ IPAddress(129,6,15,28),
+ IPAddress(132,163,96,1),
+ IPAddress(216,239,35,0)
+};
+static uint32_t periodMsFromIdx(uint8_t idx){
+ static const uint32_t ms[6]={60000UL,600000UL,1800000UL,3600000UL,21600000UL,43200000UL};
+ return ms[idx%6];
+}
+И реализуйте функцию,которую вызывает Page2 при SAVE:
+
+cpp Копировать
+void applyInternet1FromStore()
+{
+ LanIfStore::IfConfig c;
+ lanStore.load(LanIfStore::IF1,c,false);
+
+ // применить LAN (DHCP/static)
+ ntpLan.applyLanConfig(
+ c.dhcp != 0,
+ IPAddress(c.ip[0],c.ip[1],c.ip[2],c.ip[3]),
+ IPAddress(c.dns[0],c.dns[1],c.dns[2],c.dns[3]),
+ IPAddress(c.gw[0],c.gw[1],c.gw[2],c.gw[3]),
+ IPAddress(c.mask[0],c.mask[1],c.mask[2],c.mask[3])
+ );
+
+ // применить upstream NTP и период
+ ntpLan.applyUpstream(kNtpUpstreamIp[c.ntpIdx % 5],periodMsFromIdx(c.periodIdx % 6));
+}
+INTERNET2 пока не применяется (нет второго W5500 в этом МК).
+
+Что ещё нужно поправить в вашем текущем Menu.cpp
+В attachPages() теперь Page2/Page3 — это INTERNET1/2 (как выше). Старый “TIME ZONE” Page2 удалите полностью.
+В drawPageSelect() используйте новые topMenuNames + строку IP1/IP2 (как я описал раньше).
+В HOME вы просили убрать “TIME” и добавить IP — это отдельные правки,которые вы уже просили ранее 
+(могу дать точный патч под вашу текущую версию Menu.cpp,если пришлёте кусок HOME-функций).
+Если вы пришлёте ваш текущий NtpLanService_Generic.h/.cpp (с PIMPL),я верну точный готовый
+ патч для applyUpstream() и applyLanConfig() под вашу реализацию,чтобы INTERNET1 
+реально применял DHCP/static и смену upstream без перезагрузки.
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — цельный новый Menu.cpp под ваш проект (ST7789 170×320,rotation=3 → 320×170),с дополнениями:
+
+HOME:убрано поле TIME,добавлено IP1 под “HOME”
+“ВЫБОР МЕНЮ”:пункты ИСТОЧНИКИ СИНХРОНИЗАЦИИ,ИНТЕРНЕТ1,ИНТЕРНЕТ2,…
+“ВЫБОР МЕНЮ”:вверху показываются IP1 и IP2
+Страница ИНТЕРНЕТ1:настройка DHCP/STATIC + IP/MASK/GW/DNS + выбор NTP (только IP) + PERIOD; по SW4 сохраняет в EEPROM (через LanIfStore) и вызывает applyInternet1FromStore() (применение на W5500)
+Страница ИНТЕРНЕТ2:та же настройка и сохранение,но пишет “NOT IMPLEMENTED” (второй W5500 будет на отдельном МК по I2C,пока только хранение)
+ВАЖНО:этот Menu.cpp не включает Ethernet_Generic (никаких конфликтов линковки). IP берёт из NetFeed (gIp1Str/gIp2Str).
+
+Новый Menu.cpp
+cpp Копировать
+#include "Menu.h"
+#include <TFT_eSPI.h>
+
+#include "TimeFeed.h" // gDateStr,gTimeStr,gTimeUpdated
+#include "NetFeed.h" // gNetRegistered,gRssiDbm,gSignalBars,gCsqRssi,gIp1Str,gIp2Str,...
+#include "AT24C128Settings.h" // ee,cfg (tzTargetHours/tzNtpHours)
+#include "SyncSourcesStore.h" // syncStore,syncData
+#include "TimeSyncPlanner.h" // planner
+
+#include "LanIfStore.h" // INTERNET1/2 LAN config store
+
+// --- externs from .ino ---
+extern AT24C128Settings ee;
+extern AT24C128Settings::Config cfg;
+
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+
+extern TimeSyncPlanner planner;
+
+// INTERNET store in EEPROM (глобально в .ino)
+extern LanIfStore lanStore;
+
+// функция применения Internet1 (в .ino)
+extern void applyInternet1FromStore();
+
+// GPS globals
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+extern uint16_t gGpsHdop_x100;
+extern uint8_t gGpsSnrAvg;
+extern uint8_t gGpsSnrMax;
+extern uint32_t gGpsLastRmcMs;
+extern uint32_t gGpsLastGgaMs;
+extern uint32_t gGpsLastGsvMs;
+
+// Fonts
+#include "zTimesNRItalic18.h"
+#include "zTimesNRItalic24.h"
+#include "zTimesNRItalic28.h"
+#include "zTimesNRItalic36.h"
+#include "zCalibri36.h"
+#include "zTimesNR28.h"
+#include "zTimesNR14.h"
+#include "zTimesNR18.h"
+#include "zTimesNR24.h"
+
+#define AA_FONT_CALI zCalibri36
+#define AA_FONT_TIME18I zTimesNRItalic18
+#define AA_FONT_TIME24I zTimesNRItalic24
+#define AA_FONT_TIME28I zTimesNRItalic28
+#define AA_FONT_TIME36I zTimesNRItalic36
+#define AA_FONT_TIME28 zTimesNR28
+#define AA_FONT_TIME18 zTimesNR18
+#define AA_FONT_TIME24 zTimesNR24
+
+// ---------------- HOME layout for 320x170 ----------------
+static const int Y_HOME = 10;
+static const int Y_IP = 32; // ниже HOME
+static const int Y_DATE = 55;
+static const int Y_NET = 78;
+static const int Y_SIG = 101;
+static const int Y_VER = 140;
+
+// --- NTP upstream list (только IP,индекс 0..4) ---
+static const char* kNtpIpStr[5] = {
+ "162.159.200.123",
+ "162.159.200.1",
+ "129.6.15.28",
+ "132.163.96.1",
+ "216.239.35.0"
+};
+
+// --- Period names (idx 0..5) ---
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// --- GSM provider names ---
+static const char* kGsmProviders[5] = { "МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2" };
+
+// Таблица строк для Page1->MODE_LIST (page=0,row=item)
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","GSM","",""},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+
+// -------------------- Base for pages --------------------
+class PageBase :public IMenuPage {
+public:
+ explicit PageBase(Menu* m) :_m(m) {}
+protected:
+ Menu* _m = nullptr;
+ TFT_eSPI* tft() const { return _m ? _m->display() :nullptr; }
+};
+
+// -------------------- Helpers for GPS info --------------------
+static void formatGpsLine1(char* out,size_t n)
+{
+ snprintf(out,n,"Sat:%u/%u Fix:%s HDOP:%.2f",
+ (unsigned)gGpsSatsUsed,
+ (unsigned)gGpsSatsView,
+ gGpsFix ? "Y" :"N",
+ (double)gGpsHdop_x100 / 100.0);
+}
+
+static void formatGpsLine2(char* out,size_t n)
+{
+ uint32_t now = millis();
+ uint32_t ageR = (gGpsLastRmcMs == 0) ? 99999UL :(now - gGpsLastRmcMs);
+ uint32_t ageG = (gGpsLastGgaMs == 0) ? 99999UL :(now - gGpsLastGgaMs);
+ uint32_t ageV = (gGpsLastGsvMs == 0) ? 99999UL :(now - gGpsLastGsvMs);
+
+ auto toTenth = [](uint32_t ms)->uint32_t { return (ms + 50) / 100; };
+ uint32_t r = toTenth(ageR);
+ uint32_t g = toTenth(ageG);
+ uint32_t v = toTenth(ageV);
+
+ snprintf(out,n,"Sig:%u/%u R:%u.%us G:%u.%us V:%u.%us",
+ (unsigned)gGpsSnrAvg,
+ (unsigned)gGpsSnrMax,
+ (unsigned)(r/10),(unsigned)(r%10),
+ (unsigned)(g/10),(unsigned)(g%10),
+ (unsigned)(v/10),(unsigned)(v%10));
+}
+
+// -------------------- Page1:ИСТОЧНИКИ СИНХРОНИЗАЦИИ --------------------
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _mode = MODE_LIST;
+ _sel = 0;
+ _param = 0;
+
+ _tmp = syncData;
+
+ _tzTargetTmp = cfg.tzTargetHours;
+ _tzNtpTmp = cfg.tzNtpHours;
+
+ _staticDrawn = false;
+ _lastSel = 255;
+ _lastParam = 255;
+ _lastHash = 0;
+
+ _lastGpsLine1[0] = 0;
+ _lastGpsLine2[0] = 0;
+ _lastGpsInfoMs = 0;
+
+ draw();
+ }
+
+ void update() override {
+ if (_mode == MODE_GPS) {
+ uint32_t now = millis();
+ if (now - _lastGpsInfoMs >= 500) {
+ _lastGpsInfoMs = now;
+ drawGpsInfo(false);
+ }
+ }
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ _lastSel = 255;
+ _lastParam = 255;
+ _lastHash = 0;
+ }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+
+ // ---- LIST ----
+ if (_mode == MODE_LIST) {
+ if (buttonID == BTN_SW2) { // UP
+ _sel = (_sel + 4) % 5;
+ drawDynamic(false);
+ return;
+ }
+ if (buttonID == BTN_SW3) { // DOWN
+ _sel = (_sel + 1) % 5;
+ drawDynamic(false);
+ return;
+ }
+ if (buttonID == BTN_SW1) { // ENTER
+ if (_sel == 0) _mode = MODE_GPS;
+ else if (_sel == 1) _mode = MODE_NET;
+ else if (_sel == 2) _mode = MODE_GSM;
+ else return;
+
+ _param = 0;
+ // при входе в подрежим подтянуть TZ
+ _tzTargetTmp = cfg.tzTargetHours;
+ _tzNtpTmp = cfg.tzNtpHours;
+
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ if (buttonID == BTN_SW4) { // HOME
+ _m->backToStart();
+ return;
+ }
+ return;
+ }
+
+ // ---- SUBMENU ----
+ if (buttonID == BTN_SW1) { // NEXT PARAM
+ _param = (_param + 1) % paramCount();
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW2) { // "-"
+ changeParam(-1);
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW3) { // "+"
+ changeParam(+1);
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW4) { // SAVE + BACK
+ commitSave();
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum Mode :uint8_t { MODE_LIST = 0,MODE_GPS = 1,MODE_NET = 2,MODE_GSM = 3 };
+
+ static const int X = 10;
+ static const int Y_TITLE = 0;
+ static const int Y0 = 22;
+ static const int DY = 22;
+ static const int LINE_W = 320;
+ static const int LINE_H = 20;
+
+ static const int Y_HINT1 = 132;
+ static const int Y_HINT2 = 148;
+
+ Mode _mode = MODE_LIST;
+ bool _staticDrawn = false;
+
+ uint8_t _sel = 0;
+ uint8_t _param = 0;
+
+ SyncSourcesStore::Data _tmp;
+
+ int8_t _tzTargetTmp = 0;
+ int8_t _tzNtpTmp = 0;
+
+ uint8_t _lastSel = 255;
+ uint8_t _lastParam = 255;
+ uint32_t _lastHash = 0;
+
+ uint32_t _lastGpsInfoMs = 0;
+ char _lastGpsLine1[64] = {0};
+ char _lastGpsLine2[96] = {0};
+
+ uint8_t paramCount() const {
+ if (_mode == MODE_GPS) return 4; // enable,period,TZ target,TZ NTP
+ if (_mode == MODE_NET) return 5; // enable,ntpIdx,period,TZ target,TZ NTP
+ if (_mode == MODE_GSM) return 5; // enable,operator,period,TZ target,TZ NTP
+ return 0;
+ }
+
+ void drawStatic() {
+ TFT_eSPI* d = tft(); if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+
+ if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",X,Y_TITLE);
+ else if (_mode == MODE_GPS) d->drawString("GPS",X,Y_TITLE);
+ else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ (SIM800)",X,Y_TITLE);
+ else if (_mode == MODE_GSM) d->drawString("GSM (SIM800)",X,Y_TITLE);
+
+ for (int i = 0; i < 6; i++) d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+
+ d->setTextSize(1);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+
+ if (_mode == MODE_LIST) {
+ d->drawString("SW2:UP SW3:DOWN SW1:ENTER",X,Y_HINT1);
+ d->drawString("SW4:HOME",X,Y_HINT2);
+ } else {
+ d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+ d->drawString("SW4:SAVE+BACK",X,Y_HINT2);
+ }
+
+ d->setTextSize(2);
+ }
+
+ void drawDynamic(bool force) {
+ TFT_eSPI* d = tft(); if (!d) return;
+
+ if (_mode == MODE_LIST) {
+ if (!force && _lastSel == _sel) return;
+ _lastSel = _sel;
+
+ for (int i = 0; i < 5; i++) {
+ d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor((i == _sel) ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),X,Y0 + i * DY);
+ }
+ return;
+ }
+
+ uint32_t h = calcHash();
+ if (!force && _lastParam == _param && _lastHash == h) {
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ return;
+ }
+ _lastParam = _param;
+ _lastHash = h;
+
+ uint8_t n = paramCount();
+ for (uint8_t i = 0; i < n; i++) {
+ d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor((i == _param) ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+ if (i == _param) d->drawString(">",0,Y0 + i * DY);
+
+ char line[96];
+ buildLine(i,line,sizeof(line));
+ d->drawString(line,X,Y0 + i * DY);
+ }
+
+ if (_mode == MODE_GPS) drawGpsInfo(true);
+ }
+
+ uint32_t calcHash() const {
+ uint32_t h = 2166136261u;
+ auto mix = [&](uint32_t v) { h ^= v; h *= 16777619u; };
+
+ if (_mode == MODE_GPS) {
+ mix(_tmp.gpsEnable); mix(_tmp.gpsPeriodIdx);
+ mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+ }
+ else if (_mode == MODE_NET) {
+ mix(_tmp.netEnable); mix(_tmp.netProviderIdx); mix(_tmp.netPeriodIdx);
+ mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+ }
+ else if (_mode == MODE_GSM) {
+ mix(_tmp.gsmEnable); mix(_tmp.gsmProviderIdx); mix(_tmp.gsmPeriodIdx);
+ mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+ }
+ mix(_param);
+ return h;
+ }
+
+ void buildLine(uint8_t i,char* out,size_t n) const {
+ if (_mode == MODE_GPS) {
+ if (i == 0) snprintf(out,n,"1) GPS:%s",_tmp.gpsEnable ? "ON" :"OFF");
+ else if (i == 1) snprintf(out,n,"2) PER:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+ else if (i == 2) snprintf(out,n,"3) TZ target:%d",(int)_tzTargetTmp);
+ else snprintf(out,n,"4) TZ NTP:%d",(int)_tzNtpTmp);
+ return;
+ }
+
+ if (_mode == MODE_NET) {
+ if (i == 0) snprintf(out,n,"1) NTP:%s",_tmp.netEnable ? "ON" :"OFF");
+ else if (i == 1) snprintf(out,n,"2) NTP IP:%s",kNtpIpStr[_tmp.netProviderIdx % 5]);
+ else if (i == 2) snprintf(out,n,"3) PER:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+ else if (i == 3) snprintf(out,n,"4) TZ target:%d",(int)_tzTargetTmp);
+ else snprintf(out,n,"5) TZ NTP:%d",(int)_tzNtpTmp);
+ return;
+ }
+
+ // MODE_GSM
+ if (i == 0) snprintf(out,n,"1) GSM:%s",_tmp.gsmEnable ? "ON" :"OFF");
+ else if (i == 1) snprintf(out,n,"2) OP:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+ else if (i == 2) snprintf(out,n,"3) PER:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+ else if (i == 3) snprintf(out,n,"4) TZ target:%d",(int)_tzTargetTmp);
+ else snprintf(out,n,"5) TZ NTP:%d",(int)_tzNtpTmp);
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+
+ void changeParam(int delta) {
+ if (_mode == MODE_GPS) {
+ if (_param == 0) _tmp.gpsEnable = _tmp.gpsEnable ? 0 :1;
+ else if (_param == 1) _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ else if (_param == 2) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+ else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+ return;
+ }
+
+ if (_mode == MODE_NET) {
+ if (_param == 0) _tmp.netEnable = _tmp.netEnable ? 0 :1;
+ else if (_param == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta > 0 ? 1 :4)) % 5);
+ else if (_param == 2) _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ else if (_param == 3) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+ else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+ return;
+ }
+
+ // GSM
+ if (_param == 0) _tmp.gsmEnable = _tmp.gsmEnable ? 0 :1;
+ else if (_param == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta > 0 ? 1 :4)) % 5);
+ else if (_param == 2) _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ else if (_param == 3) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+ else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+ }
+
+ void commitSave() {
+ syncData = _tmp;
+ syncStore.save(syncData);
+
+ // сохранить TZ в cfg + EEPROM
+ cfg.tzTargetHours = _tzTargetTmp;
+ cfg.tzNtpHours = _tzNtpTmp;
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ ee.writeTzNtpHours(cfg.tzNtpHours);
+
+ planner.onSettingsChanged();
+ }
+
+ void drawGpsInfo(bool clearLine) {
+ TFT_eSPI* d = tft(); if (!d) return;
+
+ int y1 = Y0 + 3 * DY;
+ int y2 = Y0 + 4 * DY;
+
+ char line1[64];
+ char line2[96];
+ formatGpsLine1(line1,sizeof(line1));
+ formatGpsLine2(line2,sizeof(line2));
+
+ bool changed1 = (strcmp(_lastGpsLine1,line1) != 0);
+ bool changed2 = (strcmp(_lastGpsLine2,line2) != 0);
+
+ if (clearLine || changed1) {
+ d->fillRect(0,y1,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString(line1,X,y1);
+ strncpy(_lastGpsLine1,line1,sizeof(_lastGpsLine1)-1);
+ _lastGpsLine1[sizeof(_lastGpsLine1)-1] = 0;
+ }
+
+ if (clearLine || changed2) {
+ d->fillRect(0,y2,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ d->drawString(line2,X,y2);
+ strncpy(_lastGpsLine2,line2,sizeof(_lastGpsLine2)-1);
+ _lastGpsLine2[sizeof(_lastGpsLine2)-1] = 0;
+ }
+ }
+};
+
+// -------------------- Internet pages base --------------------
+class InternetPageBase :public PageBase {
+public:
+ using PageBase::PageBase;
+
+protected:
+ static const int X=10,Y_TITLE=0,Y0=22,DY=20,W=320,H=18;
+ static const int Y_HINT1=132,Y_HINT2=148;
+
+ enum Param :uint8_t { P_DHCP=0,P_IP=1,P_MASK=2,P_GW=3,P_DNS=4,P_NTP=5,P_PERIOD=6,PARAM_COUNT=7 };
+
+ static bool isIpParam(uint8_t p){ return (p==P_IP||p==P_MASK||p==P_GW||p==P_DNS); }
+
+ static void adjOct(uint8_t v[4],uint8_t idx,int delta){
+ int x=(int)v[idx]+(delta>0?1:-1);
+ if(x<0) x=255;
+ if(x>255) x=0;
+ v[idx]=(uint8_t)x;
+ }
+
+ void drawIpLine(TFT_eSPI* d,const char* name,uint8_t v[4],uint8_t p,int row,uint8_t curParam) {
+ d->setTextColor(curParam==p?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(curParam==p?">":" ",0,Y0+row*DY);
+
+ char s[40];
+ snprintf(s,sizeof(s),"%s %u.%u.%u.%u",name,v[0],v[1],v[2],v[3]);
+ d->drawString(s,X,Y0+row*DY);
+ }
+};
+
+// -------------------- Page2:ИНТЕРНЕТ1 --------------------
+class Page2 :public InternetPageBase {
+public:
+ using InternetPageBase::InternetPageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+ _param = 0;
+ _oct = 0;
+ lanStore.load(LanIfStore::IF1,_cfg,false);
+ draw();
+ }
+
+ void update() override {}
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW4) { // SAVE+HOME
+ lanStore.save(LanIfStore::IF1,_cfg,true);
+ applyInternet1FromStore();
+ _m->backToStart();
+ return;
+ }
+
+ if (buttonID == BTN_SW1) { // NEXT
+ if (isIpParam(_param)) {
+ _oct = (_oct + 1) & 3;
+ if (_oct == 0) _param = (_param + 1) % PARAM_COUNT;
+ } else {
+ _param = (_param + 1) % PARAM_COUNT;
+ }
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ int delta = (buttonID == BTN_SW3) ? +1 :-1;
+ applyDelta(delta);
+ drawDynamic(false);
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ LanIfStore::IfConfig _cfg{};
+ bool _staticDrawn=false;
+ uint8_t _param=0;
+ uint8_t _oct=0;
+
+ void drawStatic(){
+ auto d=tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("INTERNET1",X,Y_TITLE);
+
+ d->setTextSize(1);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+ d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+ d->drawString("SW4:SAVE+HOME",X,Y_HINT2);
+ d->setTextSize(2);
+ }
+
+ void drawDynamic(bool){
+ auto d=tft(); if(!d) return;
+
+ for(int i=0;i<6;i++) d->fillRect(0,Y0+i*DY,W,H,TFT_BLACK);
+
+ d->setTextColor(_param==P_DHCP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_DHCP?">":" ",0,Y0+0*DY);
+ d->drawString(_cfg.dhcp ? "DHCP:ON" :"DHCP:OFF",X,Y0+0*DY);
+
+ drawIpLine(d,"IP :",_cfg.ip,P_IP,1,_param);
+ drawIpLine(d,"MASK:",_cfg.mask,P_MASK,2,_param);
+ drawIpLine(d,"GW :",_cfg.gw,P_GW,3,_param);
+ drawIpLine(d,"DNS :",_cfg.dns,P_DNS,4,_param);
+
+ // NTP + PERIOD
+ char b[64];
+ d->setTextColor(_param==P_NTP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_NTP?">":" ",0,Y0+5*DY);
+ snprintf(b,sizeof(b),"NTP:%s",kNtpIpStr[_cfg.ntpIdx % 5]);
+ d->drawString(b,X,Y0+5*DY);
+
+ d->setTextColor(_param==P_PERIOD?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ snprintf(b,sizeof(b),"PER:%s",kPeriodsName[_cfg.periodIdx % 6]);
+ d->fillRect(160,Y0+5*DY,160,H,TFT_BLACK);
+ d->drawString(b,160,Y0+5*DY);
+ }
+
+ void applyDelta(int delta){
+ if (_param==P_DHCP){ _cfg.dhcp = _cfg.dhcp?0:1; return; }
+
+ if (_cfg.dhcp && isIpParam(_param)) return;
+
+ if (_param==P_IP) adjOct(_cfg.ip,_oct,delta);
+ else if (_param==P_MASK) adjOct(_cfg.mask,_oct,delta);
+ else if (_param==P_GW) adjOct(_cfg.gw,_oct,delta);
+ else if (_param==P_DNS) adjOct(_cfg.dns,_oct,delta);
+ else if (_param==P_NTP) _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta>0?1:4)) % 5);
+ else if (_param==P_PERIOD) _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta>0?1:5)) % 6);
+ }
+};
+
+// -------------------- Page3:ИНТЕРНЕТ2 (пока не реализован) --------------------
+class Page3 :public InternetPageBase {
+public:
+ using InternetPageBase::InternetPageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+ _param = 0;
+ _oct = 0;
+ lanStore.load(LanIfStore::IF2,_cfg,false);
+ draw();
+ }
+
+ void update() override {}
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW4) { // SAVE+HOME
+ lanStore.save(LanIfStore::IF2,_cfg,true);
+ _m->backToStart();
+ return;
+ }
+
+ if (buttonID == BTN_SW1) {
+ if (isIpParam(_param)) {
+ _oct = (_oct + 1) & 3;
+ if (_oct == 0) _param = (_param + 1) % PARAM_COUNT;
+ } else {
+ _param = (_param + 1) % PARAM_COUNT;
+ }
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ int delta = (buttonID == BTN_SW3) ? +1 :-1;
+ applyDelta(delta);
+ drawDynamic(false);
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ LanIfStore::IfConfig _cfg{};
+ bool _staticDrawn=false;
+ uint8_t _param=0;
+ uint8_t _oct=0;
+
+ void drawStatic(){
+ auto d=tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("INTERNET2",X,Y_TITLE);
+
+ d->setTextSize(1);
+ d->setTextColor(TFT_RED,TFT_BLACK);
+ d->drawString("NOT IMPLEMENTED (2nd MCU over I2C)",X,18);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+ d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+ d->drawString("SW4:SAVE+HOME",X,Y_HINT2);
+ d->setTextSize(2);
+ }
+
+ void drawDynamic(bool){
+ auto d=tft(); if(!d) return;
+
+ for(int i=0;i<6;i++) d->fillRect(0,Y0+i*DY,W,H,TFT_BLACK);
+
+ d->setTextColor(_param==P_DHCP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_DHCP?">":" ",0,Y0+0*DY);
+ d->drawString(_cfg.dhcp ? "DHCP:ON" :"DHCP:OFF",X,Y0+0*DY);
+
+ drawIpLine(d,"IP :",_cfg.ip,P_IP,1,_param);
+ drawIpLine(d,"MASK:",_cfg.mask,P_MASK,2,_param);
+ drawIpLine(d,"GW :",_cfg.gw,P_GW,3,_param);
+ drawIpLine(d,"DNS :",_cfg.dns,P_DNS,4,_param);
+
+ char b[64];
+ d->setTextColor(_param==P_NTP?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ d->drawString(_param==P_NTP?">":" ",0,Y0+5*DY);
+ snprintf(b,sizeof(b),"NTP:%s",kNtpIpStr[_cfg.ntpIdx % 5]);
+ d->drawString(b,X,Y0+5*DY);
+
+ d->setTextColor(_param==P_PERIOD?TFT_CYAN:TFT_WHITE,TFT_BLACK);
+ snprintf(b,sizeof(b),"PER:%s",kPeriodsName[_cfg.periodIdx % 6]);
+ d->fillRect(160,Y0+5*DY,160,H,TFT_BLACK);
+ d->drawString(b,160,Y0+5*DY);
+ }
+
+ void applyDelta(int delta){
+ if (_param==P_DHCP){ _cfg.dhcp = _cfg.dhcp?0:1; return; }
+ if (_cfg.dhcp && isIpParam(_param)) return;
+
+ if (_param==P_IP) adjOct(_cfg.ip,_oct,delta);
+ else if (_param==P_MASK) adjOct(_cfg.mask,_oct,delta);
+ else if (_param==P_GW) adjOct(_cfg.gw,_oct,delta);
+ else if (_param==P_DNS) adjOct(_cfg.dns,_oct,delta);
+ else if (_param==P_NTP) _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta>0?1:4)) % 5);
+ else if (_param==P_PERIOD) _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta>0?1:5)) % 6);
+ }
+};
+
+// -------------------- Page4/5 stubs --------------------
+class Page4 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void onActivate() override { draw(); }
+ void update() override {}
+ void draw() override {
+ auto d=tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("PAGE 4",10,10);
+ }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page5 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void onActivate() override { draw(); }
+ void update() override {}
+ void draw() override {
+ auto d=tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("PAGE 5",10,10);
+ }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+// ---------------------------------------------------------
+
+Menu::Menu(TFT_eSPI* disp) :tft(disp) {}
+
+void Menu::attachPages()
+{
+ static Page1 p1(this);
+ static Page2 p2(this);
+ static Page3 p3(this);
+ static Page4 p4(this);
+ static Page5 p5(this);
+
+ pages[0] = &p1; // SOURCES
+ pages[1] = &p2; // INTERNET1
+ pages[2] = &p3; // INTERNET2
+ pages[3] = &p4;
+ pages[4] = &p5;
+}
+
+void Menu::setup(const String& ver)
+{
+ versionString = ver;
+
+ tft->init();
+ tft->setRotation(3);
+ tft->fillScreen(TFT_NAVY);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+
+ // стартовый экран
+ tft->loadFont(AA_FONT_CALI);
+ tft->setCursor(120,20); tft->println("IVCH");
+ tft->setCursor(100,50); tft->println("DECIMA");
+
+ tft->loadFont(AA_FONT_TIME24I);
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->setCursor(84,90); tft->println("ВКЛЮЧЕНИЕ");
+
+ tft->loadFont(AA_FONT_TIME18);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->setCursor(5,130); tft->println("(C) 2026");
+ tft->setCursor(5,150); tft->println("www.decima.ru");
+
+ uint16_t tbw = tft->textWidth(versionString);
+ uint16_t x = (tft->width() - tbw) - 4;
+ tft->setCursor(x,150);
+ tft->print(versionString);
+
+ attachPages();
+ for (int i = 0; i < 5; i++) if (pages[i]) pages[i]->setup();
+
+ drawStartPage();
+}
+
+void Menu::update()
+{
+ const uint32_t now = millis();
+
+ if (state == MENU_IDLE) {
+ if (!_homeStaticDrawn) {
+ drawHomeStatic();
+ _homeStaticDrawn = true;
+ _homeDirty = true;
+ }
+
+ // HOME dynamic каждые 500мс
+ if (_homeDirty || (now - _lastHomeTickMs) >= 500) {
+ _lastHomeTickMs = now;
+ drawHomeDynamic();
+ _homeDirty = false;
+ }
+ return;
+ }
+
+ if (state == MENU_ITEM_SELECT) {
+ if (pages[page]) pages[page]->update();
+ }
+}
+
+void Menu::invalidateHome() { _homeDirty = true; }
+
+void Menu::drawStartPage()
+{
+ state = MENU_IDLE;
+ _homeStaticDrawn = false;
+ _homeDirty = true;
+}
+
+void Menu::drawHomeStatic()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("HOME",10,Y_HOME);
+
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("IP :",10,Y_IP);
+ tft->drawString("DATE:",10,Y_DATE);
+ tft->drawString("NET :",10,Y_NET);
+ tft->drawString("SIG :",10,Y_SIG);
+
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->drawString(versionString,10,Y_VER);
+
+ _lastIp[0] = 0;
+ _lastDate[0] = 0;
+ _lastNet = !gNetRegistered;
+ _lastBars = 255;
+}
+
+void Menu::drawHomeDynamic()
+{
+ // IP1
+ if (strcmp(_lastIp,gIp1Str) != 0) {
+ strncpy(_lastIp,gIp1Str,sizeof(_lastIp) - 1);
+ _lastIp[sizeof(_lastIp) - 1] = 0;
+ tft->fillRect(80,Y_IP,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastIp,80,Y_IP);
+ }
+
+ // Date
+ if (strcmp(_lastDate,gDateStr) != 0) {
+ strncpy(_lastDate,gDateStr,sizeof(_lastDate) - 1);
+ _lastDate[sizeof(_lastDate) - 1] = 0;
+ tft->fillRect(80,Y_DATE,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastDate,80,Y_DATE);
+ }
+
+ // Net
+ if (_lastNet != gNetRegistered) {
+ _lastNet = gNetRegistered;
+ tft->fillRect(80,Y_NET,240,20,TFT_BLACK);
+ tft->setTextColor(gNetRegistered ? TFT_GREEN :TFT_RED,TFT_BLACK);
+ tft->drawString(gNetRegistered ? "CONNECTED" :"NO",80,Y_NET);
+ }
+
+ // Signal
+ if (_lastBars != gSignalBars) {
+ _lastBars = gSignalBars;
+ tft->fillRect(80,Y_SIG,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ char buf[32];
+ if (gCsqRssi == 99 || gRssiDbm == 0) snprintf(buf,sizeof(buf),"-- [0/5]");
+ else snprintf(buf,sizeof(buf),"%ddBm [%u/5]",(int)gRssiDbm,(unsigned)gSignalBars);
+ tft->drawString(buf,80,Y_SIG);
+ }
+}
+
+void Menu::activate()
+{
+ page = 0;
+ item = 0;
+ state = MENU_PAGE_SELECT;
+ draw();
+}
+
+void Menu::deactivate()
+{
+ drawStartPage();
+}
+
+bool Menu::isActive() const { return state != MENU_IDLE; }
+MenuState Menu::getState() const { return state; }
+
+void Menu::prevPage() { if (state == MENU_PAGE_SELECT) { page = (page + 4) % 5; drawPageSelect(); } }
+void Menu::nextPage() { if (state == MENU_PAGE_SELECT) { page = (page + 1) % 5; drawPageSelect(); } }
+
+void Menu::prevItem() { if (state == MENU_ITEM_SELECT) { item = (item + 4) % 5; drawActivePage(); } }
+void Menu::nextItem() { if (state == MENU_ITEM_SELECT) { item = (item + 1) % 5; drawActivePage(); } }
+
+void Menu::fixPage()
+{
+ if (state == MENU_PAGE_SELECT) {
+ item = 0;
+ state = MENU_ITEM_SELECT;
+ if (pages[page]) pages[page]->onActivate();
+ else drawActivePage();
+ }
+}
+
+void Menu::backToStart() { deactivate(); }
+
+void Menu::draw()
+{
+ if (state == MENU_PAGE_SELECT) drawPageSelect();
+ else if (state == MENU_ITEM_SELECT) drawActivePage();
+ else if (state == MENU_TEST) drawTestPage();
+ else drawStartPage();
+}
+
+void Menu::drawPageSelect()
+{
+ static const char* topMenuNames[5] = {
+ "ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+ "ИНТЕРНЕТ1",
+ "ИНТЕРНЕТ2",
+ "СВОБОДНО",
+ "СВОБОДНО"
+ };
+
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("ВЫБОР МЕНЮ",10,10);
+
+ // IP line
+ tft->setTextSize(1);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ char ipLine[64];
+ snprintf(ipLine,sizeof(ipLine),"IP1:%s IP2:%s",gIp1Str,gIp2Str);
+ tft->drawString(ipLine,10,28);
+
+ tft->setTextSize(2);
+
+ for (int i = 0; i < 5; i++) {
+ bool sel = (i == page);
+ tft->setTextColor(sel ? TFT_GREEN :TFT_WHITE,sel ? TFT_BLUE :TFT_BLACK);
+ tft->fillRect(10,45 + i * 24,310,22,TFT_BLACK);
+ tft->drawString(topMenuNames[i],10,45 + i * 24);
+ }
+}
+
+void Menu::drawActivePage()
+{
+ if (pages[page]) pages[page]->draw();
+}
+
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:вход в меню по SW1
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW1) activate();
+ return;
+ }
+
+ // MENU_PAGE_SELECT:SW2 up,SW3 down,SW1 enter,SW4 home
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) prevPage();
+ else if (buttonID == BTN_SW3) nextPage();
+ else if (buttonID == BTN_SW1) fixPage();
+ else if (buttonID == BTN_SW4) backToStart();
+ return;
+ }
+
+ if (state == MENU_ITEM_SELECT) {
+ if (pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+ }
+}
+
+void Menu::onButtonReleased(int buttonID)
+{
+ if (state == MENU_ITEM_SELECT && pages[page]) pages[page]->onButtonReleased(buttonID);
+}
+
+const char* Menu::itemLabel(int p,int i) const
+{
+ // таблица menu[][] только для page 0 (Page1 list)
+ if (p < 0 || p > 4 || i < 0 || i > 4) return "";
+ return menu[p][i];
+}
+
+void Menu::drawTestPage()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextColor(TFT_RED,TFT_BLACK);
+ tft->setTextSize(2);
+ tft->drawString("TEST (legacy)",20,60);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("SW4 - exit",20,120);
+}
+Что нужно ДОБАВИТЬ в проект,чтобы этот Menu.cpp собрался
+1) В NetFeed.h/.cpp
+Добавьте IP‑строки:
+
+gIp1Str,gIp2Str,gIpUpdated (как я писал выше).
+2) В .ino должны быть глобальные:
+cpp Копировать
+LanIfStore lanStore(0x50,Wire);
+и функция:
+
+cpp Копировать
+void applyInternet1FromStore();
+3) В .ino нужно раз в секунду обновлять gIp1Str/gIp2Str
+(чтобы HOME и “ВЫБОР МЕНЮ” показывали IP).
+
+Следующий шаг (если скажете “ок”)
+Я дам готовые:
+
+applyInternet1FromStore() (с загрузкой из lanStore и вызовами ntpLan.applyLanConfig() + ntpLan.applyUpstream())
+патч NtpLanService_Generic (добавить методы applyLanConfig/applyUpstream) под вашу текущую PIMPL-реализацию.
+Для этого пришлите ваш текущий NtpLanService_Generic.h/.cpp (ту версию,которая у вас сейчас успешно компилируется и даёт NTP=OK).

@@ -1,1 +1,3212 @@
 Настройки меню
+
+При входе в меню drawPageSelect()отображать "ВЫБОР МЕНЮ"
+меню 1 "ИСТОЧНИКИ СИНХРОНИЗАЦИИ"
+Подпункты меню 1
+1 "GPS"
+2 "ИНТЕРНЕТ"
+3 "GSM"
+4 "СВОБОДНО"
+5 "СВОБОДНО"
+
+Меню "GPS"
+1 пунктом подменю установка флага - включить или отключить источник синхронизации
+2 пунктом подменю установка периода опроса источника. 1 минута,10 минут,30 минут 1 час, 6 часов, 12 часов
+Внизу выводить информацию по спутникам
+
+Меню "ИНТЕРНЕТ"
+1 пунктом подменю установка флага - включить или отключить источник синхронизации
+2 пунктом подменю выбор провайдера " ", " ", " ", " ", " " уточним сайты синхронизации времени.
+3 пунктом подменю установка периода опроса источника. 1 минута,10 минут,30 минут 1 час, 6 часов, 12 часов
+
+Меню "GSM"
+1 пунктом подменю установка флага - включить или отключить источник синхронизации
+2 пунктом подменю выбор провайдера "МТС", "МЕГАФОН", "БИЛАЙН", "YOTA", "ТЕЛЕ 2"
+3 пунктом подменю установка периода опроса источника. 1 минута,10 минут,30 минут 1 час, 6 часов, 12 часов
+
+////////////////////////////////////////////////////////////////////////
+
+Ниже — конкретный план и готовые заготовки кода под ваши требования,встраиваемые 
+в текущую архитектуру страниц‑программ (setup/update/draw/onActivate/onButtonPressed/onButtonReleased).
+
+0) Принятые кнопки (единый стиль)
+SW1:назад / на HOME
+SW2:вниз / “–”
+SW3:вверх / “+”
+SW4:выбор / подтвердить / переключить
+1) drawPageSelect() — заголовок “ВЫБОР МЕНЮ”
+В вашем новом Menu.cpp (там где drawPageSelect()),замените заголовок:
+
+cpp Копировать
+tft->drawString("SELECT PAGE",10,10);
+на:
+
+cpp Копировать
+tft->drawString("ВЫБОР МЕНЮ",10,10);
+2) Меню 1:“ИСТОЧНИКИ СИНХРОНИЗАЦИИ” и подпункты
+Вы ранее держали menu[5][5]. Заполните страницу 1 так:
+
+cpp Копировать
+const char* menu[5][5] = {
+ // Меню 1:источники синхронизации
+ {"GPS","ИНТЕРНЕТ","GSM","СВОБОДНО","СВОБОДНО"},
+
+ // Остальные страницы меню (пока заглушки)
+ {"P2-1","P2-2","P2-3","P2-4","P2-5"},
+ {"P3-1","P3-2","P3-3","P3-4","P3-5"},
+ {"P4-1","P4-2","P4-3","P4-4","P4-5"},
+ {"P5-1","P5-2","P5-3","P5-4","P5-5"}
+};
+И сделайте так,чтобы Str1 называлась “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” (не “Str1”).
+  Самый простой вариант — заменить строки в drawPageSelect():
+
+cpp Копировать
+static const char* topMenuNames[5] = {
+ "ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+ "СВОБОДНО",
+ "СВОБОДНО",
+ "СВОБОДНО",
+ "СВОБОДНО"
+};
+и рисовать их вместо Str%d.
+
+3) Архитектура:как сделать независимые “подменю” GPS/ИНТЕРНЕТ/GSM
+Сейчас у вас “страница‑программа” = Str1..Str5. Но внутри Str1 нужны 3 независимых экрана (GPS/ИНТЕРНЕТ/GSM).
+
+Решение:внутри Page1 (источники синхронизации) сделать внутренний режим:
+
+режим A:список источников (GPS/ИНТЕРНЕТ/GSM/...)
+режим B:настройка выбранного источника (экраны “GPS”,“ИНТЕРНЕТ”,“GSM”)
+То есть Page1 сама будет переключаться между “списком” и “настройками”.
+
+4) Общие данные настроек (флаги/периоды/провайдеры)
+Периоды опроса фиксированные:
+
+cpp Копировать
+static const uint32_t kPeriodsMs[] = {
+ 60000UL,// 1 мин
+ 600000UL,// 10 мин
+ 1800000UL,// 30 мин
+ 3600000UL,// 1 час
+ 21600000UL,// 6 часов
+ 43200000UL // 12 часов
+};
+
+static const char* kPeriodsName[] = {
+ "1 мин","10 мин","30 мин","1 час","6 часов","12 часов"
+};
+Провайдеры GSM:
+
+cpp Копировать
+static const char* kGsmProviders[] = {"МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2"};
+Провайдеры INTERNET (пока заглушки):
+
+cpp Копировать
+static const char* kNetProviders[] = {" "," "," "," "," "}; // позже заменим на сайты NTP
+5) Страница 1 (Page1):реализация меню “ИСТОЧНИКИ СИНХРОНИЗАЦИИ”
+Ниже — заготовка класса Page1,которая:
+
+рисует список источников,
+по SW4 “входит” в настройки выбранного источника,
+по SW1 возвращается назад (или в HOME,если уже в списке),
+умеет перерисовывать только изменённые строки (без полного fillScreen в динамике).
+Вам нужно вставить этот класс в Menu.cpp вместо вашего текущего Page1.
+
+Для хранения настроек предлагаю пока держать их в RAM (структура SyncCfg) и позже 
+привязать к EEPROM (по фиксированным адресам). В конце напишу,как правильно сохранить в AT24C128.
+
+cpp Копировать
+struct SyncCfg {
+ bool gpsEnable = false;
+ uint8_t gpsPeriodIdx = 0; // 0..5
+
+ bool netEnable = false;
+ uint8_t netProviderIdx = 0; // 0..4
+ uint8_t netPeriodIdx = 0;
+
+ bool gsmEnable = true;
+ uint8_t gsmProviderIdx = 0; // 0..4
+ uint8_t gsmPeriodIdx = 0;
+};
+
+// где-то глобально (или extern из .ino),чтобы потом сохранять в EEPROM
+static SyncCfg gSync;
+Данные по спутникам (для нижней строки GPS)
+Сделайте глобальные переменные (их заполняет ваш GPS‑код):
+
+cpp Копировать
+extern uint8_t gGpsSatsUsed; // например 0..32
+extern uint8_t gGpsSatsView; // 0..32
+extern bool gGpsFix; // true/false
+Page1
+cpp Копировать
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ }
+
+ void update() override {
+ // тут можно обновлять нижнюю строку по спутникам,если MODE_GPS
+ if (_mode == MODE_GPS) drawGpsSatInfo(false);
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (_mode == MODE_LIST) {
+ if (buttonID == BTN_SW2) { _sel = (_sel + 1) % 5; drawDynamic(false); }
+ else if (buttonID == BTN_SW3) { _sel = (_sel + 4) % 5; drawDynamic(false); }
+ else if (buttonID == BTN_SW4) {
+ if (_sel == 0) { _mode = MODE_GPS; _subSel = 0; _staticDrawn=false; draw(); }
+ else if (_sel == 1) { _mode = MODE_NET; _subSel = 0; _staticDrawn=false; draw(); }
+ else if (_sel == 2) { _mode = MODE_GSM; _subSel = 0; _staticDrawn=false; draw(); }
+ }
+ else if (buttonID == BTN_SW1) {
+ _m->backToStart(); // HOME
+ }
+ return;
+ }
+
+ // Подменю GPS/NET/GSM
+ if (buttonID == BTN_SW1) { // назад в список
+ _mode = MODE_LIST;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+
+ // навигация по пунктам подменю
+ if (buttonID == BTN_SW2) { _subSel = (_subSel + 1) % subCount(); drawDynamic(false); return; }
+ if (buttonID == BTN_SW3) { _subSel = (_subSel + subCount() - 1) % subCount(); drawDynamic(false); return; }
+
+ // SW4:изменить значение выбранного подпункта
+ if (buttonID == BTN_SW4) {
+ applyActionOnSubItem();
+ drawDynamic(false);
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum Mode { MODE_LIST,MODE_GPS,MODE_NET,MODE_GSM } _mode = MODE_LIST;
+ bool _staticDrawn = false;
+
+ uint8_t _sel = 0; // выбор источника в списке
+ uint8_t _subSel = 0; // выбор подпункта в подменю
+
+ // кэши,чтобы не перерисовывать лишнее (упрощённо)
+ uint8_t _lastSel = 255;
+ uint8_t _lastSubSel = 255;
+
+ void drawStatic() {
+ auto d = tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ if (_mode == MODE_LIST) {
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",10,10);
+ } else if (_mode == MODE_GPS) {
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("GPS",10,10);
+ } else if (_mode == MODE_NET) {
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("ИНТЕРНЕТ",10,10);
+ } else if (_mode == MODE_GSM) {
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("GSM",10,10);
+ }
+
+ // очистка областей строк
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ if (_mode == MODE_LIST) {
+ for (int i=0;i<5;i++) d->fillRect(10,50+i*28,300,24,TFT_BLACK);
+ } else {
+ // подменю (до 3 пунктов),плюс нижняя строка у GPS
+ for (int i=0;i<4;i++) d->fillRect(10,50+i*28,300,24,TFT_BLACK);
+ }
+ _lastSel = 255;
+ _lastSubSel = 255;
+ }
+
+ void drawDynamic(bool force) {
+ auto d = tft(); if(!d) return;
+
+ if (_mode == MODE_LIST) {
+ if (!force && _lastSel == _sel) return;
+ _lastSel = _sel;
+
+ for (int i=0;i<5;i++) {
+ d->fillRect(10,50+i*28,300,24,TFT_BLACK);
+ d->setTextColor(i==_sel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),10,50+i*28);
+ }
+ return;
+ }
+
+ // подменю
+ if (!force && _lastSubSel == _subSel) {
+ // всё равно у GPS обновим инфо по спутникам
+ if (_mode == MODE_GPS) drawGpsSatInfo(false);
+ return;
+ }
+ _lastSubSel = _subSel;
+
+ drawSubMenuLines();
+ if (_mode == MODE_GPS) drawGpsSatInfo(true);
+ }
+
+ uint8_t subCount() const {
+ if (_mode == MODE_GPS) return 2;
+ if (_mode == MODE_NET) return 3;
+ if (_mode == MODE_GSM) return 3;
+ return 0;
+ }
+
+ void drawSubMenuLines() {
+ auto d = tft(); if(!d) return;
+
+ // 0:Enable,1:Period,2:Provider (если есть)
+ for (int i=0;i<subCount();i++) {
+ d->fillRect(10,50+i*28,300,24,TFT_BLACK);
+ d->setTextColor(i==_subSel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+
+ char line[64];
+ if (_mode == MODE_GPS) {
+ if (i==0) snprintf(line,sizeof(line),"1) ВКЛ:%s",gSync.gpsEnable ? "ДА":"НЕТ");
+ if (i==1) snprintf(line,sizeof(line),"2) ПЕРИОД:%s",kPeriodsName[gSync.gpsPeriodIdx]);
+ }
+ else if (_mode == MODE_NET) {
+ if (i==0) snprintf(line,sizeof(line),"1) ВКЛ:%s",gSync.netEnable ? "ДА":"НЕТ");
+ if (i==1) snprintf(line,sizeof(line),"2) ПРОВ:%s",kNetProviders[gSync.netProviderIdx]);
+ if (i==2) snprintf(line,sizeof(line),"3) ПЕРИОД:%s",kPeriodsName[gSync.netPeriodIdx]);
+ }
+ else if (_mode == MODE_GSM) {
+ if (i==0) snprintf(line,sizeof(line),"1) ВКЛ:%s",gSync.gsmEnable ? "ДА":"НЕТ");
+ if (i==1) snprintf(line,sizeof(line),"2) ПРОВ:%s",kGsmProviders[gSync.gsmProviderIdx]);
+ if (i==2) snprintf(line,sizeof(line),"3) ПЕРИОД:%s",kPeriodsName[gSync.gsmPeriodIdx]);
+ }
+
+ d->drawString(line,10,50+i*28);
+ }
+ }
+
+ void drawGpsSatInfo(bool force) {
+ auto d = tft(); if(!d) return;
+ const int y = 50 + 3*28; // нижняя строка
+ if (force) d->fillRect(10,y,300,24,TFT_BLACK);
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+
+ char buf[64];
+ snprintf(buf,sizeof(buf),"SAT:%u/%u FIX:%s",
+ (unsigned)gGpsSatsUsed,(unsigned)gGpsSatsView,gGpsFix ? "YES":"NO");
+ d->drawString(buf,10,y);
+ }
+
+ void applyActionOnSubItem() {
+ if (_mode == MODE_GPS) {
+ if (_subSel == 0) gSync.gpsEnable = !gSync.gpsEnable;
+ if (_subSel == 1) gSync.gpsPeriodIdx = (gSync.gpsPeriodIdx + 1) % 6;
+ }
+ else if (_mode == MODE_NET) {
+ if (_subSel == 0) gSync.netEnable = !gSync.netEnable;
+ if (_subSel == 1) gSync.netProviderIdx = (gSync.netProviderIdx + 1) % 5;
+ if (_subSel == 2) gSync.netPeriodIdx = (gSync.netPeriodIdx + 1) % 6;
+ }
+ else if (_mode == MODE_GSM) {
+ if (_subSel == 0) gSync.gsmEnable = !gSync.gsmEnable;
+ if (_subSel == 1) gSync.gsmProviderIdx = (gSync.gsmProviderIdx + 1) % 5;
+ if (_subSel == 2) gSync.gsmPeriodIdx = (gSync.gsmPeriodIdx + 1) % 6;
+ }
+ // Здесь же можно сразу сохранять в EEPROM по SW4 (или сделать сохранение отдельным пунктом)
+ }
+};
+6) Сохранение в AT24C128 (фиксированные адреса)
+Вы просили “записывать в память”. Для этих настроек предлагаю зарезервировать область,например с 0x0200.
+
+Минимальная карта:
+
+0x0200 gpsEnable (u8)
+0x0201 gpsPeriodIdx (u8)
+0x0202 netEnable (u8)
+0x0203 netProviderIdx (u8)
+0x0204 netPeriodIdx (u8)
+0x0205 gsmEnable (u8)
+0x0206 gsmProviderIdx (u8)
+0x0207 gsmPeriodIdx (u8)
+Чтобы это сделать аккуратно,лучше добавить в AT24C128Settings методы readU8/writeU8 публично или 
+сделать отдельный небольшой класс SyncSettingsStore 
+(как вы делали для AT24C128Settings). Я могу дать готовые файлы .h/.cpp под это.
+
+7) Что нужно от вас,чтобы я “закрыл” реализацию полностью
+GPS у вас уже есть? Чем заполнять:
+gGpsSatsUsed,gGpsSatsView,gGpsFix
+Сохранение:
+сохранять каждое изменение сразу (при SW4),или сделать отдельный пункт “СОХРАНИТЬ”?
+INTERNET “провайдеры”:вы имели в виду список NTP серверов (например pool.ntp.org,time.google.com и т.д.)? 
+Тогда я заменю kNetProviders[] на реальные строки и привяжу к cfg.server + сохранению в EEPROM.
+
+//==============================================================================================
+
+Нужно сделать 2 изменения:
+
+Сохранять TZ только по SW1 → SW1 должен попасть в Page2,а сейчас в Menu::onButtonPressed() SW1 в MENU_ITEM_SELECT сразу делает backToStart() и страница не успевает сохранить.
+
+Уменьшить расстояния между строками → поменять Y‑координаты в drawPageSelect() и в Page2.
+
+Ниже — точечные правки вашего Menu.cpp.
+
+1) Исправить обработку SW1 в Menu::onButtonPressed() (дать Page2 сохранить)
+Замените этот блок в Menu::onButtonPressed():
+
+cpp Копировать
+if (state == MENU_ITEM_SELECT) {
+ if (buttonID == BTN_SW2) prevItem();
+ else if (buttonID == BTN_SW3) nextItem();
+ else if (buttonID == BTN_SW1) backToStart();
+ else if (buttonID == BTN_SW4) fixItem();
+
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+}
+на такой (важно:SW1 для Page2 отдаём странице,для остальных — как раньше):
+
+cpp Копировать
+if (state == MENU_ITEM_SELECT) {
+
+ // SW1:для страницы 2 (index=1) сначала дать странице обработать (сохранить) и выйти самой
+ if (buttonID == BTN_SW1) {
+ if (page == 1 && pages[page]) {
+ pages[page]->onButtonPressed(buttonID); // Page2 сама сохранит и вызовет _m->backToStart()
+ } else {
+ backToStart();
+ }
+ return;
+ }
+
+ // остальная базовая навигация
+ if (buttonID == BTN_SW2) prevItem();
+ else if (buttonID == BTN_SW3) nextItem();
+ else if (buttonID == BTN_SW4) fixItem();
+
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+}
+2) Page2:изменять SW2/SW3,переключать поле SW4,сохранять только SW1 + уменьшить интервалы
+Замените ваш текущий class Page2 целиком на этот (он не чистит весь экран при изменениях,перерисовывает только значения/индикаторы):
+
+cpp Копировать
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+ _editField = 0; // 0=tzTarget,1=tzNtp
+ _lastTzTarget = 127;
+ _lastTzNtp = 127;
+ _savedMsgMs = 0;
+ _lastSavedVisible = false;
+ _lastEditField = 255;
+ draw();
+ }
+
+ void update() override {
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic();
+ }
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+ if (buttonID == BTN_SW2) {
+ if (_editField == 0) { cfg.tzTargetHours--; clampTz(cfg.tzTargetHours); }
+ else { cfg.tzNtpHours--; clampTz(cfg.tzNtpHours); }
+ drawDynamic();
+ }
+ else if (buttonID == BTN_SW3) {
+ if (_editField == 0) { cfg.tzTargetHours++; clampTz(cfg.tzTargetHours); }
+ else { cfg.tzNtpHours++; clampTz(cfg.tzNtpHours); }
+ drawDynamic();
+ }
+ else if (buttonID == BTN_SW4) {
+ // SW4:переключить редактируемое поле
+ _editField = (_editField == 0) ? 1 :0;
+ drawDynamic();
+ }
+ else if (buttonID == BTN_SW1) {
+ // SW1:СОХРАНИТЬ и выйти на HOME
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ ee.writeTzNtpHours(cfg.tzNtpHours);
+
+ _savedMsgMs = millis();
+ drawDynamic();
+
+ // выйти
+ _m->backToStart();
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ bool _staticDrawn = false;
+ uint8_t _editField = 0; // 0 target,1 ntp
+
+ int8_t _lastTzTarget = 127;
+ int8_t _lastTzNtp = 127;
+ uint8_t _lastEditField = 255;
+
+ bool _lastSavedVisible = false;
+ uint32_t _savedMsgMs = 0;
+
+ // ---- Компактная верстка (меньше расстояния между строками) ----
+ static const int X_LABEL = 10;
+ static const int X_VAL = 165;
+
+ static const int Y_TZT = 45;
+ static const int Y_TZN = 70;
+ static const int W_VAL = 155;
+ static const int H_VAL = 20;
+
+ static const int Y_HELP1 = 105;
+ static const int Y_HELP2 = 130;
+ static const int Y_HELP3 = 155;
+ static const int Y_HELP4 = 180;
+
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = 180;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 20;
+
+ void drawStatic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("TIME ZONE",10,10);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString("TZ target:",X_LABEL,Y_TZT);
+ d->drawString("TZ NTP :",X_LABEL,Y_TZN);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString("SW2 - -",10,Y_HELP1);
+ d->drawString("SW3 - +",10,Y_HELP2);
+ d->drawString("SW4 - FIELD",10,Y_HELP3);
+ d->drawString("SW1 - SAVE+HOME",10,Y_HELP4);
+
+ // очистка динамических областей
+ d->fillRect(X_VAL,Y_TZT,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_TZN,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ }
+
+ void drawDynamic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ // подсветка редактируемого поля (маленький маркер ">" слева)
+ if (_lastEditField != _editField) {
+ _lastEditField = _editField;
+ // стереть маркеры
+ d->fillRect(0,Y_TZT,10,H_VAL,TFT_BLACK);
+ d->fillRect(0,Y_TZN,10,H_VAL,TFT_BLACK);
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString(">",0,(_editField == 0) ? Y_TZT :Y_TZN);
+ }
+
+ // TZ target
+ if (_lastTzTarget != cfg.tzTargetHours) {
+ _lastTzTarget = cfg.tzTargetHours;
+ d->fillRect(X_VAL,Y_TZT,W_VAL,H_VAL,TFT_BLACK);
+ char buf[16];
+ snprintf(buf,sizeof(buf),"%d",(int)_lastTzTarget);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_TZT);
+ }
+
+ // TZ NTP
+ if (_lastTzNtp != cfg.tzNtpHours) {
+ _lastTzNtp = cfg.tzNtpHours;
+ d->fillRect(X_VAL,Y_TZN,W_VAL,H_VAL,TFT_BLACK);
+ char buf[16];
+ snprintf(buf,sizeof(buf),"%d",(int)_lastTzNtp);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_TZN);
+ }
+
+ // SAVED indicator
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+};
+Что изменилось по требованиям:
+
+SW4 больше не сохраняет (теперь переключает поле target/ntp).
+Сохранение только SW1 (writeTzTargetHours + writeTzNtpHours) и сразу выход на HOME.
+Интервалы между строками уменьшены (Y_TZT=45,Y_TZN=70,help строки тоже ближе).
+3) Уменьшить расстояние между строками в drawPageSelect()
+Сейчас у вас:
+
+cpp Копировать
+tft->drawString(s,30,50 + i * 30);
+Сделайте компактнее,например 24–26:
+
+cpp Копировать
+tft->drawString(s,30,45 + i * 24);
+Важная проверка
+Убедитесь,что в .ino вы вызываете menu_start.onButtonPressed(BTN_SWx) именно по EDGE_PRESSED (новый Button).
+ Если вы всё ещё используете BTN_SHORT/BTN_LONG и старую логику меню — SW1 может не доходить до Menu как “pressed”.
+
+Если хотите,пришлите кусок вашего .ino,где вы обрабатываете кнопки — я скажу,что именно заменить,
+чтобы SW1 гарантированно сохранял TZ и возвращал на HOME.
+
+////////////////////////+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Сделаем для Страницы 2 (TIME ZONE) нормальную схему:
+
+SW2/SW3:перебор значений (без записи в EEPROM)
+Запись в EEPROM только по подтверждению:SW4 (в режиме редактирования)
+SW1:
+в режиме выбора поля → выход на HOME без записи
+в режиме редактирования → отмена (discard) и возврат в выбор поля без записи
+Плюс:уменьшаем расстояние между строками и перерисовываем только изменившиеся области.
+
+Ниже — конкретные правки для вашего Menu.cpp.
+
+1) Важно:кнопки на Page2 не должны перехватываться “общей навигацией меню”
+Сейчас в Menu::onButtonPressed() при MENU_ITEM_SELECT у вас есть глобальная навигация:
+
+cpp Копировать
+if (buttonID == BTN_SW2) prevItem();
+else if (buttonID == BTN_SW3) nextItem();
+...
+Это мешает Page2,потому что SW2/SW3 должны менять TZ,а не “item”.
+
+Правка Menu::onButtonPressed() (в MENU_ITEM_SELECT)
+Замените блок if (state == MENU_ITEM_SELECT) { ... } на:
+
+cpp Копировать
+if (state == MENU_ITEM_SELECT) {
+
+ // Для Page2 (index=1) все кнопки отдаём странице целиком
+ // (чтобы SW2/SW3 работали как +/- и не листали "item")
+ if (page == 1 && pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+
+ // базовая навигация для остальных страниц
+ if (buttonID == BTN_SW2) prevItem();
+ else if (buttonID == BTN_SW3) nextItem();
+ else if (buttonID == BTN_SW1) backToStart();
+ else if (buttonID == BTN_SW4) fixItem();
+
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+}
+2) Page2:перебор без записи + подтверждение записи (SW4)
+Ниже — полная замена вашего класса Page2. Он:
+
+имеет 2 режима:SELECT_FIELD (выбор:TZ target / TZ NTP) и EDIT_FIELD (редактирование выбранного поля)
+хранит временные значения _tmpTarget/_tmpNtp (перебор без записи)
+записывает в EEPROM только при SW4 в EDIT_FIELD
+без полной очистки экрана:рисует статик один раз,а динамику — через fillRect() только нужных строк/значений
+уменьшены расстояния (шаг строк 22)
+Вставьте в Menu.cpp вместо текущего class Page2.
+
+cpp Копировать
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+
+ // загрузить временные значения из cfg (перебор идёт по tmp)
+ _tmpTarget = cfg.tzTargetHours;
+ _tmpNtp = cfg.tzNtpHours;
+
+ _mode = MODE_SELECT_FIELD;
+ _fieldSel = 0; // 0 target,1 ntp
+ _savedMsgMs = 0;
+
+ // сброс кешей
+ _lastTmpTarget = 127;
+ _lastTmpNtp = 127;
+ _lastMode = 255;
+ _lastFieldSel = 255;
+ _lastSavedVisible = false;
+
+ draw();
+ }
+
+ void update() override {
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic();
+ }
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+
+ // --- SW1 ---
+ if (buttonID == BTN_SW1) {
+ if (_mode == MODE_EDIT_FIELD) {
+ // отмена редактирования (без записи):вернуть tmp из cfg и выйти в выбор поля
+ _tmpTarget = cfg.tzTargetHours;
+ _tmpNtp = cfg.tzNtpHours;
+ _mode = MODE_SELECT_FIELD;
+ _savedMsgMs = 0;
+ drawDynamic();
+ } else {
+ // выйти на HOME без записи
+ _m->backToStart();
+ }
+ return;
+ }
+
+ // --- MODE_SELECT_FIELD ---
+ if (_mode == MODE_SELECT_FIELD) {
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ // переключаем выбор поля
+ _fieldSel = (_fieldSel == 0) ? 1 :0;
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW4) {
+ // перейти в редактирование выбранного поля
+ _mode = MODE_EDIT_FIELD;
+ drawDynamic();
+ return;
+ }
+ return;
+ }
+
+ // --- MODE_EDIT_FIELD ---
+ if (_mode == MODE_EDIT_FIELD) {
+
+ if (buttonID == BTN_SW2) {
+ // -
+ if (_fieldSel == 0) { _tmpTarget--; clampTz(_tmpTarget); }
+ else { _tmpNtp--; clampTz(_tmpNtp); }
+ drawDynamic();
+ return;
+ }
+
+ if (buttonID == BTN_SW3) {
+ // +
+ if (_fieldSel == 0) { _tmpTarget++; clampTz(_tmpTarget); }
+ else { _tmpNtp++; clampTz(_tmpNtp); }
+ drawDynamic();
+ return;
+ }
+
+ if (buttonID == BTN_SW4) {
+ // ПОДТВЕРЖДЕНИЕ ЗАПИСИ:
+ // применяем tmp -> cfg и пишем в EEPROM
+ cfg.tzTargetHours = _tmpTarget;
+ cfg.tzNtpHours = _tmpNtp;
+
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ ee.writeTzNtpHours(cfg.tzNtpHours);
+
+ _savedMsgMs = millis();
+ // остаёмся в EDIT (можно менять дальше) или вернуться в SELECT — как вам удобнее:
+ // _mode = MODE_SELECT_FIELD;
+
+ drawDynamic();
+ return;
+ }
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum { MODE_SELECT_FIELD = 0,MODE_EDIT_FIELD = 1 };
+
+ bool _staticDrawn = false;
+
+ uint8_t _mode = MODE_SELECT_FIELD;
+ uint8_t _fieldSel = 0; // 0=target,1=ntp
+
+ int8_t _tmpTarget = 0;
+ int8_t _tmpNtp = 0;
+
+ // кеш
+ int8_t _lastTmpTarget = 127;
+ int8_t _lastTmpNtp = 127;
+ uint8_t _lastMode = 255;
+ uint8_t _lastFieldSel = 255;
+
+ uint32_t _savedMsgMs = 0;
+ bool _lastSavedVisible = false;
+
+ // ---- компактная верстка ----
+ static const int X = 10;
+ static const int Y0 = 10;
+ static const int DY = 22;
+
+ static const int Y_TITLE = Y0;
+ static const int Y_L1 = Y0 + 2*DY; // строка 1
+ static const int Y_L2 = Y0 + 3*DY; // строка 2
+ static const int Y_HINT1 = Y0 + 5*DY;
+ static const int Y_HINT2 = Y0 + 6*DY;
+ static const int Y_HINT3 = Y0 + 7*DY;
+ static const int Y_HINT4 = Y0 + 8*DY;
+
+ static const int X_MARK = 0; // ">" слева от выбранного поля
+ static const int X_VAL = 200; // значение TZ
+ static const int W_VAL = 120;
+ static const int H_VAL = 18;
+
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = Y_HINT3;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 18;
+
+ void drawStatic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("TIME ZONE",X,Y_TITLE);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString("TZ target:",X,Y_L1);
+ d->drawString("TZ NTP :",X,Y_L2);
+
+ d->drawString("SW2/SW3:SELECT / -/+",X,Y_HINT1);
+ d->drawString("SW4:EDIT / SAVE",X,Y_HINT2);
+ d->drawString("SW1:BACK (no save)",X,Y_HINT4);
+
+ // очистка динамических областей
+ d->fillRect(X_MARK,Y_L1,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_MARK,Y_L2,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_L1,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_L2,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ }
+
+ void drawDynamic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ // маркеры выбранного поля
+ if (_lastFieldSel != _fieldSel || _lastMode != _mode) {
+ _lastFieldSel = _fieldSel;
+ _lastMode = _mode;
+
+ d->fillRect(X_MARK,Y_L1,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_MARK,Y_L2,10,H_VAL,TFT_BLACK);
+
+ d->setTextColor((_mode == MODE_EDIT_FIELD) ? TFT_GREEN :TFT_CYAN,TFT_BLACK);
+ d->drawString(">",X_MARK,(_fieldSel == 0) ? Y_L1 :Y_L2);
+ }
+
+ // значения TZ (tmp)
+ if (_lastTmpTarget != _tmpTarget) {
+ _lastTmpTarget = _tmpTarget;
+ d->fillRect(X_VAL,Y_L1,W_VAL,H_VAL,TFT_BLACK);
+ char buf[12];
+ snprintf(buf,sizeof(buf),"%d",(int)_tmpTarget);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_L1);
+ }
+
+ if (_lastTmpNtp != _tmpNtp) {
+ _lastTmpNtp = _tmpNtp;
+ d->fillRect(X_VAL,Y_L2,W_VAL,H_VAL,TFT_BLACK);
+ char buf[12];
+ snprintf(buf,sizeof(buf),"%d",(int)_tmpNtp);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_L2);
+ }
+
+ // SAVED indicator
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+};
+Поведение Page2
+Вошли на страницу:
+режим SELECT_FIELD,выбираете поле (SW2/SW3),SW4 — перейти в EDIT
+В режиме EDIT_FIELD:
+SW2/SW3 меняют значение (только в RAM,в EEPROM не пишется)
+SW4 — подтвердить запись (пишет EEPROM и обновляет cfg)
+SW1 — отмена редактирования (discard) и возврат к выбору поля
+3) “Уменьшить расстояние между строками” — сделано
+В Page2:
+
+шаг DY=22 вместо 28/30
+подписи компактнее
+Если нужно ещё компактнее — уменьшите DY до 20 и setTextSize(2) можно заменить на 1 для подсказок.
+
+4) Ваш код кнопок в .ino — корректный
+Фрагмент,который вы привели,правильный для нашей логики (работаем по EDGE_PRESSED/RELEASED). Дополнительно ничего не требуется.
+
+Если хотите,следующим шагом сделаю аналогично для “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” (GPS/ИНТЕРНЕТ/GSM)
+ с перебором без записи и подтверждением записи отдельной кнопкой.
+ 
+ //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — “аналогично Page2”,но для Стр.1 “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” (GPS/ИНТЕРНЕТ/GSM):
+
+перебор вариантов без записи (изменения идут во временные переменные tmp)
+запись только по подтверждению (кнопка SW4 = SAVE в режиме редактирования)
+SW1 = BACK/Cancel (без записи; в редактировании — отмена и выход назад)
+без полной очистки экрана:перерисовываются только изменившиеся строки/поля.
+Также добавляю отдельное хранилище в AT24C128 с фиксированной областью 0x0200 (чтобы можно было писать “из других программ”).
+
+0) Файлы EEPROM для источников синхронизации (SyncSourcesStore.h/.cpp)
+SyncSourcesStore.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class SyncSourcesStore {
+public:
+ static constexpr uint8_t I2C_ADDR = 0x50;
+
+ struct Data {
+ uint8_t gpsEnable; // 0/1
+ uint8_t gpsPeriodIdx; // 0..5
+
+ uint8_t netEnable; // 0/1
+ uint8_t netProviderIdx;// 0..4 (NTP server index)
+ uint8_t netPeriodIdx; // 0..5
+
+ uint8_t gsmEnable; // 0/1
+ uint8_t gsmProviderIdx;// 0..4 (оператор)
+ uint8_t gsmPeriodIdx; // 0..5
+ };
+
+ explicit SyncSourcesStore(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+ bool begin();
+ void defaults(Data& d);
+ bool load(Data& d); // strict (magic/ver)
+ bool loadLoose(Data& d);// best effort (если magic нет — defaults)
+ bool save(const Data& d);
+
+ // фикс. адреса (для внешних программ)
+ static constexpr uint16_t BASE = 0x0200;
+ static constexpr uint16_t ADDR_MAGIC = BASE + 0; // u16
+ static constexpr uint16_t ADDR_VER = BASE + 2; // u8
+ static constexpr uint16_t ADDR_DATA = BASE + 4; // Data bytes
+
+private:
+ TwoWire* _w;
+ uint8_t _addr;
+
+ static constexpr uint16_t MAGIC = 0x5359; // 'SY'
+ static constexpr uint8_t VERSION = 1;
+ static constexpr uint8_t PAGE_SIZE = 64;
+
+ bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+ bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool waitReady(uint32_t timeoutMs = 50);
+
+ bool readU8(uint16_t memAddr,uint8_t& v);
+ bool writeU8(uint16_t memAddr,uint8_t v);
+ bool readU16(uint16_t memAddr,uint16_t& v);
+ bool writeU16(uint16_t memAddr,uint16_t v);
+};
+SyncSourcesStore.cpp (Arduino_STM32/libmaple)
+cpp Копировать
+#include "SyncSourcesStore.h"
+
+SyncSourcesStore::SyncSourcesStore(TwoWire& w,uint8_t addr) :_w(&w),_addr(addr) {}
+
+bool SyncSourcesStore::begin() {
+ _w->beginTransmission(_addr);
+ return (_w->endTransmission() == 0);
+}
+
+void SyncSourcesStore::defaults(Data& d) {
+ d.gpsEnable = 0; d.gpsPeriodIdx = 0;
+ d.netEnable = 0; d.netProviderIdx = 0; d.netPeriodIdx = 0;
+ d.gsmEnable = 1; d.gsmProviderIdx = 0; d.gsmPeriodIdx = 0;
+}
+
+bool SyncSourcesStore::load(Data& d) {
+ defaults(d);
+ uint16_t mg = 0; uint8_t ver = 0;
+ if (!readU16(ADDR_MAGIC,mg) || mg != MAGIC) return false;
+ if (!readU8(ADDR_VER,ver) || ver != VERSION) return false;
+ return readBytes(ADDR_DATA,(uint8_t*)&d,sizeof(d));
+}
+
+bool SyncSourcesStore::loadLoose(Data& d) {
+ if (!load(d)) { defaults(d); return false; }
+ return true;
+}
+
+bool SyncSourcesStore::save(const Data& d) {
+ if (!writeU16(ADDR_MAGIC,MAGIC)) return false;
+ if (!writeU8(ADDR_VER,VERSION)) return false;
+ return writeBytes(ADDR_DATA,(const uint8_t*)&d,sizeof(d));
+}
+
+// ---- low level (libmaple) ----
+bool SyncSourcesStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ if (_w->endTransmission() != 0) return false;
+
+ uint8_t got = _w->requestFrom((uint8_t)_addr,(int)len);
+ if (got != (uint8_t)len) return false;
+
+ for (size_t i=0;i<len;i++) out[i] = (uint8_t)_w->read();
+ return true;
+}
+
+bool SyncSourcesStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+ size_t off = 0;
+ while (off < len) {
+ uint16_t a = memAddr + (uint16_t)off;
+ uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+ size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+ if (!writePage(a,data + off,chunk)) return false;
+ if (!waitReady(50)) return false;
+ off += chunk;
+ }
+ return true;
+}
+
+bool SyncSourcesStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ _w->write((uint8_t*)data,(int)len); // libmaple требует non-const
+ return (_w->endTransmission() == 0);
+}
+
+bool SyncSourcesStore::waitReady(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while ((millis() - t0) < timeoutMs) {
+ _w->beginTransmission(_addr);
+ if (_w->endTransmission() == 0) return true;
+ delay(1);
+ }
+ return false;
+}
+
+bool SyncSourcesStore::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool SyncSourcesStore::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+
+bool SyncSourcesStore::readU16(uint16_t memAddr,uint16_t& v) {
+ uint8_t b[2]; if(!readBytes(memAddr,b,2)) return false;
+ v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+ return true;
+}
+bool SyncSourcesStore::writeU16(uint16_t memAddr,uint16_t v) {
+ uint8_t b[2] = {(uint8_t)(v & 0xFF),(uint8_t)((v >> 8) & 0xFF)};
+ return writeBytes(memAddr,b,2);
+}
+1) Подключение SyncSourcesStore в .ino (глобально)
+В вашем .ino:
+
+cpp Копировать
+#include "SyncSourcesStore.h"
+
+// ГЛОБАЛЬНО (не static),чтобы Menu.cpp мог сделать extern
+SyncSourcesStore syncStore(Wire,0x50);
+SyncSourcesStore::Data syncData;
+В setup() после Wire.begin():
+
+cpp Копировать
+syncStore.begin();
+syncStore.loadLoose(syncData); // если не инициализировано — будут defaults
+2) Page1 в Menu.cpp:GPS/ИНТЕРНЕТ/GSM с подтверждением записи (SW4)
+2.1. В начале Menu.cpp добавьте extern
+cpp Копировать
+#include "SyncSourcesStore.h"
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+
+// GPS пока нет — просто заведите в .ino переменные (или оставьте extern,если уже есть)
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+2.2. Списки периодов/провайдеров (в Menu.cpp,глобально)
+cpp Копировать
+static const uint32_t kPeriodsMs[] = {
+ 60000UL,600000UL,1800000UL,3600000UL,21600000UL,43200000UL
+};
+static const char* kPeriodsName[] = {"1 мин","10 мин","30 мин","1 час","6 часов","12 часов"};
+
+static const char* kNtpServers[5] = {
+ "pool.ntp.org",
+ "time.google.com",
+ "time.cloudflare.com",
+ "time.windows.com",
+ "ru.pool.ntp.org"
+};
+
+static const char* kGsmProviders[5] = {"МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2"};
+2.3. Замените вашу текущую class Page1 на эту
+Она делает:
+
+список источников
+вход в подменю
+режим выбора поля / редактирование
+SW4 подтверждает запись (save) и применяет последствия (например INTERNET меняет cfg.server и пишет ee.writeSERVER()).
+cpp Копировать
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+ _mode = MODE_LIST;
+ _sel = 0;
+ _fieldSel = 0;
+ _edit = false;
+ _savedMsgMs = 0;
+
+ // temp копии (перебор без записи)
+ _tmp = syncData;
+
+ // сброс кешей
+ _lastMode = 255;
+ _lastSel = 255;
+ _lastFieldSel = 255;
+ _lastEdit = 2;
+ _lastSavedVisible = false;
+
+ draw();
+ }
+
+ void update() override {
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic();
+ }
+
+ // GPS:нижняя строка со спутниками (пока 0/0/FIX:NO)
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+ // SW1:назад/отмена
+ if (buttonID == BTN_SW1) {
+ if (_mode == MODE_LIST) {
+ _m->backToStart(); // HOME
+ return;
+ }
+ if (_edit) {
+ // отмена редактирования:вернуть tmp из syncData и выйти в SELECT (без записи)
+ _tmp = syncData;
+ _edit = false;
+ _savedMsgMs = 0;
+ drawDynamic();
+ return;
+ }
+ // выход из подменю назад в список
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+
+ // ---- список источников ----
+ if (_mode == MODE_LIST) {
+ if (buttonID == BTN_SW2) { _sel = (_sel + 1) % 5; drawDynamic(); return; }
+ if (buttonID == BTN_SW3) { _sel = (_sel + 4) % 5; drawDynamic(); return; }
+ if (buttonID == BTN_SW4) {
+ if (_sel == 0) { _mode = MODE_GPS; }
+ else if (_sel == 1) { _mode = MODE_NET; }
+ else if (_sel == 2) { _mode = MODE_GSM; }
+ else return; // свободно
+ _fieldSel = 0;
+ _edit = false;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ return;
+ }
+
+ // ---- подменю GPS/NET/GSM ----
+ if (!_edit) {
+ // SELECT FIELD
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ _fieldSel = (_fieldSel + 1) % fieldCount();
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW4) {
+ _edit = true; // вошли в edit (без записи)
+ drawDynamic();
+ return;
+ }
+ return;
+ } else {
+ // EDIT FIELD:SW2/SW3 меняют tmp,SW4 подтверждает запись
+ if (buttonID == BTN_SW2) { changeField(-1); drawDynamic(); return; }
+ if (buttonID == BTN_SW3) { changeField(+1); drawDynamic(); return; }
+ if (buttonID == BTN_SW4) {
+ // SAVE:применить tmp -> syncData и записать EEPROM
+ syncData = _tmp;
+ syncStore.save(syncData);
+
+ // INTERNET:привязать NTP server к cfg.server и записать в EEPROM cfg
+ if (_mode == MODE_NET) {
+ const char* s = kNtpServers[syncData.netProviderIdx % 5];
+ strncpy(cfg.server,s,sizeof(cfg.server)-1);
+ cfg.server[sizeof(cfg.server)-1] = 0;
+ ee.writeSERVER(cfg.server);
+ }
+
+ _savedMsgMs = millis();
+ _edit = false; // после сохранения выходим в select
+ drawDynamic();
+ return;
+ }
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum Mode :uint8_t { MODE_LIST=0,MODE_GPS=1,MODE_NET=2,MODE_GSM=3 };
+
+ bool _staticDrawn = false;
+
+ Mode _mode = MODE_LIST;
+ uint8_t _sel = 0; // выбор в списке (GPS/NET/GSM/...)
+ uint8_t _fieldSel = 0; // выбор поля внутри подменю
+ bool _edit = false; // редактирование поля
+
+ SyncSourcesStore::Data _tmp; // перебор без записи
+
+ // кеш для частичной перерисовки
+ uint8_t _lastMode = 255;
+ uint8_t _lastSel = 255;
+ uint8_t _lastFieldSel = 255;
+ uint8_t _lastEdit = 2;
+
+ uint32_t _savedMsgMs = 0;
+ bool _lastSavedVisible = false;
+
+ // --- компактная верстка ---
+ static const int X = 10;
+ static const int Y_TITLE = 10;
+ static const int Y0 = 40;
+ static const int DY = 22;
+
+ static const int X_MARK = 0;
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = 200;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 18;
+
+ void drawStatic() {
+ auto d = tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+
+ if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",10,Y_TITLE);
+ else if (_mode == MODE_GPS) d->drawString("GPS",10,Y_TITLE);
+ else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",10,Y_TITLE);
+ else if (_mode == MODE_GSM) d->drawString("GSM",10,Y_TITLE);
+
+ // подсказки
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ if (_mode == MODE_LIST) {
+ d->drawString("SW2/SW3:SELECT",10,200);
+ d->drawString("SW4:ENTER",10,222);
+ d->drawString("SW1:HOME",10,244);
+ } else {
+ d->drawString("SW2/SW3:SEL / -/+",10,200);
+ d->drawString("SW4:EDIT / SAVE",10,222);
+ d->drawString("SW1:BACK/CANCEL",10,244);
+ }
+
+ // очистка области строк
+ for (int i=0;i<6;i++) d->fillRect(0,Y0 + i*DY,320,DY,TFT_BLACK);
+
+ // сброс кешей
+ _lastMode = 255; _lastSel = 255; _lastFieldSel = 255; _lastEdit = 2;
+ }
+
+ void drawDynamic() {
+ auto d = tft(); if(!d) return;
+
+ // saved indicator
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+
+ if (_mode == MODE_LIST) {
+ if (_lastSel != _sel || _lastMode != _mode) {
+ _lastMode = _mode; _lastSel = _sel;
+ for (int i=0;i<5;i++) {
+ d->fillRect(0,Y0+i*DY,320,DY,TFT_BLACK);
+ d->setTextColor(i==_sel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ // в Str1 у вас должны быть:GPS/ИНТЕРНЕТ/GSM/...
+ d->drawString(_m->itemLabel(0,i),X,Y0+i*DY);
+ }
+ }
+ return;
+ }
+
+ // подменю:маркер выбранного поля и режим edit
+ if (_lastFieldSel != _fieldSel || _lastEdit != (uint8_t)_edit || _lastMode != _mode) {
+ _lastFieldSel = _fieldSel;
+ _lastEdit = (uint8_t)_edit;
+ _lastMode = _mode;
+
+ // маркеры
+ d->fillRect(X_MARK,Y0,10,6*DY,TFT_BLACK);
+ d->setTextColor(_edit ? TFT_GREEN :TFT_CYAN,TFT_BLACK);
+ d->drawString(">",X_MARK,Y0 + _fieldSel*DY);
+ }
+
+ // строки подменю перерисуем целиком (их мало),но без fillScreen
+ for (int i=0;i<fieldCount();i++) {
+ d->fillRect(10,Y0+i*DY,310,DY,TFT_BLACK);
+ d->setTextColor(i==_fieldSel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+
+ char line[64];
+ buildLine(i,line,sizeof(line));
+ d->drawString(line,10,Y0+i*DY);
+ }
+
+ if (_mode == MODE_GPS) drawGpsInfo(true);
+ }
+
+ uint8_t fieldCount() const {
+ if (_mode == MODE_GPS) return 2; // enable,period
+ if (_mode == MODE_NET) return 3; // enable,server,period
+ if (_mode == MODE_GSM) return 3; // enable,provider,period
+ return 0;
+ }
+
+ void buildLine(uint8_t i,char* out,size_t n) {
+ if (_mode == MODE_GPS) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gpsEnable ? "ДА":"НЕТ");
+ else snprintf(out,n,"2) ПЕР:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+ return;
+ }
+ if (_mode == MODE_NET) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.netEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) NTP:%s",kNtpServers[_tmp.netProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+ return;
+ }
+ // GSM
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gsmEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) ОП:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+ }
+
+ void changeField(int delta) {
+ // delta = +1/-1
+ if (_mode == MODE_GPS) {
+ if (_fieldSel == 0) _tmp.gpsEnable = _tmp.gpsEnable ? 0 :1;
+ else _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+ if (_mode == MODE_NET) {
+ if (_fieldSel == 0) _tmp.netEnable = _tmp.netEnable ? 0 :1;
+ else if (_fieldSel == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta>0?1:4)) % 5);
+ else _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+ // GSM
+ if (_fieldSel == 0) _tmp.gsmEnable = _tmp.gsmEnable ? 0 :1;
+ else if (_fieldSel == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta>0?1:4)) % 5);
+ else _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta>0?1:5)) % 6);
+ }
+
+ void drawGpsInfo(bool clearLine) {
+ auto d = tft(); if(!d) return;
+ int y = Y0 + 4*DY; // ниже пунктов
+ if (clearLine) d->fillRect(10,y,310,DY,TFT_BLACK);
+
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ char buf[64];
+ // GPS пока нет — будут нули,это ок
+ snprintf(buf,sizeof(buf),"SAT:%u/%u FIX:%s",
+ (unsigned)gGpsSatsUsed,(unsigned)gGpsSatsView,gGpsFix ? "YES":"NO");
+ d->drawString(buf,10,y);
+ }
+};
+3) Меню Str1 пункты (GPS/ИНТЕРНЕТ/GSM/…)
+В таблице menu[5][5] для страницы 1 (индекс 0) поставьте:
+
+cpp Копировать
+{"GPS","ИНТЕРНЕТ","GSM","СВОБОДНО","СВОБОДНО"}
+4) Важное:кнопки .ino у вас уже правильно сделаны
+Ваш блок с getEdge()==EDGE_PRESSED корректен — ничего менять не нужно.
+
+Что дальше (по вашему ТЗ)
+INTERNET:выбор NTP сервера теперь реально сохраняется в:
+syncData.netProviderIdx (в 0x0200..)
+и в cfg.server + ee.writeSERVER(cfg.server) (ваш основной конфиг)
+Периоды пока сохраняются только в SyncSourcesStore (и это правильно,они относятся к “источникам синхронизации”,а не к SIM800 как таковому).
+Если хотите,следующий шаг — привязать включенные источники/периоды к реальному планировщику синхронизации времени
+ (GSM/NTP) в вашей основной программе (когда gpsEnable/netEnable/gsmEnable
+ управляют тем,кто и как часто обновляет RTC).
+ 
+ //////////////////////////////////////////////////////////////*****************************************
+ 
+ Ниже — рабочая привязка включённых источников и их периодов к реальному планировщику синхронизации времени в вашей основной программе.
+
+Сделаем так:
+
+GPS (пока нет) — просто пропускаем.
+ИНТЕРНЕТ — выполняем принудительную NTP‑синхронизацию через SIM800 (AT+CNTP),затем читаем AT+CCLK? и пишем в RTC.
+GSM — выполняем только AT+CCLK? (NITZ/RTC модема),без NTP.
+Для этого нужно:
+
+добавить в SIM800TimeAsync возможность принудительно запустить NTP (даже если время валидное);
+добавить в .ino планировщик,который по syncData.{gps/net/gsm}Enable и PeriodIdx решает,когда запускать Internet/GSM.
+1) Патч в SIM800TimeAsync — принудительный NTP по запросу
+1.1. В SIM800TimeAsync.h добавьте публичный метод
+В public::
+
+cpp Копировать
+// Принудительно выполнить NTP sync (Internet-источник) при следующем цикле.
+// Не блокирует.
+void requestNtpNow();
+В private: добавьте флаг:
+
+cpp Копировать
+bool _forceNtp = false;
+1.2. В SIM800TimeAsync.cpp
+Добавьте реализацию:
+
+cpp Копировать
+void SIM800TimeAsync::requestNtpNow() {
+ _forcePoll = true; // используем общий механизм запуска
+ _forceNtp = true; // а это заставит идти в NTP ветку
+}
+В состоянии WAIT_NETWORK (в вашем полном файле оно уже есть) после того как сеть зарегистрирована,сделайте выбор:
+
+Было (условно):
+
+cpp Копировать
+if (networkRegistered()) _enter(State::REQ_CCLK);
+Станет:
+
+cpp Копировать
+if (networkRegistered()) {
+ if (_forceNtp && _ntp.enableFallback && _ntp.apn && _ntp.apn[0]) {
+ _enter(State::NTP_CGATT); // Internet sync (forced)
+ } else {
+ _enter(State::REQ_CCLK); // GSM sync
+ }
+}
+И обязательно сбрасывайте _forceNtp после завершения NTP-цепочки (лучше всего в конце REQ_CCLK_AFTER_NTP и/или при уходе в IDLE):
+
+Например,в REQ_CCLK_AFTER_NTP перед _enter(State::IDLE);:
+
+cpp Копировать
+_forceNtp = false;
+А также если вы ушли в IDLE без NTP (например,таймаут) — можно сбросить в _enter(State::IDLE) или в ветках таймаутов,но достаточно сброса после NTP и после успешного обычного цикла (по желанию).
+
+2) Планировщик источников в .ino
+Предположим у вас есть:
+
+syncData типа SyncSourcesStore::Data (как мы делали)
+sim (SIM800TimeAsync)
+cfg (AT24C128Settings::Config) — содержит apn/user/pass/server/tzNtpHours и т.д.
+2.1. Таблица периодов
+cpp Копировать
+static uint32_t periodMsFromIdx(uint8_t idx) {
+ static const uint32_t kPeriodsMs[6] = {
+ 60000UL,// 1 мин
+ 600000UL,// 10 мин
+ 1800000UL,// 30 мин
+ 3600000UL,// 1 час
+ 21600000UL,// 6 часов
+ 43200000UL // 12 часов
+ };
+ return kPeriodsMs[idx % 6];
+}
+2.2. Состояние планировщика
+cpp Копировать
+static uint32_t nextGpsMs = 0;
+static uint32_t nextNetMs = 0;
+static uint32_t nextGsmMs = 0;
+
+static bool netInFlight = false;
+static bool gsmInFlight = false;
+Инициализация в setup():
+
+cpp Копировать
+uint32_t now = millis();
+nextGpsMs = now + periodMsFromIdx(syncData.gpsPeriodIdx);
+nextNetMs = now + periodMsFromIdx(syncData.netPeriodIdx);
+nextGsmMs = now + periodMsFromIdx(syncData.gsmPeriodIdx);
+2.3. Применение NTP параметров из cfg в SIM800
+Сделайте функцию:
+
+cpp Копировать
+static void applyCfgToSimNtp(bool enableFallback) {
+ SIM800TimeAsync::NtpConfig ntp;
+ ntp.apn = cfg.apn;
+ ntp.user = cfg.user;
+ ntp.pass = cfg.pass;
+ ntp.server = cfg.server; // NTP server из cfg.server
+ ntp.tzHours = cfg.tzNtpHours; // обычно 0 (UTC)
+ ntp.enableFallback = enableFallback;
+ sim.setNtpConfig(ntp);
+}
+2.4. Главная функция планировщика (вызывать в loop)
+cpp Копировать
+static void timeSyncPlannerTick()
+{
+ uint32_t now = millis();
+
+ // если SIM занят — ничего не запускаем
+ if (sim.isBusy()) return;
+
+ // 1) GPS (пока нет) — пропускаем
+ // if (syncData.gpsEnable && now >= nextGpsMs) { ... }
+
+ // 2) INTERNET (приоритет выше GSM)
+ if (syncData.netEnable && (int32_t)(now - nextNetMs) >= 0) {
+ // включаем NTP режим и запускаем принудительный NTP
+ applyCfgToSimNtp(true);
+
+ sim.requestNtpNow();
+ netInFlight = true;
+
+ nextNetMs = now + periodMsFromIdx(syncData.netPeriodIdx);
+ return;
+ }
+
+ // 3) GSM
+ if (syncData.gsmEnable && (int32_t)(now - nextGsmMs) >= 0) {
+ // отключаем NTP,чтобы это был именно "GSM источник"
+ applyCfgToSimNtp(false);
+
+ sim.requestTimeNow();
+ gsmInFlight = true;
+
+ nextGsmMs = now + periodMsFromIdx(syncData.gsmPeriodIdx);
+ return;
+ }
+}
+Вызывайте в loop():
+
+cpp Копировать
+sim.tick();
+timeSyncPlannerTick();
+3) Завершение цикла синхронизации:когда писать в RTC
+У вас уже есть обработчик:
+
+cpp Копировать
+if (sim.hasNewTime()) {
+ // parseCCLK(...) -> localToUTC -> utcToLocal(target) -> rtc.setTime(...)
+}
+Его оставляем. Только добавьте сброс флагов “inFlight”:
+
+cpp Копировать
+if (sim.hasNewTime()) {
+ netInFlight = false;
+ gsmInFlight = false;
+ // ... запись в RTC ...
+}
+4) Важные нюансы
+Internet NTP сервер:мы привязали к cfg.server. Его вы уже меняете в меню “источники” (INTERNET provider)
+ и сохраняете ee.writeSERVER(cfg.server).
+cfg.tzNtpHours рекомендую держать 0,а целевую зону для RTC/экрана — cfg.tzTargetHours (как вы сделали).
+SIM800TimeAsync период:теперь фактический запуск синхронизации управляет планировщик,а sim.setPeriodMs(...)
+ можно поставить большим,либо оставить как есть,но чтобы не было “самопроизвольных” запросов,лучше:
+поставить sim.setPeriodMs(86400000UL); (раз в сутки) и запускать только requestTimeNow/requestNtpNow.
+Если хотите — соберу вам “готовыми файлами”
+Я могу оформить планировщик отдельными файлами:
+
+TimeSyncPlanner.h/.cpp (с begin()/tick()/onTimeUpdated()), чтобы .ino не разрастался.
+Скажите только:
+
+приоритет источников:GPS > Internet > GSM (я так заложил) — подтверждаете?
+нужно ли “догонять пропущенное” (если SIM был занят долго) или просто переносить nextX = now + period (как сейчас).
+//***********************************************-----------------------------------------
+
+Ниже — точечные правки вашего текущего Menu.cpp,чтобы:
+
+Page1 “ИСТОЧНИКИ СИНХРОНИЗАЦИИ” (GPS/ИНТЕРНЕТ/GSM) работала как Page2:
+перебор без записи (временно в tmp)
+запись только по подтверждению SW4 (в режиме редактирования)
+SW1 = BACK/Cancel без записи
+Page2 “TIME ZONE”:перебор без записи и подтверждение записи отдельной кнопкой (SW4)
+Уменьшить расстояния между строками
+drawPageSelect() показывает «ВЫБОР МЕНЮ» и реальные названия пунктов,а не Str1..Str5
+Не ломать кнопки (у вас в .ino обработка EDGE_PRESSED/RELEASED уже правильная)
+ВНИМАНИЕ:для Page1 нужны глобальные объекты (не static) в .ino:
+
+SyncSourcesStore syncStore; SyncSourcesStore::Data syncData;
+TimeSyncPlanner planner; И в Menu.cpp будут extern на них.
+1) В начало Menu.cpp добавьте include/extern для источников и планировщика
+Сразу после extern AT24C128Settings ee; extern AT24C128Settings::Config cfg; добавьте:
+
+cpp Копировать
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+
+// ГЛОБАЛЬНЫЕ объекты из .ino (не static!)
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+extern TimeSyncPlanner planner;
+
+// GPS пока нет (в .ino сделайте эти переменные =0)
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+И добавьте таблицы (ниже по файлу,глобально):
+
+cpp Копировать
+static const char* kNtpServers[5] = {
+ "pool.ntp.org",
+ "time.google.com",
+ "time.cloudflare.com",
+ "time.windows.com",
+ "ru.pool.ntp.org"
+};
+
+static const char* kGsmProviders[5] = {"МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2"};
+
+static const char* kPeriodsName[6] = {"1 мин","10 мин","30 мин","1 час","6 часов","12 часов"};
+2) Обновите таблицу menu[5][5]
+Замените вашу текущую таблицу на:
+
+cpp Копировать
+const char* menu[5][5] = {
+ // Str1 = источники синхронизации
+ {"GPS","ИНТЕРНЕТ","GSM","СВОБОДНО","СВОБОДНО"},
+
+ // Str2 = time zone (пункты можно не использовать)
+ {"TZ TARGET","TZ NTP"," "," "," "},
+
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+3) drawPageSelect() — “ВЫБОР МЕНЮ” + реальные имена + меньше интервал
+Замените тело drawPageSelect() на:
+
+cpp Копировать
+void Menu::drawPageSelect()
+{
+ static const char* topMenuNames[5] = {
+ "ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+ "TIME ZONE",
+ "СВОБОДНО",
+ "СВОБОДНО",
+ "СВОБОДНО"
+ };
+
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("ВЫБОР МЕНЮ",10,10);
+
+ // шаг меньше (24 вместо 30)
+ for (int i = 0; i < 5; i++) {
+ bool sel = (i == page);
+ tft->setTextColor(sel ? TFT_GREEN :TFT_WHITE,sel ? TFT_BLUE :TFT_BLACK);
+
+ tft->fillRect(10,45 + i * 24,310,22,TFT_BLACK);
+ tft->drawString(topMenuNames[i],10,45 + i * 24);
+ }
+}
+4) Критично:не дать общему меню “съесть” SW2/SW3 на Page1/Page2
+В Menu::onButtonPressed() замените блок MENU_ITEM_SELECT на:
+
+cpp Копировать
+if (state == MENU_ITEM_SELECT) {
+
+ // Page1 (index=0) и Page2 (index=1):все кнопки отдаём странице
+ if ((page == 0 || page == 1) && pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+
+ // остальным страницам оставляем старую навигацию
+ if (buttonID == BTN_SW2) prevItem();
+ else if (buttonID == BTN_SW3) nextItem();
+ else if (buttonID == BTN_SW1) backToStart();
+ else if (buttonID == BTN_SW4) fixItem();
+
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+}
+5) Page2 (TIME ZONE):перебор без записи + подтверждение записи SW4
+Замените ваш текущий class Page2 на тот,который мы делали ранее (с режимами SELECT/EDIT и tmp‑значениями). Коротко суть:
+
+_tmpTarget/_tmpNtp меняются SW2/SW3 только в EDIT
+SW4:
+в SELECT → вход в EDIT
+в EDIT → сохранить (ee.writeTzTargetHours,ee.writeTzNtpHours) и выйти в SELECT
+SW1:
+в EDIT → отмена (tmp <- cfg),выход в SELECT
+в SELECT → HOME
+И после сохранения добавьте:
+
+cpp Копировать
+planner.onSettingsChanged();
+(чтобы планировщик подхватил изменения tzNtpHours,если вы его используете для NTP).
+
+Если хотите — я вставлю Page2 целиком ещё раз,но она длинная; вы уже просили “как Page2” и логика та же.
+
+6) Page1 (ИСТОЧНИКИ СИНХРОНИЗАЦИИ):перебор без записи + подтверждение записи SW4
+Замените ваш текущий class Page1 на эту версию (компактная,частичная перерисовка,2 режима:LIST и SUBMENU с SELECT/EDIT):
+
+cpp Копировать
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _mode = MODE_LIST;
+ _sel = 0;
+ _fieldSel = 0;
+ _edit = false;
+
+ _tmp = syncData; // перебор без записи
+
+ _staticDrawn = false;
+ _savedMsgMs = 0;
+
+ _lastSel = 255;
+ _lastFieldSel = 255;
+ _lastEdit = 2;
+ _lastSavedVisible = false;
+
+ draw();
+ }
+
+ void update() override {
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic();
+ }
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ }
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+ // SW1:назад/отмена без записи
+ if (buttonID == BTN_SW1) {
+ if (_mode == MODE_LIST) { _m->backToStart(); return; }
+
+ if (_edit) {
+ // отмена редактирования:вернуть tmp из сохранённых syncData и выйти в SELECT
+ _tmp = syncData;
+ _edit = false;
+ _savedMsgMs = 0;
+ drawDynamic();
+ return;
+ }
+
+ // выход из подменю назад в список
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+
+ // LIST:выбор источника + вход
+ if (_mode == MODE_LIST) {
+ if (buttonID == BTN_SW2) { _sel = (_sel + 1) % 5; drawDynamic(); return; }
+ if (buttonID == BTN_SW3) { _sel = (_sel + 4) % 5; drawDynamic(); return; }
+ if (buttonID == BTN_SW4) {
+ if (_sel == 0) _mode = MODE_GPS;
+ else if (_sel == 1) _mode = MODE_NET;
+ else if (_sel == 2) _mode = MODE_GSM;
+ else return; // свободно
+ _fieldSel = 0;
+ _edit = false;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ return;
+ }
+
+ // SUBMENU:SELECT / EDIT
+ if (!_edit) {
+ // SELECT:SW2/SW3 меняют поле,SW4 -> EDIT
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ _fieldSel = (_fieldSel + 1) % fieldCount();
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW4) { _edit = true; drawDynamic(); return; }
+ return;
+ } else {
+ // EDIT:SW2/SW3 меняют tmp,SW4 сохраняет
+ if (buttonID == BTN_SW2) { changeField(-1); drawDynamic(); return; }
+ if (buttonID == BTN_SW3) { changeField(+1); drawDynamic(); return; }
+
+ if (buttonID == BTN_SW4) {
+ // CONFIRM SAVE:
+ syncData = _tmp;
+ syncStore.save(syncData);
+
+ // INTERNET:привязать выбор NTP к cfg.server + EEPROM cfg
+ if (_mode == MODE_NET) {
+ const char* s = kNtpServers[syncData.netProviderIdx % 5];
+ strncpy(cfg.server,s,sizeof(cfg.server)-1);
+ cfg.server[sizeof(cfg.server)-1] = 0;
+ ee.writeSERVER(cfg.server);
+ }
+
+ planner.onSettingsChanged();
+
+ _savedMsgMs = millis();
+ _edit = false;
+ drawDynamic();
+ return;
+ }
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum Mode :uint8_t { MODE_LIST=0,MODE_GPS=1,MODE_NET=2,MODE_GSM=3 };
+
+ Mode _mode = MODE_LIST;
+ bool _staticDrawn = false;
+
+ uint8_t _sel = 0; // выбор в списке GPS/NET/GSM
+ uint8_t _fieldSel = 0; // выбор поля в подменю
+ bool _edit = false; // режим редактирования
+
+ SyncSourcesStore::Data _tmp;
+
+ uint8_t _lastSel = 255;
+ uint8_t _lastFieldSel = 255;
+ uint8_t _lastEdit = 2;
+
+ uint32_t _savedMsgMs = 0;
+ bool _lastSavedVisible = false;
+
+ // компактная верстка
+ static const int X = 10;
+ static const int Y_TITLE = 10;
+ static const int Y0 = 40;
+ static const int DY = 22;
+
+ static const int X_MARK = 0;
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = 200;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 18;
+
+ void drawStatic() {
+ auto d = tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+
+ if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",10,Y_TITLE);
+ else if (_mode == MODE_GPS) d->drawString("GPS",10,Y_TITLE);
+ else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",10,Y_TITLE);
+ else if (_mode == MODE_GSM) d->drawString("GSM",10,Y_TITLE);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ if (_mode == MODE_LIST) {
+ d->drawString("SW2/SW3:SELECT",10,200);
+ d->drawString("SW4:ENTER",10,222);
+ d->drawString("SW1:HOME",10,244);
+ } else {
+ d->drawString("SW2/SW3:SEL / -/+",10,200);
+ d->drawString("SW4:EDIT / SAVE",10,222);
+ d->drawString("SW1:BACK/CANCEL",10,244);
+ }
+
+ for (int i=0;i<7;i++) d->fillRect(0,Y0 + i*DY,320,DY,TFT_BLACK);
+
+ _lastSel = 255;
+ _lastFieldSel = 255;
+ _lastEdit = 2;
+ }
+
+ void drawDynamic() {
+ auto d = tft(); if(!d) return;
+
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+
+ if (_mode == MODE_LIST) {
+ if (_lastSel == _sel) return;
+ _lastSel = _sel;
+
+ for (int i=0;i<5;i++) {
+ d->fillRect(0,Y0+i*DY,320,DY,TFT_BLACK);
+ d->setTextColor(i==_sel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),X,Y0+i*DY);
+ }
+ return;
+ }
+
+ // подменю:маркер
+ if (_lastFieldSel != _fieldSel || _lastEdit != (uint8_t)_edit) {
+ _lastFieldSel = _fieldSel;
+ _lastEdit = (uint8_t)_edit;
+
+ d->fillRect(X_MARK,Y0,10,6*DY,TFT_BLACK);
+ d->setTextColor(_edit ? TFT_GREEN :TFT_CYAN,TFT_BLACK);
+ d->drawString(">",X_MARK,Y0 + _fieldSel*DY);
+ }
+
+ // строки подменю (их мало) — перерисуем
+ for (int i=0;i<fieldCount();i++) {
+ d->fillRect(10,Y0+i*DY,310,DY,TFT_BLACK);
+ d->setTextColor(i==_fieldSel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ char line[64];
+ buildLine(i,line,sizeof(line));
+ d->drawString(line,10,Y0+i*DY);
+ }
+
+ if (_mode == MODE_GPS) drawGpsInfo(true);
+ }
+
+ uint8_t fieldCount() const {
+ if (_mode == MODE_GPS) return 2;
+ if (_mode == MODE_NET) return 3;
+ if (_mode == MODE_GSM) return 3;
+ return 0;
+ }
+
+ void buildLine(uint8_t i,char* out,size_t n) {
+ if (_mode == MODE_GPS) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gpsEnable ? "ДА":"НЕТ");
+ else snprintf(out,n,"2) ПЕР:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+ return;
+ }
+ if (_mode == MODE_NET) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.netEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) NTP:%s",kNtpServers[_tmp.netProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+ return;
+ }
+ // GSM
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gsmEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) ОП:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+ }
+
+ void changeField(int delta) {
+ if (_mode == MODE_GPS) {
+ if (_fieldSel == 0) _tmp.gpsEnable = _tmp.gpsEnable ? 0 :1;
+ else _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+ if (_mode == MODE_NET) {
+ if (_fieldSel == 0) _tmp.netEnable = _tmp.netEnable ? 0 :1;
+ else if (_fieldSel == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta>0?1:4)) % 5);
+ else _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+ // GSM
+ if (_fieldSel == 0) _tmp.gsmEnable = _tmp.gsmEnable ? 0 :1;
+ else if (_fieldSel == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta>0?1:4)) % 5);
+ else _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta>0?1:5)) % 6);
+ }
+
+ void drawGpsInfo(bool clearLine) {
+ auto d = tft(); if(!d) return;
+ int y = Y0 + 4*DY;
+ if (clearLine) d->fillRect(10,y,310,DY,TFT_BLACK);
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ char buf[64];
+ snprintf(buf,sizeof(buf),"SAT:%u/%u FIX:%s",
+ (unsigned)gGpsSatsUsed,(unsigned)gGpsSatsView,gGpsFix ? "YES":"NO");
+ d->drawString(buf,10,y);
+ }
+};
+7) После этих правок:планировщик реально начнёт работать от меню
+В меню Page1 вы включаете/отключаете источники и задаёте период.
+По SW4 (SAVE) данные пишутся в AT24C128 (область 0x0200) и вызывается planner.onSettingsChanged().
+Planner в .ino будет запускать Internet/GSM синхронизацию по расписанию (как мы сделали в TimeSyncPlanner).
+Минимальный чек‑лист (чтобы не “undefined reference”)
+В проекте должны быть файлы:
+SyncSourcesStore.h/.cpp
+TimeSyncPlanner.h/.cpp
+В .ino объекты глобальные:
+cpp Копировать
+SyncSourcesStore syncStore(Wire,0x50);
+SyncSourcesStore::Data syncData;
+TimeSyncPlanner planner(sim,ee,cfg,syncStore,syncData);
+В setup():
+cpp Копировать
+syncStore.begin();
+syncStore.loadLoose(syncData);
+planner.begin();
+В loop():
+cpp Копировать
+sim.tick();
+planner.tick();
+if (sim.hasNewTime()) planner.onTimeUpdated();
+Если хотите — пришлите ваш .ino (где объявлены syncStore/syncData/planner) 
+и я проверю связность “menu → eeprom → planner → sim → rtc” целиком.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+#include "Menu.h"
+#include <TFT_eSPI.h>
+
+#include "TimeFeed.h" // gDateStr,gTimeStr,gTimeUpdated
+#include "NetFeed.h" // gNetRegistered,gRssiDbm,gSignalBars,gCsqRssi...
+#include "AT24C128Settings.h" // ee,cfg
+#include "SyncSourcesStore.h" // syncStore,syncData
+#include "TimeSyncPlanner.h" // planner
+
+// ВАЖНО:в .ino эти объекты должны быть ГЛОБАЛЬНЫМИ (не static)
+extern AT24C128Settings ee;
+extern AT24C128Settings::Config cfg;
+
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+extern TimeSyncPlanner planner;
+
+// GPS пока нет:в .ino заведите эти переменные (0/0/false),чтобы экран не падал на линковке
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+
+// Шрифты (как у вас)
+#include "zTimesNRItalic18.h"
+#include "zTimesNRItalic24.h"
+#include "zTimesNRItalic28.h"
+#include "zTimesNRItalic36.h"
+#include "zCalibri36.h"
+#include "zTimesNR28.h"
+#include "zTimesNR14.h"
+#include "zTimesNR18.h"
+#include "zTimesNR24.h"
+
+#define AA_FONT_CALI zCalibri36
+#define AA_FONT_TIME18I zTimesNRItalic18
+#define AA_FONT_TIME24I zTimesNRItalic24
+#define AA_FONT_TIME28I zTimesNRItalic28
+#define AA_FONT_TIME36I zTimesNRItalic36
+#define AA_FONT_TIME28 zTimesNR28
+#define AA_FONT_TIME18 zTimesNR18
+#define AA_FONT_TIME24 zTimesNR24
+
+// HOME layout (компактнее)
+static const int Y_DATE = 40;
+static const int Y_TIME = 63;
+static const int Y_NET = 86;
+static const int Y_SIG = 109;
+static const int Y_VER = 150;
+
+// Списки для источников синхронизации
+static const char* kNtpServers[5] = {
+ "pool.ntp.org",
+ "time.google.com",
+ "time.cloudflare.com",
+ "time.windows.com",
+ "ru.pool.ntp.org"
+};
+
+static const char* kGsmProviders[5] = {"МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2"};
+static const char* kPeriodsName[6] = {"1 мин","10 мин","30 мин","1 час","6 часов","12 часов"};
+
+// Таблица меню (Str1 = источники синхронизации; Str2 = time zone)
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","GSM","СВОБОДНО","СВОБОДНО"},
+ {"TZ TARGET","TZ NTP"," "," "," "},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+
+// -------------------- Base for pages --------------------
+class PageBase :public IMenuPage {
+public:
+ explicit PageBase(Menu* m) :_m(m) {}
+protected:
+ Menu* _m = nullptr;
+ TFT_eSPI* tft() const { return _m ? _m->display() :nullptr; }
+ int page() const { return _m ? _m->currentPageIndex() :0; }
+ int item() const { return _m ? _m->currentItemIndex() :0; }
+};
+
+// -------------------- Page1:ИСТОЧНИКИ СИНХРОНИЗАЦИИ --------------------
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _mode = MODE_LIST;
+ _sel = 0;
+ _fieldSel = 0;
+ _edit = false;
+
+ _tmp = syncData; // перебор без записи
+ _savedMsgMs = 0;
+
+ _staticDrawn = false;
+ _lastSel = 255;
+ _lastFieldSel = 255;
+ _lastEdit = 2;
+ _lastSavedVisible = false;
+
+ draw();
+ }
+
+ void update() override {
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic();
+ }
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ }
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+
+ // SW1:назад/отмена без записи
+ if (buttonID == BTN_SW1) {
+ if (_mode == MODE_LIST) { _m->backToStart(); return; }
+
+ if (_edit) {
+ // отмена редактирования:вернуть tmp из сохранённых syncData и выйти в SELECT
+ _tmp = syncData;
+ _edit = false;
+ _savedMsgMs = 0;
+ drawDynamic();
+ return;
+ }
+
+ // выход из подменю назад в список
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+
+ // LIST:выбор источника + вход
+ if (_mode == MODE_LIST) {
+ if (buttonID == BTN_SW2) { _sel = (_sel + 1) % 5; drawDynamic(); return; }
+ if (buttonID == BTN_SW3) { _sel = (_sel + 4) % 5; drawDynamic(); return; }
+ if (buttonID == BTN_SW4) {
+ if (_sel == 0) _mode = MODE_GPS;
+ else if (_sel == 1) _mode = MODE_NET;
+ else if (_sel == 2) _mode = MODE_GSM;
+ else return; // свободно
+
+ _fieldSel = 0;
+ _edit = false;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ return;
+ }
+
+ // SUBMENU:SELECT / EDIT
+ if (!_edit) {
+ // SELECT:SW2/SW3 меняют поле,SW4 -> EDIT
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ _fieldSel = (_fieldSel + 1) % fieldCount();
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW4) { _edit = true; drawDynamic(); return; }
+ return;
+ } else {
+ // EDIT:SW2/SW3 меняют tmp,SW4 сохраняет
+ if (buttonID == BTN_SW2) { changeField(-1); drawDynamic(); return; }
+ if (buttonID == BTN_SW3) { changeField(+1); drawDynamic(); return; }
+
+ if (buttonID == BTN_SW4) {
+ // CONFIRM SAVE:
+ syncData = _tmp;
+ syncStore.save(syncData);
+
+ // INTERNET:привязать выбор NTP к cfg.server + EEPROM cfg
+ if (_mode == MODE_NET) {
+ const char* s = kNtpServers[syncData.netProviderIdx % 5];
+ strncpy(cfg.server,s,sizeof(cfg.server) - 1);
+ cfg.server[sizeof(cfg.server) - 1] = 0;
+ ee.writeSERVER(cfg.server);
+ }
+
+ planner.onSettingsChanged();
+
+ _savedMsgMs = millis();
+ _edit = false;
+ drawDynamic();
+ return;
+ }
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum Mode :uint8_t { MODE_LIST=0,MODE_GPS=1,MODE_NET=2,MODE_GSM=3 };
+
+ Mode _mode = MODE_LIST;
+ bool _staticDrawn = false;
+
+ uint8_t _sel = 0; // выбор в списке GPS/NET/GSM
+ uint8_t _fieldSel = 0; // выбор поля в подменю
+ bool _edit = false; // режим редактирования
+
+ SyncSourcesStore::Data _tmp;
+
+ uint8_t _lastSel = 255;
+ uint8_t _lastFieldSel = 255;
+ uint8_t _lastEdit = 2;
+
+ uint32_t _savedMsgMs = 0;
+ bool _lastSavedVisible = false;
+
+ // компактная верстка
+ static const int X = 10;
+ static const int Y_TITLE = 10;
+ static const int Y0 = 40;
+ static const int DY = 22;
+
+ static const int X_MARK = 0;
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = 200;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 18;
+
+ void drawStatic() {
+ TFT_eSPI* d = tft(); if(!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+
+ if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",10,Y_TITLE);
+ else if (_mode == MODE_GPS) d->drawString("GPS",10,Y_TITLE);
+ else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",10,Y_TITLE);
+ else if (_mode == MODE_GSM) d->drawString("GSM",10,Y_TITLE);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ if (_mode == MODE_LIST) {
+ d->drawString("SW2/SW3:SELECT",10,200);
+ d->drawString("SW4:ENTER",10,222);
+ d->drawString("SW1:HOME",10,244);
+ } else {
+ d->drawString("SW2/SW3:SEL / -/+",10,200);
+ d->drawString("SW4:EDIT / SAVE",10,222);
+ d->drawString("SW1:BACK/CANCEL",10,244);
+ }
+
+ // очистка области строк
+ for (int i=0;i<8;i++) d->fillRect(0,Y0 + i*DY,320,DY,TFT_BLACK);
+
+ _lastSel = 255;
+ _lastFieldSel = 255;
+ _lastEdit = 2;
+ _lastSavedVisible = false;
+ }
+
+ void drawDynamic() {
+ TFT_eSPI* d = tft(); if(!d) return;
+
+ // saved indicator
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+
+ if (_mode == MODE_LIST) {
+ if (_lastSel == _sel) return;
+ _lastSel = _sel;
+
+ for (int i=0;i<5;i++) {
+ d->fillRect(0,Y0+i*DY,320,DY,TFT_BLACK);
+ d->setTextColor(i==_sel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),X,Y0+i*DY);
+ }
+ return;
+ }
+
+ // подменю:маркер
+ if (_lastFieldSel != _fieldSel || _lastEdit != (uint8_t)_edit) {
+ _lastFieldSel = _fieldSel;
+ _lastEdit = (uint8_t)_edit;
+
+ d->fillRect(X_MARK,Y0,10,6*DY,TFT_BLACK);
+ d->setTextColor(_edit ? TFT_GREEN :TFT_CYAN,TFT_BLACK);
+ d->drawString(">",X_MARK,Y0 + _fieldSel*DY);
+ }
+
+ // строки подменю — перерисуем (их мало)
+ for (int i=0;i<fieldCount();i++) {
+ d->fillRect(10,Y0+i*DY,310,DY,TFT_BLACK);
+ d->setTextColor(i==_fieldSel ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ char line[64];
+ buildLine(i,line,sizeof(line));
+ d->drawString(line,10,Y0+i*DY);
+ }
+
+ if (_mode == MODE_GPS) drawGpsInfo(true);
+ }
+
+ uint8_t fieldCount() const {
+ if (_mode == MODE_GPS) return 2; // enable,period
+ if (_mode == MODE_NET) return 3; // enable,server,period
+ if (_mode == MODE_GSM) return 3; // enable,provider,period
+ return 0;
+ }
+
+ void buildLine(uint8_t i,char* out,size_t n) {
+ if (_mode == MODE_GPS) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gpsEnable ? "ДА":"НЕТ");
+ else snprintf(out,n,"2) ПЕР:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+ return;
+ }
+ if (_mode == MODE_NET) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.netEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) NTP:%s",kNtpServers[_tmp.netProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+ return;
+ }
+ // GSM
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gsmEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) ОП:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+ }
+
+ void changeField(int delta) {
+ if (_mode == MODE_GPS) {
+ if (_fieldSel == 0) _tmp.gpsEnable = _tmp.gpsEnable ? 0 :1;
+ else _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+ if (_mode == MODE_NET) {
+ if (_fieldSel == 0) _tmp.netEnable = _tmp.netEnable ? 0 :1;
+ else if (_fieldSel == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta>0?1:4)) % 5);
+ else _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+ // GSM
+ if (_fieldSel == 0) _tmp.gsmEnable = _tmp.gsmEnable ? 0 :1;
+ else if (_fieldSel == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta>0?1:4)) % 5);
+ else _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta>0?1:5)) % 6);
+ }
+
+ void drawGpsInfo(bool clearLine) {
+ TFT_eSPI* d = tft(); if(!d) return;
+ int y = Y0 + 4*DY;
+ if (clearLine) d->fillRect(10,y,310,DY,TFT_BLACK);
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ char buf[64];
+ snprintf(buf,sizeof(buf),"SAT:%u/%u FIX:%s",
+ (unsigned)gGpsSatsUsed,(unsigned)gGpsSatsView,gGpsFix ? "YES":"NO");
+ d->drawString(buf,10,y);
+ }
+};
+
+// -------------------- Page2:TIME ZONE (tmp + confirm save on SW4) --------------------
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+
+ _tmpTarget = cfg.tzTargetHours;
+ _tmpNtp = cfg.tzNtpHours;
+
+ _mode = MODE_SELECT_FIELD;
+ _fieldSel = 0;
+ _savedMsgMs = 0;
+
+ _lastTmpTarget = 127;
+ _lastTmpNtp = 127;
+ _lastMode = 255;
+ _lastFieldSel = 255;
+ _lastSavedVisible = false;
+
+ draw();
+ }
+
+ void update() override {
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic();
+ }
+ }
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+
+ // SW1:назад/отмена без записи
+ if (buttonID == BTN_SW1) {
+ if (_mode == MODE_EDIT_FIELD) {
+ // отмена редактирования (без записи)
+ _tmpTarget = cfg.tzTargetHours;
+ _tmpNtp = cfg.tzNtpHours;
+ _mode = MODE_SELECT_FIELD;
+ _savedMsgMs = 0;
+ drawDynamic();
+ } else {
+ _m->backToStart();
+ }
+ return;
+ }
+
+ // SELECT FIELD
+ if (_mode == MODE_SELECT_FIELD) {
+ if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+ _fieldSel = (_fieldSel == 0) ? 1 :0;
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW4) {
+ _mode = MODE_EDIT_FIELD;
+ drawDynamic();
+ return;
+ }
+ return;
+ }
+
+ // EDIT FIELD
+ if (_mode == MODE_EDIT_FIELD) {
+ if (buttonID == BTN_SW2) {
+ if (_fieldSel == 0) { _tmpTarget--; clampTz(_tmpTarget); }
+ else { _tmpNtp--; clampTz(_tmpNtp); }
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW3) {
+ if (_fieldSel == 0) { _tmpTarget++; clampTz(_tmpTarget); }
+ else { _tmpNtp++; clampTz(_tmpNtp); }
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW4) {
+ // CONFIRM SAVE:
+ cfg.tzTargetHours = _tmpTarget;
+ cfg.tzNtpHours = _tmpNtp;
+
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ ee.writeTzNtpHours(cfg.tzNtpHours);
+
+ planner.onSettingsChanged();
+
+ _savedMsgMs = millis();
+ _mode = MODE_SELECT_FIELD;
+ drawDynamic();
+ return;
+ }
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum { MODE_SELECT_FIELD = 0,MODE_EDIT_FIELD = 1 };
+
+ bool _staticDrawn = false;
+ uint8_t _mode = MODE_SELECT_FIELD;
+ uint8_t _fieldSel = 0; // 0 target,1 ntp
+
+ int8_t _tmpTarget = 0;
+ int8_t _tmpNtp = 0;
+
+ int8_t _lastTmpTarget = 127;
+ int8_t _lastTmpNtp = 127;
+ uint8_t _lastMode = 255;
+ uint8_t _lastFieldSel = 255;
+
+ uint32_t _savedMsgMs = 0;
+ bool _lastSavedVisible = false;
+
+ // компактная верстка
+ static const int X = 10;
+ static const int Y_TITLE = 10;
+ static const int Y0 = 44;
+ static const int DY = 22;
+
+ static const int Y_L1 = Y0 + 0*DY;
+ static const int Y_L2 = Y0 + 1*DY;
+
+ static const int X_MARK = 0;
+ static const int X_VAL = 210;
+ static const int W_VAL = 100;
+ static const int H_VAL = 18;
+
+ static const int Y_HINT1 = 140;
+ static const int Y_HINT2 = 162;
+ static const int Y_HINT3 = 184;
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = 184;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 18;
+
+ void drawStatic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("TIME ZONE",X,Y_TITLE);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString("TZ target:",X,Y_L1);
+ d->drawString("TZ NTP :",X,Y_L2);
+
+ d->drawString("SW2/SW3:SEL / -/+",X,Y_HINT1);
+ d->drawString("SW4:EDIT / SAVE",X,Y_HINT2);
+ d->drawString("SW1:BACK/CANCEL",X,Y_HINT3);
+
+ d->fillRect(X_MARK,Y_L1,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_MARK,Y_L2,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_L1,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_L2,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ }
+
+ void drawDynamic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ // marker / mode color
+ if (_lastFieldSel != _fieldSel || _lastMode != _mode) {
+ _lastFieldSel = _fieldSel;
+ _lastMode = _mode;
+
+ d->fillRect(X_MARK,Y_L1,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_MARK,Y_L2,10,H_VAL,TFT_BLACK);
+ d->setTextColor((_mode == MODE_EDIT_FIELD) ? TFT_GREEN :TFT_CYAN,TFT_BLACK);
+ d->drawString(">",X_MARK,(_fieldSel == 0) ? Y_L1 :Y_L2);
+ }
+
+ // values
+ if (_lastTmpTarget != _tmpTarget) {
+ _lastTmpTarget = _tmpTarget;
+ d->fillRect(X_VAL,Y_L1,W_VAL,H_VAL,TFT_BLACK);
+ char buf[12];
+ snprintf(buf,sizeof(buf),"%d",(int)_tmpTarget);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_L1);
+ }
+
+ if (_lastTmpNtp != _tmpNtp) {
+ _lastTmpNtp = _tmpNtp;
+ d->fillRect(X_VAL,Y_L2,W_VAL,H_VAL,TFT_BLACK);
+ char buf[12];
+ snprintf(buf,sizeof(buf),"%d",(int)_tmpNtp);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_L2);
+ }
+
+ // saved indicator
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+};
+
+// -------------------- Page3..Page5 stubs --------------------
+class Page3 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { auto d=tft(); if(!d) return; d->fillScreen(TFT_BLACK); d->setTextSize(2); d->setTextColor(TFT_YELLOW,TFT_BLACK); d->drawString("PAGE 3",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page4 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { auto d=tft(); if(!d) return; d->fillScreen(TFT_BLACK); d->setTextSize(2); d->setTextColor(TFT_YELLOW,TFT_BLACK); d->drawString("PAGE 4",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+class Page5 :public PageBase {
+public:using PageBase::PageBase;
+ void setup() override {}
+ void update() override {}
+ void draw() override { auto d=tft(); if(!d) return; d->fillScreen(TFT_BLACK); d->setTextSize(2); d->setTextColor(TFT_YELLOW,TFT_BLACK); d->drawString("PAGE 5",10,10); }
+ void onActivate() override { draw(); }
+ void onButtonPressed(int) override {}
+ void onButtonReleased(int) override {}
+};
+
+// ---------------------------------------------------------
+
+Menu::Menu(TFT_eSPI* disp) :tft(disp) {}
+
+void Menu::attachPages()
+{
+ static Page1 p1(this);
+ static Page2 p2(this);
+ static Page3 p3(this);
+ static Page4 p4(this);
+ static Page5 p5(this);
+ pages[0] = &p1;
+ pages[1] = &p2;
+ pages[2] = &p3;
+ pages[3] = &p4;
+ pages[4] = &p5;
+}
+
+void Menu::setup(const String& ver)
+{
+ versionString = ver;
+
+ tft->init();
+ tft->setRotation(3);
+ tft->fillScreen(TFT_NAVY);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+
+ // стартовый экран (как у вас)
+ tft->loadFont(AA_FONT_CALI);
+ tft->setCursor(120,20); tft->println("IVCH");
+ tft->setCursor(100,50); tft->println("DECIMA");
+
+ tft->loadFont(AA_FONT_TIME24I);
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->setCursor(84,90); tft->println("ВКЛЮЧЕНИЕ");
+
+ tft->loadFont(AA_FONT_TIME18);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->setCursor(5,130); tft->println("(C) 2026");
+ tft->setCursor(5,150); tft->println("www.decima.ru");
+
+ uint16_t tbw = tft->textWidth(versionString);
+ uint16_t x = (tft->width() - tbw) - 4;
+ tft->setCursor(x,150);
+ tft->print(versionString);
+
+ attachPages();
+ for (int i=0;i<5;i++) if (pages[i]) pages[i]->setup();
+
+ drawStartPage(); // HOME
+}
+
+void Menu::update()
+{
+ const uint32_t now = millis();
+
+ if (state == MENU_IDLE) {
+ if (!_homeStaticDrawn) {
+ drawHomeStatic();
+ _homeStaticDrawn = true;
+ _homeDirty = true;
+ }
+
+ // HOME dynamic каждые 500мс
+ if (_homeDirty || (now - _lastHomeTickMs) >= 500) {
+ _lastHomeTickMs = now;
+ drawHomeDynamic();
+ _homeDirty = false;
+ }
+ return;
+ }
+
+ if (state == MENU_ITEM_SELECT) {
+ if (pages[page]) pages[page]->update();
+ }
+}
+
+void Menu::invalidateHome() { _homeDirty = true; }
+
+void Menu::drawStartPage()
+{
+ state = MENU_IDLE;
+ _homeStaticDrawn = false;
+ _homeDirty = true;
+}
+
+void Menu::drawHomeStatic()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("HOME",10,10);
+
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("DATE:",10,Y_DATE);
+ tft->drawString("TIME:",10,Y_TIME);
+ tft->drawString("NET :",10,Y_NET);
+ tft->drawString("SIG :",10,Y_SIG);
+
+ tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+ tft->drawString(versionString,10,Y_VER);
+
+ _lastDate[0] = 0;
+ _lastTime[0] = 0;
+ _lastNet = !gNetRegistered;
+ _lastBars = 255;
+}
+
+void Menu::drawHomeDynamic()
+{
+ // Date
+ if (strcmp(_lastDate,gDateStr) != 0) {
+ strncpy(_lastDate,gDateStr,sizeof(_lastDate)-1);
+ _lastDate[sizeof(_lastDate)-1] = 0;
+ tft->fillRect(80,Y_DATE,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastDate,80,Y_DATE);
+ }
+
+ // Time
+ if (strcmp(_lastTime,gTimeStr) != 0) {
+ strncpy(_lastTime,gTimeStr,sizeof(_lastTime)-1);
+ _lastTime[sizeof(_lastTime)-1] = 0;
+ tft->fillRect(80,Y_TIME,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString(_lastTime,80,Y_TIME);
+ }
+
+ // Net
+ if (_lastNet != gNetRegistered) {
+ _lastNet = gNetRegistered;
+ tft->fillRect(80,Y_NET,240,20,TFT_BLACK);
+ tft->setTextColor(gNetRegistered ? TFT_GREEN :TFT_RED,TFT_BLACK);
+ tft->drawString(gNetRegistered ? "CONNECTED" :"NO",80,Y_NET);
+ }
+
+ // Signal
+ if (_lastBars != gSignalBars) {
+ _lastBars = gSignalBars;
+ tft->fillRect(80,Y_SIG,240,20,TFT_BLACK);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ char buf[32];
+ if (gCsqRssi == 99 || gRssiDbm == 0) snprintf(buf,sizeof(buf),"-- [0/5]");
+ else snprintf(buf,sizeof(buf),"%ddBm [%u/5]",(int)gRssiDbm,(unsigned)gSignalBars);
+ tft->drawString(buf,80,Y_SIG);
+ }
+}
+
+void Menu::activate()
+{
+ page = 0;
+ item = 0;
+ state = MENU_PAGE_SELECT;
+ draw();
+}
+
+void Menu::deactivate()
+{
+ drawStartPage();
+}
+
+bool Menu::isActive() const { return state != MENU_IDLE; }
+MenuState Menu::getState() const { return state; }
+
+void Menu::prevPage() { if (state == MENU_PAGE_SELECT) { page = (page + 4) % 5; drawPageSelect(); } }
+void Menu::nextPage() { if (state == MENU_PAGE_SELECT) { page = (page + 1) % 5; drawPageSelect(); } }
+
+void Menu::prevItem() { if (state == MENU_ITEM_SELECT) { item = (item + 4) % 5; drawActivePage(); } }
+void Menu::nextItem() { if (state == MENU_ITEM_SELECT) { item = (item + 1) % 5; drawActivePage(); } }
+
+void Menu::fixPage()
+{
+ if (state == MENU_PAGE_SELECT) {
+ item = 0;
+ state = MENU_ITEM_SELECT;
+ if (pages[page]) pages[page]->onActivate();
+ else drawActivePage();
+ }
+}
+
+void Menu::fixItem()
+{
+ if (state == MENU_ITEM_SELECT) {
+ if (pages[page]) pages[page]->onButtonPressed(BTN_SW4);
+ }
+}
+
+void Menu::backToStart() { deactivate(); }
+
+void Menu::draw()
+{
+ if (state == MENU_PAGE_SELECT) drawPageSelect();
+ else if (state == MENU_ITEM_SELECT) drawActivePage();
+ else if (state == MENU_TEST) drawTestPage();
+ else drawStartPage();
+}
+
+void Menu::drawPageSelect()
+{
+ static const char* topMenuNames[5] = {
+ "ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+ "TIME ZONE",
+ "СВОБОДНО",
+ "СВОБОДНО",
+ "СВОБОДНО"
+ };
+
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("ВЫБОР МЕНЮ",10,10);
+
+ // шаг строк меньше (24)
+ for (int i=0;i<5;i++) {
+ bool sel = (i == page);
+ tft->setTextColor(sel ? TFT_GREEN :TFT_WHITE,sel ? TFT_BLUE :TFT_BLACK);
+ tft->fillRect(10,45 + i*24,310,22,TFT_BLACK);
+ tft->drawString(topMenuNames[i],10,45 + i*24);
+ }
+}
+
+void Menu::drawActivePage()
+{
+ if (pages[page]) pages[page]->draw();
+}
+
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:SW1 открывает меню
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW1) activate();
+ return;
+ }
+
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) prevPage();
+ else if (buttonID == BTN_SW3) nextPage();
+ else if (buttonID == BTN_SW1) fixPage();
+ else if (buttonID == BTN_SW4) backToStart(); // опционально
+ return;
+ }
+
+ if (state == MENU_ITEM_SELECT) {
+
+ // Page1/Page2 обрабатывают кнопки сами (чтобы SW2/SW3 не листали item)
+ if ((page == 0 || page == 1) && pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+
+ // базовая навигация для остальных страниц
+ if (buttonID == BTN_SW2) prevItem();
+ else if (buttonID == BTN_SW3) nextItem();
+ else if (buttonID == BTN_SW1) backToStart();
+ else if (buttonID == BTN_SW4) fixItem();
+
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+}
+
+void Menu::onButtonReleased(int buttonID)
+{
+ if (state == MENU_ITEM_SELECT && pages[page]) pages[page]->onButtonReleased(buttonID);
+}
+
+void Menu::select() {}
+void Menu::runTest() {}
+
+void Menu::drawTestPage()
+{
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextColor(TFT_RED,TFT_BLACK);
+ tft->setTextSize(2);
+ tft->drawString("TEST (legacy)",20,60);
+ tft->setTextColor(TFT_WHITE,TFT_BLACK);
+ tft->drawString("SW1 - exit",20,120);
+}
+
+//---------------------------------------------------------------------
+//*************************************++++++++++++++++++++++++++++++++++++
+
+Ниже — полностью готовые файлы TimeSyncPlanner.h / TimeSyncPlanner.cpp под ваш текущий проект/ядро 
+(Arduino_STM32,STM32F103,Arduino IDE). Планировщик использует ваши глобальные объекты:
+
+SIM800TimeAsync sim;
+AT24C128Settings ee; AT24C128Settings::Config cfg;
+SyncSourcesStore syncStore; SyncSourcesStore::Data syncData;
+и обеспечивает приоритет GPS > Internet(NTP) > GSM(CCLK),с режимом «догонять пропущенное» 
+(не запускает много раз подряд,а переносит “следующий запуск” в будущее).
+
+Важно:для Internet(NTP) планировщик вызывает sim.requestNtpNow(). Убедитесь,что в вашем 
+SIM800TimeAsync добавлен метод requestNtpNow() (я ранее описывал патч).
+
+TimeSyncPlanner.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+#include "SIM800TimeAsync.h"
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+
+// Планировщик синхронизации времени по источникам (GPS > Internet > GSM).
+// - GPS пока не реализован:просто "пропускается",но расписание ведется.
+// - Internet:принудительный NTP (AT+CNTP),затем CCLK и запись в RTC (у вас в .ino).
+// - GSM:только CCLK (NITZ/RTC модема).
+//
+// "Догонять пропущенное":если время запуска уже прошло,следующий запуск переносится вперед,
+// и выполняется не серия запусков,а один.
+class TimeSyncPlanner {
+public:
+ TimeSyncPlanner(SIM800TimeAsync& sim,
+ AT24C128Settings& eeCfg,
+ AT24C128Settings::Config& cfg,
+ SyncSourcesStore& srcStore,
+ SyncSourcesStore::Data& src);
+
+ void begin();
+
+ // Вызывать в loop() часто
+ void tick();
+
+ // Вызывать после изменения настроек из меню (после SAVE)
+ void onSettingsChanged();
+
+ // Вызывать при получении нового времени от SIM800 (после sim.hasNewTime())
+ void onTimeUpdated();
+
+ const char* lastAction() const { return _lastAction; }
+ uint32_t lastActionMs() const { return _lastActionMs; }
+
+private:
+ SIM800TimeAsync& _sim;
+ AT24C128Settings& _eeCfg;
+ AT24C128Settings::Config& _cfg;
+ SyncSourcesStore& _srcStore;
+ SyncSourcesStore::Data& _src;
+
+ uint32_t _nextGpsMs = 0;
+ uint32_t _nextNetMs = 0;
+ uint32_t _nextGsmMs = 0;
+
+ bool _netInFlight = false;
+ bool _gsmInFlight = false;
+
+ // GPS пока не реализован
+ bool _gpsImplemented = false;
+
+ const char* _lastAction = "none";
+ uint32_t _lastActionMs = 0;
+
+private:
+ static uint32_t periodMsFromIdx(uint8_t idx);
+
+ // переносит next в будущее (>now) с учетом period
+ static uint32_t catchUpNext(uint32_t now,uint32_t next,uint32_t period);
+
+ void applyNtpConfig(bool enableFallback);
+
+ bool due(uint32_t now,uint32_t next) const { return (int32_t)(now - next) >= 0; }
+
+ bool tryStartGps(uint32_t now);
+ bool tryStartNet(uint32_t now);
+ bool tryStartGsm(uint32_t now);
+};
+TimeSyncPlanner.cpp
+cpp Копировать
+#include "TimeSyncPlanner.h"
+
+TimeSyncPlanner::TimeSyncPlanner(SIM800TimeAsync& sim,
+ AT24C128Settings& eeCfg,
+ AT24C128Settings::Config& cfg,
+ SyncSourcesStore& srcStore,
+ SyncSourcesStore::Data& src)
+:_sim(sim),_eeCfg(eeCfg),_cfg(cfg),_srcStore(srcStore),_src(src) {}
+
+uint32_t TimeSyncPlanner::periodMsFromIdx(uint8_t idx)
+{
+ // индексы должны совпадать с меню:1м,10м,30м,1ч,6ч,12ч
+ static const uint32_t kPeriodsMs[6] = {
+ 60000UL,
+ 600000UL,
+ 1800000UL,
+ 3600000UL,
+ 21600000UL,
+ 43200000UL
+ };
+ return kPeriodsMs[idx % 6];
+}
+
+uint32_t TimeSyncPlanner::catchUpNext(uint32_t now,uint32_t next,uint32_t period)
+{
+ if (period == 0) return now + 60000UL;
+ if ((int32_t)(now - next) < 0) return next;
+
+ // next уже в прошлом:пересчитать так,чтобы next стало > now
+ uint32_t diff = now - next;
+ uint32_t steps = diff / period + 1;
+ return next + steps * period;
+}
+
+void TimeSyncPlanner::applyNtpConfig(bool enableFallback)
+{
+ // NTP параметры берём из cfg (server/apn/user/pass/tzNtpHours)
+ SIM800TimeAsync::NtpConfig ntp;
+ ntp.apn = _cfg.apn;
+ ntp.user = _cfg.user;
+ ntp.pass = _cfg.pass;
+ ntp.server = _cfg.server;
+ ntp.tzHours = _cfg.tzNtpHours; // обычно 0 (UTC)
+ ntp.enableFallback = enableFallback;
+ _sim.setNtpConfig(ntp);
+}
+
+void TimeSyncPlanner::begin()
+{
+ const uint32_t now = millis();
+
+ _nextGpsMs = now + periodMsFromIdx(_src.gpsPeriodIdx);
+ _nextNetMs = now + periodMsFromIdx(_src.netPeriodIdx);
+ _nextGsmMs = now + periodMsFromIdx(_src.gsmPeriodIdx);
+
+ // Рекомендация:чтобы SIM800TimeAsync сам не запускал периодический опрос времени,
+ // можно "задвинуть" его период далеко:
+ // _sim.setPeriodMs(86400000UL); // 1 сутки
+}
+
+void TimeSyncPlanner::onSettingsChanged()
+{
+ // когда пользователь меняет периоды,важно не получить "лавину" запусков
+ const uint32_t now = millis();
+ _nextGpsMs = catchUpNext(now,_nextGpsMs,periodMsFromIdx(_src.gpsPeriodIdx));
+ _nextNetMs = catchUpNext(now,_nextNetMs,periodMsFromIdx(_src.netPeriodIdx));
+ _nextGsmMs = catchUpNext(now,_nextGsmMs,periodMsFromIdx(_src.gsmPeriodIdx));
+}
+
+void TimeSyncPlanner::onTimeUpdated()
+{
+ _netInFlight = false;
+ _gsmInFlight = false;
+}
+
+bool TimeSyncPlanner::tryStartGps(uint32_t now)
+{
+ if (!_src.gpsEnable) return false;
+ if (!due(now,_nextGpsMs)) return false;
+
+ const uint32_t p = periodMsFromIdx(_src.gpsPeriodIdx);
+ _nextGpsMs = catchUpNext(now,_nextGpsMs,p);
+
+ if (!_gpsImplemented) {
+ _lastAction = "gps(skip)";
+ _lastActionMs = now;
+ return false; // не блокируем,даём Internet/GSM продолжить
+ }
+
+ // Когда появится GPS:запуск тут.
+ return false;
+}
+
+bool TimeSyncPlanner::tryStartNet(uint32_t now)
+{
+ if (!_src.netEnable) return false;
+ if (!due(now,_nextNetMs)) return false;
+ if (_sim.isBusy()) return false;
+
+ const uint32_t p = periodMsFromIdx(_src.netPeriodIdx);
+ _nextNetMs = catchUpNext(now,_nextNetMs,p);
+
+ applyNtpConfig(true);
+
+ // Internet источник = принудительный NTP
+ _sim.requestNtpNow();
+ _netInFlight = true;
+
+ _lastAction = "internet(ntp)";
+ _lastActionMs = now;
+ return true;
+}
+
+bool TimeSyncPlanner::tryStartGsm(uint32_t now)
+{
+ if (!_src.gsmEnable) return false;
+ if (!due(now,_nextGsmMs)) return false;
+ if (_sim.isBusy()) return false;
+
+ const uint32_t p = periodMsFromIdx(_src.gsmPeriodIdx);
+ _nextGsmMs = catchUpNext(now,_nextGsmMs,p);
+
+ // GSM источник = CCLK (без NTP)
+ applyNtpConfig(false);
+
+ _sim.requestTimeNow();
+ _gsmInFlight = true;
+
+ _lastAction = "gsm(cclk)";
+ _lastActionMs = now;
+ return true;
+}
+
+void TimeSyncPlanner::tick()
+{
+ const uint32_t now = millis();
+
+ // Приоритет:GPS > Internet > GSM
+ (void)tryStartGps(now);
+
+ if (tryStartNet(now)) return;
+ (void)tryStartGsm(now);
+}
+Как подключить в ваш .ino (минимальные изменения)
+Добавьте include:
+cpp Копировать
+#include "TimeSyncPlanner.h"
+Создайте глобальный объект (ВАЖНО:не static),после объявлений sim/ee/cfg/syncStore/syncData:
+cpp Копировать
+TimeSyncPlanner planner(sim,ee,cfg,syncStore,syncData);
+В setup() после syncStore.loadLoose(syncData);:
+cpp Копировать
+planner.begin();
+В loop() после sim.tick();:
+cpp Копировать
+planner.tick();
+В месте,где вы обработали sim.hasNewTime() и записали время в RTC — добавьте:
+cpp Копировать
+planner.onTimeUpdated();
+После сохранения настроек в меню (у вас это уже в Menu.cpp после SW4 SAVE) 
+вызывается planner.onSettingsChanged(); — у вас в обновлённом menu.cpp это уже стоит.
+Напоминание про SIM800TimeAsync::requestNtpNow()
+Если компилятор ругается “no member named requestNtpNow”,нужно добавить этот метод 
+в SIM800TimeAsync (как я описал в начале). Без него Internet(NTP) не сможет быть “принудительным источником”.
+
+Если хотите — пришлите вашу текущую версию SIM800TimeAsync.h/.cpp,и я верну готовый 
+патч с requestNtpNow() под вашу конкретную сборку.

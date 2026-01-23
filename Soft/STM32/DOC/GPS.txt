@@ -1,0 +1,1538 @@
+Написать программу синхронизации от GPS и включить в проект.
+Модуль GPS подключен по USART2
+Параметры настройки взять из пункта меню "GPS"
+Вывести информацию о количестве спутников, силе принимаемого сигнала и иную информацию в пункт меню "GPS"
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — готовый модуль GPS-синхронизации для вашего проекта (STM32F103VGT6,Arduino IDE,USART2,NMEA). Он:
+
+читает NMEA по USART2 (обычно Serial2,RX=PA3),
+парсит RMC (время/дата UTC) и GGA/GSV (fix,спутники,HDOP,SNR),
+по настройкам из меню “GPS” (syncData.gpsEnable + syncData.gpsPeriodIdx) выполняет периодическую синхронизацию DS3231,
+обновляет глобальные переменные gGpsSatsUsed/gGpsSatsView/gGpsFix и доп. поля (HDOP,средний SNR и т.п.)
+ для вывода в меню “GPS”.
+Главный источник “текущего времени” остаётся DS3231:всё отображение и логика времени берётся через rtc.getTime().
+ GPS/SIM800 только корректируют DS3231.
+
+1) Файлы GPS модуля
+GPSManager.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include "RTCSupport.h"
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+
+// Глобальные показатели для меню (объявления; определения в GPSManager.cpp)
+extern uint8_t gGpsSatsUsed; // used in fix (GGA)
+extern uint8_t gGpsSatsView; // in view (GSV)
+extern bool gGpsFix; // fix valid (RMC A + GGA fixq>0)
+extern uint16_t gGpsHdop_x100; // HDOP*100 (GGA)
+extern uint8_t gGpsSnrAvg; // average SNR (0..99) from GSV (условно "сила сигнала")
+extern uint8_t gGpsSnrMax; // max SNR
+extern uint32_t gGpsLastRmcMs; // когда последний раз пришёл RMC
+extern uint32_t gGpsLastGgaMs; // когда последний раз пришёл GGA
+extern uint32_t gGpsLastGsvMs; // когда последний раз пришёл GSV
+
+class GPSManager {
+public:
+ GPSManager(HardwareSerial& gpsSerial,RealtimeClock& rtc,
+ AT24C128Settings::Config& cfg,
+ SyncSourcesStore::Data& syncData);
+
+ void begin(uint32_t baud = 9600);
+ void tick(); // вызывать часто
+
+ // Немедленная синхронизация (если есть валидное время от GPS)
+ void triggerImmediate();
+
+ // Последняя попытка синхронизации успешна
+ bool tookSync() const { return _lastSyncOk; }
+ uint32_t lastSyncMs() const { return _lastSyncMs; }
+
+private:
+ HardwareSerial& _gps;
+ RealtimeClock& _rtc;
+ AT24C128Settings::Config& _cfg;
+ SyncSourcesStore::Data& _sync;
+
+ // NMEA line buffer
+ static const size_t LINE_MAX = 128;
+ char _line[LINE_MAX];
+ size_t _len = 0;
+
+ // parsed UTC time/date from RMC
+ bool _rmcValid = false;
+ int _utcYear=0,_utcMonth=0,_utcDay=0,_utcHour=0,_utcMin=0,_utcSec=0;
+
+ // from GGA
+ uint8_t _ggaFixQ = 0;
+
+ // schedule
+ bool _immediate = false;
+ uint32_t _nextSyncMs = 0;
+ bool _lastSyncOk = false;
+ uint32_t _lastSyncMs = 0;
+
+ // GSV aggregation
+ uint16_t _snrSum = 0;
+ uint8_t _snrCnt = 0;
+ uint8_t _snrMax = 0;
+
+private:
+ void applySettings();
+ uint32_t periodMsFromIdx(uint8_t idx) const;
+
+ void onLine(const char* s);
+
+ // NMEA helpers
+ static bool checksumOK(const char* s);
+ static uint8_t hex2u4(char c);
+ static uint8_t hex2u8(char hi,char lo);
+
+ static bool parse_hhmmss(const char* s,int& hh,int& mm,int& ss);
+ static bool parse_ddmmyy(const char* s,int& dd,int& mo,int& yy);
+
+ // Parsers
+ void parseRMC(char** f,int nf);
+ void parseGGA(char** f,int nf);
+ void parseGSV(char** f,int nf);
+
+ // RTC helpers
+ static uint8_t dow0_sun(int y,int m,int d); // 0=Sun..6=Sat
+ static uint8_t ds3231DowFromDow0(uint8_t dow0); // Sun->7,Mon..Sat->1..6
+ static int64_t toEpochSeconds(int y,int mo,int d,int h,int mi,int s);
+ static void fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s);
+ static void utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours);
+};
+GPSManager.cpp
+cpp Копировать
+#include "GPSManager.h"
+
+// ---- globals for меню ----
+uint8_t gGpsSatsUsed = 0;
+uint8_t gGpsSatsView = 0;
+bool gGpsFix = false;
+uint16_t gGpsHdop_x100 = 0;
+uint8_t gGpsSnrAvg = 0;
+uint8_t gGpsSnrMax = 0;
+uint32_t gGpsLastRmcMs = 0;
+uint32_t gGpsLastGgaMs = 0;
+uint32_t gGpsLastGsvMs = 0;
+
+GPSManager::GPSManager(HardwareSerial& gpsSerial,RealtimeClock& rtc,
+ AT24C128Settings::Config& cfg,
+ SyncSourcesStore::Data& syncData)
+:_gps(gpsSerial),_rtc(rtc),_cfg(cfg),_sync(syncData) {}
+
+void GPSManager::begin(uint32_t baud) {
+ _gps.begin(baud);
+ _nextSyncMs = millis(); // чтобы при включённом GPS мог быстро синхронизироваться
+}
+
+void GPSManager::triggerImmediate() {
+ _immediate = true;
+}
+
+uint32_t GPSManager::periodMsFromIdx(uint8_t idx) const {
+ static const uint32_t kPeriodsMs[6] = {
+ 60000UL,600000UL,1800000UL,3600000UL,21600000UL,43200000UL
+ };
+ return kPeriodsMs[idx % 6];
+}
+
+void GPSManager::applySettings() {
+ // если GPS выключен — ничего не делаем
+ // период берём из меню GPS (syncData.gpsPeriodIdx)
+}
+
+void GPSManager::tick() {
+ applySettings();
+
+ // 1) читаем UART неблокирующе
+ while (_gps.available()) {
+ char c = (char)_gps.read();
+ if (c == '\r') continue;
+
+ if (c == '\n') {
+ if (_len > 0) {
+ _line[_len] = 0;
+ onLine(_line);
+ _len = 0;
+ }
+ } else {
+ if (_len + 1 < LINE_MAX) _line[_len++] = c;
+ }
+ }
+
+ // 2) синхронизация по расписанию (только если включено)
+ if (!_sync.gpsEnable) return;
+
+ const uint32_t now = millis();
+ const uint32_t period = periodMsFromIdx(_sync.gpsPeriodIdx);
+
+ bool due = _immediate || (int32_t)(now - _nextSyncMs) >= 0;
+ if (!due) return;
+
+ // Нужно валидное UTC время из RMC
+ if (!_rmcValid) {
+ // нет времени — не двигаем next,просто подождём следующий тик
+ _lastSyncOk = false;
+ return;
+ }
+
+ // Считаем “fix” достаточным,если RMC valid и GGA fixq>0 (если GGA ещё не было,разрешим только по RMC)
+ bool fixOk = (_ggaFixQ > 0) || (millis() - gGpsLastGgaMs > 10000);
+ if (!fixOk) {
+ _lastSyncOk = false;
+ return;
+ }
+
+ // UTC -> local(target TZ)
+ int y=_utcYear,mo=_utcMonth,d=_utcDay,h=_utcHour,mi=_utcMin,s=_utcSec;
+ int tzq_target = (int)_cfg.tzTargetHours * 4;
+ utcToLocal(y,mo,d,h,mi,s,tzq_target);
+
+ uint8_t dow0 = dow0_sun(y,mo,d);
+ uint8_t dsDow = ds3231DowFromDow0(dow0);
+
+ _rtc.setTime((uint8_t)s,(uint8_t)mi,(uint8_t)h,dsDow,(uint8_t)d,(uint8_t)mo,(uint16_t)y);
+
+ _lastSyncOk = true;
+ _lastSyncMs = now;
+ _immediate = false;
+ _nextSyncMs = now + period;
+}
+
+void GPSManager::onLine(const char* s) {
+ if (!s || s[0] != '$') return;
+ if (!checksumOK(s)) return;
+
+ // выделим talker+type до первой запятой
+ // пример:$GPRMC,...
+ const char* comma = strchr(s,',');
+ if (!comma) return;
+
+ char type[6] = {0}; // "GPRMC"
+ size_t n = (size_t)(comma - (s + 1));
+ if (n > 5) n = 5;
+ memcpy(type,s + 1,n);
+ type[n] = 0;
+
+ // копируем строку без '$' и без checksum части в локальный буфер для strtok
+ char buf[LINE_MAX];
+ strncpy(buf,s + 1,sizeof(buf)-1);
+ buf[sizeof(buf)-1]=0;
+ char* star = strchr(buf,'*');
+ if (star) *star = 0;
+
+ // токенизация
+ char* fields[32];
+ int nf = 0;
+ char* p = buf;
+ while (p && nf < 32) {
+ fields[nf++] = p;
+ char* c = strchr(p,',');
+ if (!c) break;
+ *c = 0;
+ p = c + 1;
+ }
+
+ // type sits in fields[0] like "GPRMC"
+ if (strcmp(fields[0],"GPRMC")==0 || strcmp(fields[0],"GNRMC")==0) parseRMC(fields,nf);
+ else if (strcmp(fields[0],"GPGGA")==0 || strcmp(fields[0],"GNGGA")==0) parseGGA(fields,nf);
+ else if (strcmp(fields[0],"GPGSV")==0 || strcmp(fields[0],"GNGSV")==0) parseGSV(fields,nf);
+}
+
+bool GPSManager::checksumOK(const char* s) {
+ const char* star = strchr(s,'*');
+ if (!star || star[1]==0 || star[2]==0) return false;
+
+ uint8_t want = hex2u8(star[1],star[2]);
+ uint8_t got = 0;
+ for (const char* p = s + 1; p < star; p++) got ^= (uint8_t)(*p);
+ return got == want;
+}
+
+uint8_t GPSManager::hex2u4(char c) {
+ if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+ if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
+ if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+ return 0;
+}
+uint8_t GPSManager::hex2u8(char hi,char lo) { return (uint8_t)((hex2u4(hi) << 4) | hex2u4(lo)); }
+
+bool GPSManager::parse_hhmmss(const char* s,int& hh,int& mm,int& ss) {
+ if (!s || strlen(s) < 6) return false;
+ hh = (s[0]-'0')*10 + (s[1]-'0');
+ mm = (s[2]-'0')*10 + (s[3]-'0');
+ ss = (s[4]-'0')*10 + (s[5]-'0');
+ if (hh<0||hh>23||mm<0||mm>59||ss<0||ss>59) return false;
+ return true;
+}
+
+bool GPSManager::parse_ddmmyy(const char* s,int& dd,int& mo,int& yy) {
+ if (!s || strlen(s) < 6) return false;
+ dd = (s[0]-'0')*10 + (s[1]-'0');
+ mo = (s[2]-'0')*10 + (s[3]-'0');
+ yy = (s[4]-'0')*10 + (s[5]-'0');
+ if (dd<1||dd>31||mo<1||mo>12) return false;
+ return true;
+}
+
+void GPSManager::parseRMC(char** f,int nf) {
+ // RMC:[1]=time,[2]=status,[9]=date
+ if (nf < 10) return;
+
+ int hh,mm,ss,dd,mo,yy;
+ if (!parse_hhmmss(f[1],hh,mm,ss)) return;
+
+ bool ok = (f[2] && f[2][0] == 'A'); // A=valid
+ if (!ok) { _rmcValid = false; gGpsFix = false; return; }
+
+ if (!parse_ddmmyy(f[9],dd,mo,yy)) return;
+
+ _utcYear = 2000 + yy;
+ _utcMonth = mo;
+ _utcDay = dd;
+ _utcHour = hh;
+ _utcMin = mm;
+ _utcSec = ss;
+
+ _rmcValid = true;
+ gGpsLastRmcMs = millis();
+
+ // fix flag общий
+ gGpsFix = (_rmcValid && (_ggaFixQ > 0));
+}
+
+void GPSManager::parseGGA(char** f,int nf) {
+ // GGA:[6]=fix quality,[7]=sats,[8]=hdop
+ if (nf < 9) return;
+
+ _ggaFixQ = (uint8_t)atoi(f[6]);
+ gGpsSatsUsed = (uint8_t)atoi(f[7]);
+
+ // hdop может быть float,берём *100
+ if (f[8] && f[8][0]) {
+ float hd = (float)atof(f[8]);
+ if (hd < 0) hd = 0;
+ if (hd > 99.99f) hd = 99.99f;
+ gGpsHdop_x100 = (uint16_t)(hd * 100.0f + 0.5f);
+ }
+
+ gGpsLastGgaMs = millis();
+ gGpsFix = (_rmcValid && (_ggaFixQ > 0));
+}
+
+void GPSManager::parseGSV(char** f,int nf) {
+ // GSV:[3]=total sats in view,затем группы по 4 поля,SNR в каждом 4-м
+ if (nf < 4) return;
+
+ gGpsSatsView = (uint8_t)atoi(f[3]);
+
+ // пересобираем SNR из этого предложения
+ _snrSum = 0;
+ _snrCnt = 0;
+ _snrMax = 0;
+
+ for (int i = 4; i + 3 < nf; i += 4) {
+ const char* snr = f[i + 3];
+ if (snr && snr[0]) {
+ int v = atoi(snr);
+ if (v >= 0 && v <= 99) {
+ _snrSum += (uint16_t)v;
+ _snrCnt++;
+ if ((uint8_t)v > _snrMax) _snrMax = (uint8_t)v;
+ }
+ }
+ }
+
+ if (_snrCnt > 0) gGpsSnrAvg = (uint8_t)(_snrSum / _snrCnt);
+ else gGpsSnrAvg = 0;
+
+ gGpsSnrMax = _snrMax;
+ gGpsLastGsvMs = millis();
+}
+
+// ---- RTC helpers ----
+uint8_t GPSManager::dow0_sun(int y,int m,int d) {
+ static int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ if (m < 3) y -= 1;
+ return (uint8_t)((y + y/4 - y/100 + y/400 + t[m-1] + d) % 7);
+}
+uint8_t GPSManager::ds3231DowFromDow0(uint8_t dow0) {
+ return (dow0 == 0) ? 7 :dow0;
+}
+
+int64_t GPSManager::toEpochSeconds(int y,int mo,int d,int h,int mi,int s) {
+ // same civil algorithm used earlier (Howard Hinnant),embedded here for locality
+ auto daysFromCivil = [](int y,int m,int d)->int32_t {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+ };
+ int32_t days = daysFromCivil(y,mo,d);
+ return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+void GPSManager::fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s) {
+ auto civilFromDays = [](int32_t z,int &y,int &m,int &d){
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+ };
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+ if (rem < 0) { rem += 86400LL; days -= 1; }
+ civilFromDays((int32_t)days,y,mo,d);
+ h = (int)(rem / 3600LL); rem %= 3600LL;
+ mi = (int)(rem / 60LL);
+ s = (int)(rem % 60LL);
+}
+
+void GPSManager::utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours) {
+ const int offsetMin = tzQuarterHours * 15;
+ int64_t epochUTC = toEpochSeconds(y,mo,d,h,mi,s);
+ int64_t epochLocal = epochUTC + (int64_t)offsetMin * 60LL;
+ fromEpochSeconds(epochLocal,y,mo,d,h,mi,s);
+}
+2) Подключение GPS к USART2 (Serial2) и интеграция в ваш .ino
+2.1. Подключение проводов (USART2)
+Обычно на STM32F103:
+
+PA3 = USART2_RX (сюда подключить GPS TX)
+PA2 = USART2_TX (обычно не нужен; если надо конфигурировать GPS — подключить GPS RX)
+Общий GND обязателен.
+
+2.2. В ваш .ino добавить include и объект GPSManager
+В начале .ino:
+
+cpp Копировать
+#include "GPSManager.h"
+Создайте объект (глобально,не static):
+
+cpp Копировать
+// Для Arduino_STM32 обычно доступен Serial2
+GPSManager gps(Serial2,rtc,cfg,syncData);
+В setup() после Wire.begin() и после загрузки syncData/cfg:
+
+cpp Копировать
+Serial2.begin(9600); // USART2
+gps.begin(9600);
+gps.triggerImmediate(); // немедленная попытка синхронизации при старте (если включен GPS и есть фиксация)
+В loop() очень часто:
+
+cpp Копировать
+gps.tick();
+Теперь параметры syncData.gpsEnable и syncData.gpsPeriodIdx из меню “GPS” будут автоматически учитываться.
+
+3) Вывод информации в меню “GPS”
+У вас в меню уже используются глобальные:
+
+gGpsSatsUsed/gGpsSatsView/gGpsFix
+Теперь дополнительно доступны:
+
+gGpsHdop_x100 (например вывести HDOP = gGpsHdop_x100/100.0)
+gGpsSnrAvg и gGpsSnrMax (условная “сила сигнала” по SNR)
+gGpsLastRmcMs/gGpsLastGgaMs/gGpsLastGsvMs (свежесть данных)
+Пример строки для меню GPS (одна строка)
+cpp Копировать
+char buf[64];
+snprintf(buf,sizeof(buf),"SAT:%u/%u FIX:%s SNR:%u/%u HDOP:%.2f",
+ (unsigned)gGpsSatsUsed,(unsigned)gGpsSatsView,
+ gGpsFix ? "Y":"N",
+ (unsigned)gGpsSnrAvg,(unsigned)gGpsSnrMax,
+ (double)gGpsHdop_x100/100.0);
+На дисплее 320×170 обычно влезет 1–2 строки,можно разделить на две.
+
+4) Как связать с вашим планировщиком (TimeSyncPlanner)
+Сейчас GPSManager сам выполняет синхронизацию DS3231 по расписанию GPS (из syncData.gpsPeriodIdx) и по cfg.tzTargetHours.
+
+Это уже “включено в проект” без изменения планировщика.
+
+Если хотите,чтобы TimeSyncPlanner управлял GPS (а GPSManager только парсил NMEA),скажите — сделаю режим,
+где GPSManager выдаёт “время готово”,а planner решает,когда применять.
+
+5) Важно (частые причины “не работает GPS”)
+Неверная скорость GPS (часто 9600,но бывает 38400/115200).
+RX пин:должно быть PA3 (USART2_RX),а не PA2.
+Уровни:GPS обычно 3.3V TTL (это ок для STM32).
+Модуль может выдавать только $GNRMC/$GNGGA (у нас это учтено).
+Если пришлёте пример 3–5 строк NMEA из вашего GPS (через Serial лог),я проверю,какие 
+предложения реально приходят и при необходимости расширю парсер (например,для GSA — качество 2D/3D,PDOP/HDOP/VDOP).
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — рабочая перестройка архитектуры под ваше требование:
+
+GPSManager (GPS модуль) только парсит NMEA по USART2 и обновляет “глобальные” показатели для меню.
+TimeSyncPlanner управляет синхронизацией по приоритету:GPS → Internet(NTP) → GSM(CCLK) и ставит DS3231 
+(для GPS — напрямую; для Internet/GSM — запускает SIM800,а установка RTC остаётся в вашем if(sim.hasNewTime()) как сейчас).
+Я даю готовые файлы:
+
+GPSNmeaParser.h/.cpp — парсер NMEA (Serial2),без установки RTC
+обновлённые TimeSyncPlanner.h/.cpp — принимает GPSNmeaParser и RealtimeClock и выполняет GPS‑sync в RTC
+1) GPS парсер (только NMEA):GPSNmeaParser.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// Глобальные показатели для меню (определены в .cpp)
+extern uint8_t gGpsSatsUsed; // used in fix (GGA)
+extern uint8_t gGpsSatsView; // in view (GSV)
+extern bool gGpsFix; // RMC valid + GGA fixq>0
+extern uint16_t gGpsHdop_x100; // HDOP*100 (GGA)
+extern uint8_t gGpsSnrAvg; // средний SNR (условная "сила сигнала")
+extern uint8_t gGpsSnrMax; // max SNR
+extern uint32_t gGpsLastRmcMs;
+extern uint32_t gGpsLastGgaMs;
+extern uint32_t gGpsLastGsvMs;
+
+class GPSNmeaParser {
+public:
+ explicit GPSNmeaParser(HardwareSerial& port);
+
+ void begin(uint32_t baud = 9600);
+ void tick(); // вызывать часто
+
+ // Есть валидные дата/время UTC от GPS (RMC status A)
+ bool hasUtc() const { return _rmcValid; }
+
+ // Есть фиксация (RMC valid + GGA fixq>0)
+ bool hasFix() const { return _rmcValid && (_ggaFixQ > 0); }
+
+ // Получить UTC (если hasUtc()==true)
+ bool getUtc(int& year,int& month,int& day,int& hour,int& minute,int& second) const;
+
+private:
+ HardwareSerial& _gps;
+
+ static const size_t LINE_MAX = 128;
+ char _line[LINE_MAX];
+ size_t _len = 0;
+
+ // UTC from RMC
+ bool _rmcValid = false;
+ int _utcYear=0,_utcMonth=0,_utcDay=0,_utcHour=0,_utcMin=0,_utcSec=0;
+
+ // from GGA
+ uint8_t _ggaFixQ = 0;
+
+ // GSV aggregation for SNR
+ uint16_t _snrSum = 0;
+ uint8_t _snrCnt = 0;
+ uint8_t _snrMax = 0;
+
+private:
+ void onLine(const char* s);
+
+ // NMEA helpers
+ static bool checksumOK(const char* s);
+ static uint8_t hex2u4(char c);
+ static uint8_t hex2u8(char hi,char lo);
+ static bool parse_hhmmss(const char* s,int& hh,int& mm,int& ss);
+ static bool parse_ddmmyy(const char* s,int& dd,int& mo,int& yy);
+
+ // Parsers
+ void parseRMC(char** f,int nf);
+ void parseGGA(char** f,int nf);
+ void parseGSV(char** f,int nf);
+};
+2) GPS парсер:GPSNmeaParser.cpp
+cpp Копировать
+#include "GPSNmeaParser.h"
+#include <string.h>
+#include <stdlib.h>
+
+// ---- globals for меню ----
+uint8_t gGpsSatsUsed = 0;
+uint8_t gGpsSatsView = 0;
+bool gGpsFix = false;
+uint16_t gGpsHdop_x100 = 0;
+uint8_t gGpsSnrAvg = 0;
+uint8_t gGpsSnrMax = 0;
+uint32_t gGpsLastRmcMs = 0;
+uint32_t gGpsLastGgaMs = 0;
+uint32_t gGpsLastGsvMs = 0;
+
+GPSNmeaParser::GPSNmeaParser(HardwareSerial& port) :_gps(port) {}
+
+void GPSNmeaParser::begin(uint32_t baud) {
+ _gps.begin(baud);
+}
+
+void GPSNmeaParser::tick() {
+ while (_gps.available()) {
+ char c = (char)_gps.read();
+ if (c == '\r') continue;
+
+ if (c == '\n') {
+ if (_len > 0) {
+ _line[_len] = 0;
+ onLine(_line);
+ _len = 0;
+ }
+ } else {
+ if (_len + 1 < LINE_MAX) _line[_len++] = c;
+ }
+ }
+}
+
+bool GPSNmeaParser::getUtc(int& year,int& month,int& day,int& hour,int& minute,int& second) const {
+ if (!_rmcValid) return false;
+ year = _utcYear; month = _utcMonth; day = _utcDay;
+ hour = _utcHour; minute = _utcMin; second = _utcSec;
+ return true;
+}
+
+void GPSNmeaParser::onLine(const char* s) {
+ if (!s || s[0] != '$') return;
+ if (!checksumOK(s)) return;
+
+ const char* comma = strchr(s,',');
+ if (!comma) return;
+
+ char buf[LINE_MAX];
+ strncpy(buf,s + 1,sizeof(buf)-1);
+ buf[sizeof(buf)-1]=0;
+ char* star = strchr(buf,'*');
+ if (star) *star = 0;
+
+ char* fields[32];
+ int nf = 0;
+ char* p = buf;
+ while (p && nf < 32) {
+ fields[nf++] = p;
+ char* c = strchr(p,',');
+ if (!c) break;
+ *c = 0;
+ p = c + 1;
+ }
+
+ if (nf < 1) return;
+
+ if (strcmp(fields[0],"GPRMC")==0 || strcmp(fields[0],"GNRMC")==0) parseRMC(fields,nf);
+ else if (strcmp(fields[0],"GPGGA")==0 || strcmp(fields[0],"GNGGA")==0) parseGGA(fields,nf);
+ else if (strcmp(fields[0],"GPGSV")==0 || strcmp(fields[0],"GNGSV")==0) parseGSV(fields,nf);
+}
+
+bool GPSNmeaParser::checksumOK(const char* s) {
+ const char* star = strchr(s,'*');
+ if (!star || star[1]==0 || star[2]==0) return false;
+
+ uint8_t want = hex2u8(star[1],star[2]);
+ uint8_t got = 0;
+ for (const char* p = s + 1; p < star; p++) got ^= (uint8_t)(*p);
+ return got == want;
+}
+
+uint8_t GPSNmeaParser::hex2u4(char c) {
+ if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+ if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
+ if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+ return 0;
+}
+uint8_t GPSNmeaParser::hex2u8(char hi,char lo) { return (uint8_t)((hex2u4(hi) << 4) | hex2u4(lo)); }
+
+bool GPSNmeaParser::parse_hhmmss(const char* s,int& hh,int& mm,int& ss) {
+ if (!s || strlen(s) < 6) return false;
+ hh = (s[0]-'0')*10 + (s[1]-'0');
+ mm = (s[2]-'0')*10 + (s[3]-'0');
+ ss = (s[4]-'0')*10 + (s[5]-'0');
+ if (hh<0||hh>23||mm<0||mm>59||ss<0||ss>59) return false;
+ return true;
+}
+
+bool GPSNmeaParser::parse_ddmmyy(const char* s,int& dd,int& mo,int& yy) {
+ if (!s || strlen(s) < 6) return false;
+ dd = (s[0]-'0')*10 + (s[1]-'0');
+ mo = (s[2]-'0')*10 + (s[3]-'0');
+ yy = (s[4]-'0')*10 + (s[5]-'0');
+ if (dd<1||dd>31||mo<1||mo>12) return false;
+ return true;
+}
+
+void GPSNmeaParser::parseRMC(char** f,int nf) {
+ // [1]=time [2]=status [9]=date
+ if (nf < 10) return;
+
+ int hh,mm,ss,dd,mo,yy;
+ if (!parse_hhmmss(f[1],hh,mm,ss)) return;
+
+ bool ok = (f[2] && f[2][0] == 'A'); // A=valid
+ if (!ok) { _rmcValid = false; gGpsFix = false; return; }
+
+ if (!parse_ddmmyy(f[9],dd,mo,yy)) return;
+
+ _utcYear = 2000 + yy;
+ _utcMonth = mo;
+ _utcDay = dd;
+ _utcHour = hh;
+ _utcMin = mm;
+ _utcSec = ss;
+
+ _rmcValid = true;
+ gGpsLastRmcMs = millis();
+
+ gGpsFix = (_rmcValid && (_ggaFixQ > 0));
+}
+
+void GPSNmeaParser::parseGGA(char** f,int nf) {
+ // [6]=fixq [7]=sats [8]=hdop
+ if (nf < 9) return;
+
+ _ggaFixQ = (uint8_t)atoi(f[6]);
+ gGpsSatsUsed = (uint8_t)atoi(f[7]);
+
+ if (f[8] && f[8][0]) {
+ float hd = (float)atof(f[8]);
+ if (hd < 0) hd = 0;
+ if (hd > 99.99f) hd = 99.99f;
+ gGpsHdop_x100 = (uint16_t)(hd * 100.0f + 0.5f);
+ }
+
+ gGpsLastGgaMs = millis();
+ gGpsFix = (_rmcValid && (_ggaFixQ > 0));
+}
+
+void GPSNmeaParser::parseGSV(char** f,int nf) {
+ // [3]=sats in view; groups,SNR at each 4th in group
+ if (nf < 4) return;
+ gGpsSatsView = (uint8_t)atoi(f[3]);
+
+ _snrSum = 0; _snrCnt = 0; _snrMax = 0;
+
+ for (int i = 4; i + 3 < nf; i += 4) {
+ const char* snr = f[i + 3];
+ if (snr && snr[0]) {
+ int v = atoi(snr);
+ if (v >= 0 && v <= 99) {
+ _snrSum += (uint16_t)v;
+ _snrCnt++;
+ if ((uint8_t)v > _snrMax) _snrMax = (uint8_t)v;
+ }
+ }
+ }
+
+ gGpsSnrAvg = (_snrCnt > 0) ? (uint8_t)(_snrSum / _snrCnt) :0;
+ gGpsSnrMax = _snrMax;
+ gGpsLastGsvMs = millis();
+}
+3) Обновлённый планировщик:GPS → Internet → GSM
+Теперь TimeSyncPlanner должен:
+
+иметь доступ к GPSNmeaParser (для hasUtc/hasFix и получения UTC),
+уметь ставить RTC при GPS sync (т.к. SIM sync вы уже ставите в .ino).
+TimeSyncPlanner.h (обновлённый)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+#include "SIM800TimeAsync.h"
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+#include "RTCSupport.h"
+#include "GPSNmeaParser.h"
+
+class TimeSyncPlanner {
+public:
+ TimeSyncPlanner(SIM800TimeAsync& sim,
+ GPSNmeaParser& gps,
+ RealtimeClock& rtc,
+ AT24C128Settings::Config& cfg,
+ SyncSourcesStore::Data& src);
+
+ void begin();
+ void tick();
+
+ void onSettingsChanged();
+ void onTimeUpdated(); // вызывайте после установки времени от SIM800 (как у вас)
+
+ void triggerImmediate();
+
+private:
+ SIM800TimeAsync& _sim;
+ GPSNmeaParser& _gps;
+ RealtimeClock& _rtc;
+ AT24C128Settings::Config& _cfg;
+ SyncSourcesStore::Data& _src;
+
+ uint32_t _nextGpsMs = 0;
+ uint32_t _nextNetMs = 0;
+ uint32_t _nextGsmMs = 0;
+
+ bool _immediatePending = false;
+
+private:
+ static uint32_t periodMsFromIdx(uint8_t idx);
+ static uint32_t catchUpNext(uint32_t now,uint32_t next,uint32_t period);
+
+ static uint8_t dow0_sun(int y,int m,int d);
+ static uint8_t ds3231DowFromDow0(uint8_t dow0);
+
+ // UTC->Local по tzq (четверти часа)
+ static int64_t toEpochSeconds(int y,int mo,int d,int h,int mi,int s);
+ static void fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s);
+ static void utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours);
+
+ bool tryStartGps(uint32_t now,bool immediate);
+ bool tryStartNet(uint32_t now,bool immediate);
+ bool tryStartGsm(uint32_t now,bool immediate);
+};
+TimeSyncPlanner.cpp (обновлённый)
+cpp Копировать
+#include "TimeSyncPlanner.h"
+
+TimeSyncPlanner::TimeSyncPlanner(SIM800TimeAsync& sim,
+ GPSNmeaParser& gps,
+ RealtimeClock& rtc,
+ AT24C128Settings::Config& cfg,
+ SyncSourcesStore::Data& src)
+:_sim(sim),_gps(gps),_rtc(rtc),_cfg(cfg),_src(src) {}
+
+uint32_t TimeSyncPlanner::periodMsFromIdx(uint8_t idx) {
+ static const uint32_t kPeriodsMs[6] = {
+ 60000UL,600000UL,1800000UL,3600000UL,21600000UL,43200000UL
+ };
+ return kPeriodsMs[idx % 6];
+}
+
+uint32_t TimeSyncPlanner::catchUpNext(uint32_t now,uint32_t next,uint32_t period) {
+ if (period == 0) return now + 60000UL;
+ if ((int32_t)(now - next) < 0) return next;
+ uint32_t diff = now - next;
+ uint32_t steps = diff / period + 1;
+ return next + steps * period;
+}
+
+void TimeSyncPlanner::begin() {
+ uint32_t now = millis();
+ _nextGpsMs = now + periodMsFromIdx(_src.gpsPeriodIdx);
+ _nextNetMs = now + periodMsFromIdx(_src.netPeriodIdx);
+ _nextGsmMs = now + periodMsFromIdx(_src.gsmPeriodIdx);
+}
+
+void TimeSyncPlanner::onSettingsChanged() {
+ uint32_t now = millis();
+ _nextGpsMs = catchUpNext(now,_nextGpsMs,periodMsFromIdx(_src.gpsPeriodIdx));
+ _nextNetMs = catchUpNext(now,_nextNetMs,periodMsFromIdx(_src.netPeriodIdx));
+ _nextGsmMs = catchUpNext(now,_nextGsmMs,periodMsFromIdx(_src.gsmPeriodIdx));
+}
+
+void TimeSyncPlanner::onTimeUpdated() {
+ // пока ничего (точка расширения)
+}
+
+void TimeSyncPlanner::triggerImmediate() { _immediatePending = true; }
+
+void TimeSyncPlanner::tick() {
+ uint32_t now = millis();
+
+ // Немедленный запуск (один раз) по приоритету
+ if (_immediatePending) {
+ if (tryStartGps(now,true) || tryStartNet(now,true) || tryStartGsm(now,true)) {
+ _immediatePending = false;
+ }
+ return;
+ }
+
+ // Обычное расписание:GPS -> NET -> GSM
+ (void)tryStartGps(now,false);
+ if (tryStartNet(now,false)) return;
+ (void)tryStartGsm(now,false);
+}
+
+// ---- GPS:ставит RTC сам (UTC->local target) ----
+bool TimeSyncPlanner::tryStartGps(uint32_t now,bool immediate) {
+ if (!_src.gpsEnable) return false;
+
+ uint32_t period = periodMsFromIdx(_src.gpsPeriodIdx);
+ if (!immediate && (int32_t)(now - _nextGpsMs) < 0) return false;
+
+ // “догоняем”
+ _nextGpsMs = immediate ? (now + period) :catchUpNext(now,_nextGpsMs,period);
+
+ // Нужно валидное UTC
+ int y,mo,d,h,mi,s;
+ if (!_gps.getUtc(y,mo,d,h,mi,s)) return false;
+
+ // Требуем фиксацию,если она есть (иначе можно разрешить по RMC:на ваше усмотрение)
+ if (!_gps.hasFix()) return false;
+
+ // UTC->local target
+ int tzq_target = (int)_cfg.tzTargetHours * 4;
+ utcToLocal(y,mo,d,h,mi,s,tzq_target);
+
+ uint8_t dsDow = ds3231DowFromDow0(dow0_sun(y,mo,d));
+ _rtc.setTime((uint8_t)s,(uint8_t)mi,(uint8_t)h,dsDow,(uint8_t)d,(uint8_t)mo,(uint16_t)y);
+
+ return true;
+}
+
+// ---- Internet:запускаем SIM NTP (RTC ставите в вашем sim.hasNewTime()) ----
+bool TimeSyncPlanner::tryStartNet(uint32_t now,bool immediate) {
+ if (!_src.netEnable) return false;
+ if (_sim.isBusy()) return false;
+
+ uint32_t period = periodMsFromIdx(_src.netPeriodIdx);
+ if (!immediate && (int32_t)(now - _nextNetMs) < 0) return false;
+
+ _nextNetMs = immediate ? (now + period) :catchUpNext(now,_nextNetMs,period);
+
+ _sim.requestNtpNow();
+ return true;
+}
+
+// ---- GSM:запускаем SIM CCLK (RTC ставите в вашем sim.hasNewTime()) ----
+bool TimeSyncPlanner::tryStartGsm(uint32_t now,bool immediate) {
+ if (!_src.gsmEnable) return false;
+ if (_sim.isBusy()) return false;
+
+ uint32_t period = periodMsFromIdx(_src.gsmPeriodIdx);
+ if (!immediate && (int32_t)(now - _nextGsmMs) < 0) return false;
+
+ _nextGsmMs = immediate ? (now + period) :catchUpNext(now,_nextGsmMs,period);
+
+ _sim.requestTimeNow();
+ return true;
+}
+
+// ---- date/time helpers ----
+uint8_t TimeSyncPlanner::dow0_sun(int y,int m,int d) {
+ static int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+ if (m < 3) y -= 1;
+ return (uint8_t)((y + y/4 - y/100 + y/400 + t[m-1] + d) % 7);
+}
+uint8_t TimeSyncPlanner::ds3231DowFromDow0(uint8_t dow0) { return (dow0 == 0) ? 7 :dow0; }
+
+int64_t TimeSyncPlanner::toEpochSeconds(int y,int mo,int d,int h,int mi,int s) {
+ auto daysFromCivil = [](int y,int m,int d)->int32_t {
+ y -= (m <= 2);
+ const int era = (y >= 0 ? y :y - 399) / 400;
+ const unsigned yoe = (unsigned)(y - era * 400);
+ const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+ const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+ return (int32_t)(era * 146097 + (int)doe - 719468);
+ };
+ int32_t days = daysFromCivil(y,mo,d);
+ return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+void TimeSyncPlanner::fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s) {
+ auto civilFromDays = [](int32_t z,int &y,int &m,int &d){
+ z += 719468;
+ const int era = (z >= 0 ? z :z - 146096) / 146097;
+ const unsigned doe = (unsigned)(z - era * 146097);
+ const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+ y = (int)yoe + era * 400;
+ const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+ const unsigned mp = (5*doy + 2) / 153;
+ d = (int)(doy - (153*mp + 2)/5 + 1);
+ m = (int)(mp + (mp < 10 ? 3 :-9));
+ y += (m <= 2);
+ };
+ int64_t days = t / 86400LL;
+ int64_t rem = t % 86400LL;
+ if (rem < 0) { rem += 86400LL; days -= 1; }
+ civilFromDays((int32_t)days,y,mo,d);
+ h = (int)(rem / 3600LL); rem %= 3600LL;
+ mi = (int)(rem / 60LL);
+ s = (int)(rem % 60LL);
+}
+
+void TimeSyncPlanner::utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours) {
+ const int offsetMin = tzQuarterHours * 15;
+ int64_t epochUTC = toEpochSeconds(y,mo,d,h,mi,s);
+ int64_t epochLocal = epochUTC + (int64_t)offsetMin * 60LL;
+ fromEpochSeconds(epochLocal,y,mo,d,h,mi,s);
+}
+4) Что поменять в вашем .ino
+Подключить GPS парсер и создать объект на USART2:
+cpp Копировать
+#include "GPSNmeaParser.h"
+
+// USART2 обычно Serial2 (PA3 RX)
+GPSNmeaParser gps(Serial2);
+Инициализация в setup():
+cpp Копировать
+Serial2.begin(9600);
+gps.begin(9600);
+В loop():
+cpp Копировать
+gps.tick();
+Создание planner теперь должно учитывать gps и rtc (обновите строку создания):
+Было:
+
+cpp Копировать
+TimeSyncPlanner planner(sim,ee,cfg,syncStore,syncData);
+Станет:
+
+cpp Копировать
+TimeSyncPlanner planner(sim,gps,rtc,cfg,syncData);
+Немедленный старт (если хотите сразу пробовать GPS→NTP→GSM):
+cpp Копировать
+planner.begin();
+planner.onSettingsChanged();
+planner.triggerImmediate();
+5) Вывод информации в пункт меню “GPS”
+Ваше меню “GPS” уже может показывать:
+
+gGpsSatsUsed/gGpsSatsView/gGpsFix
+Добавьте по желанию:
+
+gGpsSnrAvg/gGpsSnrMax (условная “сила сигнала”)
+gGpsHdop_x100
+Например:
+
+строка 1:SAT:used/view FIX:Y/N
+строка 2:SNR avg/max HDOP
+Если скажете модель GPS модуля (например u-blox NEO-6M/NEO-M8N) и какая скорость реально настроена 
+(9600/38400),я подгоню begin() и при необходимости добавлю парсинг GSA (2D/3D,PDOP/VDOP) 
+и более корректное усреднение SNR по многочастным GSV.
+
+///+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ошибки означают одно:вы создаёте глобальный объект GPS раньше,чем объявлены 
+глобальные rtc,cfg и syncData. В C++ порядок важен:если в строке
+
+cpp Копировать
+GPSManager gps(Serial2,rtc,cfg,syncData);
+на момент компиляции/разбора rtc/cfg/syncData ещё не объявлены — будет ровно то,что вы видите.
+
+Плюс у вас в сообщении строка без ; в конце (в логе IDE его не показала,но проверьте).
+
+Вариант 1 (рекомендую):перенести объявление gps НИЖЕ rtc/cfg/syncData
+Сделайте порядок строго такой:
+
+cpp Копировать
+#include "RTCSupport.h"
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+#include "GPSManager.h" // если используете GPSManager (а не GPSNmeaParser)
+
+// 1) сначала объявляем то,что будет передаваться в GPS
+RealtimeClock rtc;
+AT24C128Settings::Config cfg;
+SyncSourcesStore::Data syncData;
+
+// 2) потом GPS
+GPSManager gps(Serial2,rtc,cfg,syncData); // <-- обязательно ; в конце
+И только после этого — остальные объекты,если нужно.
+
+Вариант 2 (ещё надёжнее):создавать GPS в setup() (без проблем порядка)
+Если хотите вообще исключить проблемы порядка глобальных конструкторов:
+
+cpp Копировать
+GPSManager* gps = nullptr;
+
+void setup() {
+ ...
+ gps = new GPSManager(Serial2,rtc,cfg,syncData);
+ gps->begin(9600);
+ ...
+}
+
+void loop() {
+ if (gps) gps->tick();
+}
+Важно:у вас сейчас смешаны два разных подхода
+В предыдущем решении для “GPS только парсит NMEA” я предлагал класс GPSNmeaParser (без rtc),а у вас в ошибке 
+фигурирует GPSManager (который принимает rtc,cfg,syncData).
+
+Выберите один вариант:
+
+A) “GPS только парсит” (как вы просили)
+Тогда в .ino должно быть:
+
+cpp Копировать
+#include "GPSNmeaParser.h"
+GPSNmeaParser gps(Serial2);
+и никаких rtc/cfg/syncData в конструкторе GPS.
+
+B) “GPSManager ставит RTC” (старый вариант)
+Тогда используйте GPSManager и порядок объявлений как в Варианте 1.
+
+Ещё одно замечание (по вашему ядру)
+Вы пишете “Generic STM32F1 series” — там обычно Serial2 существует,но пины должны быть правильные:
+
+USART2 RX = PA3 (GPS TX → PA3)
+USART2 TX = PA2 (если нужно)
+Если пришлёте первые ~50 строк вашего .ino (где include’ы и глобальные объекты),я точечно
+ скажу,куда именно переставить одну строку,чтобы сборка прошла с первого раза.
+ 
+ //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ Ниже — простой,неблокирующий “логгер” GPS,который раз в 1 секунду печатает в Serial ключевые
+ параметры,которые уже собирает наш парсер (или GPSManager,если вы его используете).
+
+1) Если используете GPSNmeaParser (рекомендовано в вашей архитектуре)
+У вас должны быть глобальные переменные из GPSNmeaParser.cpp:
+
+gGpsSatsUsed,gGpsSatsView,gGpsFix,gGpsHdop_x100,gGpsSnrAvg,gGpsSnrMax
+gGpsLastRmcMs,gGpsLastGgaMs,gGpsLastGsvMs
+Добавьте в .ino:
+
+cpp Копировать
+static void gpsDebugPrint1Hz()
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ // “свежесть” данных
+ uint32_t ageR = (gGpsLastRmcMs == 0) ? 0xFFFFFFFFUL :(now - gGpsLastRmcMs);
+ uint32_t ageG = (gGpsLastGgaMs == 0) ? 0xFFFFFFFFUL :(now - gGpsLastGgaMs);
+ uint32_t ageV = (gGpsLastGsvMs == 0) ? 0xFFFFFFFFUL :(now - gGpsLastGsvMs);
+
+ Serial.print(F("[GPS] fix=")); Serial.print(gGpsFix ? 1 :0);
+ Serial.print(F(" used/view=")); Serial.print(gGpsSatsUsed);
+ Serial.print(F("/")); Serial.print(gGpsSatsView);
+
+ Serial.print(F(" SNR(avg/max)=")); Serial.print(gGpsSnrAvg);
+ Serial.print(F("/")); Serial.print(gGpsSnrMax);
+
+ Serial.print(F(" HDOP="));
+ Serial.print((double)gGpsHdop_x100 / 100.0,2);
+
+ Serial.print(F(" age(ms) RMC=")); Serial.print(ageR);
+ Serial.print(F(" GGA=")); Serial.print(ageG);
+ Serial.print(F(" GSV=")); Serial.println(ageV);
+}
+И в loop():
+
+cpp Копировать
+gps.tick(); // ваш GPSNmeaParser
+gpsDebugPrint1Hz(); // отладка
+Дополнительно:вывести UTC время,которое распарсил GPS
+Если у вас есть объект GPSNmeaParser gps(Serial2);,то можно печатать UTC:
+
+cpp Копировать
+static void gpsUtcPrint1Hz(GPSNmeaParser& gps)
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ int y,mo,d,h,mi,s;
+ if (gps.getUtc(y,mo,d,h,mi,s)) {
+ Serial.print(F("[GPS UTC] "));
+ Serial.print(y); Serial.print("-");
+ if (mo < 10) Serial.print("0"); Serial.print(mo); Serial.print("-");
+ if (d < 10) Serial.print("0"); Serial.print(d); Serial.print(" ");
+ if (h < 10) Serial.print("0"); Serial.print(h); Serial.print(":");
+ if (mi < 10) Serial.print("0"); Serial.print(mi); Serial.print(":");
+ if (s < 10) Serial.print("0"); Serial.println(s);
+ } else {
+ Serial.println(F("[GPS UTC] (no RMC yet)"));
+ }
+}
+В loop():
+
+cpp Копировать
+gpsUtcPrint1Hz(gps);
+2) Если используете GPSManager (старый вариант)
+Тогда логика та же,просто печать глобальных метрик остаётся одинаковой,а UTC можно печатать из внутренних полей только если
+ вы их сделали public (обычно не нужно).
+
+3) Если вообще ничего не печатается/всё нули
+Проверяйте по шагам:
+
+В setup():
+cpp Копировать
+Serial2.begin(9600);
+Самый низкоуровневый тест:вывести “сырые” символы с GPS (на 1–2 секунды) — чтобы убедиться,что UART2 подключен правильно:
+cpp Копировать
+static uint32_t tEnd = 0;
+if (tEnd == 0) tEnd = millis() + 2000;
+if (millis() < tEnd) {
+ while (Serial2.available()) Serial.write(Serial2.read());
+}
+Если в Serial Monitor видите строки $GPRMC.../$GNGGA... — UART и скорость верны.
+
+Если пришлёте 5–10 строк вывода “сырого” GPS (RMC/GGA/GSV),я скажу,какие предложения реально 
+приходят и почему может не выставляться gGpsFix (часто дело в том,что RMC status = V,или GGA fixq=0).
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Лог отличный:GPS время/дата есть,фикс есть,HDOP адекватный. Проблема только в SNR(avg/max)=0/0 
+большую часть времени при том,что GSV приходит (age ~700 мс). Это означает:парсер GSV часто получает
+предложения,в которых поля SNR пустые (или приходят не те GSV,или многочастные GSV и мы усредняем 
+“по одному сообщению”,где SNR может быть не указан).
+
+Нормально,что иногда появляется 27/27 — значит парсер работает,просто данные SNR неполные.
+
+Почему SNR часто 0/0 при fix=1
+Типовые причины:
+
+GSV предложения без SNR:в NMEA допускается пустое поле SNR (например ...,,).
+Многочастные GSV:обычно приходят 2–4 предложения подряд (msg 1 of 3,2 of 3,3 of 3). 
+Сейчас мы считаем SNR только в одном предложении,а не на весь “цикл”.
+Модуль выдаёт GNGSV (GN talker) и там иногда SNR есть не всегда — зависит от прошивки/конфигурации.
+Некоторые GPS выдают SNR только для “tracked” спутников,а не для всех в view.
+Что улучшить (рекомендую):агрегация SNR по всем частям GSV
+Сделаем так:
+
+берём из GSV:
+total_msgs = поле [1]
+msg_num = поле [2]
+если msg_num == 1 — обнуляем накопители
+добавляем SNR по каждому сообщению
+если msg_num == total_msgs — публикуем gGpsSnrAvg/gGpsSnrMax
+Это даст стабильные значения.
+
+Патч для GPSNmeaParser::parseGSV
+Замените вашу parseGSV на:
+
+cpp Копировать
+void GPSNmeaParser::parseGSV(char** f,int nf) {
+ // GSV:[1]=total msgs,[2]=msg num,[3]=sats in view,далее группы по 4 поля,SNR = 4-е
+ if (nf < 4) return;
+
+ int totalMsgs = atoi(f[1]);
+ int msgNum = atoi(f[2]);
+
+ gGpsSatsView = (uint8_t)atoi(f[3]);
+
+ // Начало цикла GSV -> сброс накопления
+ if (msgNum <= 1) {
+ _snrSum = 0;
+ _snrCnt = 0;
+ _snrMax = 0;
+ }
+
+ // Накопить SNR из этой части
+ for (int i = 4; i + 3 < nf; i += 4) {
+ const char* snr = f[i + 3];
+ if (snr && snr[0]) {
+ int v = atoi(snr);
+ if (v >= 0 && v <= 99) {
+ _snrSum += (uint16_t)v;
+ _snrCnt++;
+ if ((uint8_t)v > _snrMax) _snrMax = (uint8_t)v;
+ }
+ }
+ }
+
+ // Конец цикла -> опубликовать
+ if (totalMsgs > 0 && msgNum >= totalMsgs) {
+ gGpsSnrAvg = (_snrCnt > 0) ? (uint8_t)(_snrSum / _snrCnt) :0;
+ gGpsSnrMax = _snrMax;
+ gGpsLastGsvMs = millis();
+ }
+}
+Теперь gGpsSnrAvg/Max будут обновляться один раз на полный набор GSV.
+
+Проверка “сырых” GSV (на 5 секунд)
+Чтобы точно подтвердить,что SNR поля реально пустые/есть,можно временно вывести сырые строки GSV в Serial (без всего NMEA):
+
+В onLine() перед разбором:
+
+cpp Копировать
+if (strstr(s,"GSV")) Serial.println(s);
+Если увидите фрагменты типа ...,36, или ...,36*hh — SNR есть. Если ...,, — поля пустые.
+
+Дополнительные поля “иная информация”
+Уже можно показывать в меню GPS:
+
+gGpsFix (да/нет)
+used/view
+HDOP
+ageRMC/GGA/GSV (насколько свежие данные)
+SNR avg/max после патча
+Если хотите ещё:
+
+скорость (из RMC поле “speed over ground”),
+курс (RMC),
+высота (GGA поле altitude),
+тип фикса (2D/3D) и PDOP/VDOP (из GSA)
+Скажите,что именно нужно — добавлю парсинг GSA и altitude в структуру.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Отлично — теперь SNR стабилизировался (avg/max=30/43),значит агрегация GSV по многочастным сообщениям сработала. По возрасту видно:
+
+RMC приходит регулярно (~300–500 мс)
+GGA иногда “пачками” (age то 0–1 мс,то ~800–1000 мс) — это нормально,период GGA может быть 1 Гц и вы “снимаете” лог раз в секунду чуть раньше/позже прихода
+GSV иногда “редко” (видно 1741 мс) — тоже нормально,часто GSV идёт раз в 2–5 секунд
+Теперь можно уверенно подключать GPS как приоритетный источник.
+
+1) Что менять в планировщике,чтобы GPS был первым источником
+В TimeSyncPlanner::tick() у вас уже приоритет GPS→NET→GSM. Важно:если GPS включён,но нет свежего фикса,планировщик должен падать дальше на NET,затем GSM.
+
+Сейчас tryStartGps() возвращает false,если !gps.hasFix() или нет UTC — это правильно.
+
+2) Улучшение:разрешить синхронизацию по GPS даже при “fix=1,но GGA давно”
+У вас иногда age GGA около 1000 мс — это не проблема. Но если по какой-то причине GGA будет реже,а RMC стабильно,то жёсткое требование hasFix() может “зажать” GPS. Можно сделать условие:
+
+если gps.hasUtc() и RMC свежий,то синхронизировать
+если есть GGA и fixq>0 — отлично
+если GGA давно,но RMC валидный — всё равно синхронизировать (на ваше усмотрение)
+Если хотите,я добавлю “мягкое” правило:считать фиксацию допустимой,если RMC valid и ageGGA < 10 сек ИЛИ GGA не приходил >10 сек (не блокировать).
+
+3) Доп. отладка:показать в Serial “когда реально установили RTC от GPS”
+В TimeSyncPlanner::tryStartGps() после rtc.setTime(...) добавьте:
+
+cpp Копировать
+Serial.print("[GPS->RTC] ");
+Serial.print(y); Serial.print("-");
+Serial.print(mo); Serial.print("-");
+Serial.print(d); Serial.print(" ");
+Serial.print(h); Serial.print(":");
+Serial.print(mi); Serial.print(":");
+Serial.println(s);
+(можно под #ifdef DEBUG_GPS_RTC).
+
+4) Что выводить в меню “GPS”
+Теперь у вас есть хорошие метрики:
+
+FIX (gGpsFix)
+used/view
+SNR avg/max
+HDOP
+“age” по RMC/GGA/GSV (как индикатор связи)
+На дисплее 320×170 обычно удобно 2 строки:
+
+SAT:15/12 FIX:Y HDOP:0.90
+SNR:30/43 R:0.4s G:0.1s V:1.7s
+Если хотите — дам готовую функцию formatGpsStatusLine1/2().
+
+5) Важное замечание по конфигурации GPS
+Если захотите “более живые” значения SNR/видимых спутников:
+
+увеличьте частоту GSV (если модуль u-blox,это UBX-CFG-MSG)
+но это уже конфигурирование GPS по TX (USART2 TX) и хранение в EEPROM — можно добавить позже.
+Скажите,какой GPS модуль у вас (NEO-6M/NEO-M8N/др.) и хотите ли вы дополнительно:
+
+скорость/курс (из RMC),
+высоту (из GGA),
+2D/3D + PDOP/VDOP (из GSA).
+
+//=====================================================================
+
+Ниже — готовый вариант вывода дополнительной информации в пункте меню GPS (внутри “ИСТОЧНИКИ СИНХРОНИЗАЦИИ → GPS”) на вашем дисплее 320×170:
+
+строка вида Sat:used/view Fix:Y/N HDOP:x.xx
+строка вида Sig:avg/max (SNR) Age R/G/V:...
+Я дам:
+
+функцию форматирования строк,
+как вставить в ваш Page1::drawGpsInfo() (который сейчас рисует SAT:... FIX:...).
+1) Добавьте форматирование (в Menu.cpp,перед Page1 или внутри Page1 как static)
+cpp Копировать
+static void formatGpsLine1(char* out,size_t n)
+{
+ // Sat:used/view Fix:Y/N HDOP:0.90
+ snprintf(out,n,"Sat:%u/%u Fix:%s HDOP:%.2f",
+ (unsigned)gGpsSatsUsed,
+ (unsigned)gGpsSatsView,
+ gGpsFix ? "Y" :"N",
+ (double)gGpsHdop_x100 / 100.0);
+}
+
+static void formatGpsLine2(char* out,size_t n)
+{
+ // Sig:avg/max Age:R0.3 G0.9 V0.5
+ uint32_t now = millis();
+ uint32_t ageR = (gGpsLastRmcMs==0) ? 99999UL :(now - gGpsLastRmcMs);
+ uint32_t ageG = (gGpsLastGgaMs==0) ? 99999UL :(now - gGpsLastGgaMs);
+ uint32_t ageV = (gGpsLastGsvMs==0) ? 99999UL :(now - gGpsLastGsvMs);
+
+ // Возраст покажем в секундах с одной десятичной (грубо)
+ auto toTenthSec = [](uint32_t ms)->uint32_t { return (ms + 50) / 100; }; // 0.1s units
+
+ uint32_t r = toTenthSec(ageR);
+ uint32_t g = toTenthSec(ageG);
+ uint32_t v = toTenthSec(ageV);
+
+ snprintf(out,n,"Sig:%u/%u Age R:%u.%us G:%u.%us V:%u.%us",
+ (unsigned)gGpsSnrAvg,
+ (unsigned)gGpsSnrMax,
+ (unsigned)(r/10),(unsigned)(r%10),
+ (unsigned)(g/10),(unsigned)(g%10),
+ (unsigned)(v/10),(unsigned)(v%10));
+}
+gGpsSnrAvg/gGpsSnrMax — это как раз “сила сигнала” по SNR из GSV (после вашей правки агрегации оно стало стабильным).
+
+2) Замените Page1::drawGpsInfo() на двухстрочный вывод
+Найдите в вашем Page1 метод drawGpsInfo(...) и замените на:
+
+cpp Копировать
+void drawGpsInfo(bool clearArea)
+{
+ TFT_eSPI* d = tft(); if (!d) return;
+
+ // На 320x170 удобно 2 строки ниже параметров.
+ // У вас параметры обычно в Y0 + 0..2*DY,а инфо разместим в Y0 + 3*DY и +4*DY.
+ int y1 = Y0 + 3*DY;
+ int y2 = Y0 + 4*DY;
+
+ if (clearArea) {
+ d->fillRect(0,y1,320,LINE_H,TFT_BLACK);
+ d->fillRect(0,y2,320,LINE_H,TFT_BLACK);
+ }
+
+ char line1[64];
+ char line2[96];
+ formatGpsLine1(line1,sizeof(line1));
+ formatGpsLine2(line2,sizeof(line2));
+
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString(line1,X,y1);
+
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ d->drawString(line2,X,y2);
+}
+Где X,Y0,DY,LINE_H — это ваши константы внутри Page1 (в моих версиях они уже есть:X=10,Y0=22,DY=22,LINE_H=20).
+
+3) Частичная перерисовка (чтобы не “мигало”)
+Если хотите не перерисовывать GPS-инфо каждый update(),можно раз в 500 мс:
+
+В Page1 добавьте поле:
+
+cpp Копировать
+uint32_t _lastGpsInfoMs = 0;
+и в update():
+
+cpp Копировать
+if (_mode == MODE_GPS) {
+ uint32_t now = millis();
+ if (now - _lastGpsInfoMs > 500) {
+ _lastGpsInfoMs = now;
+ drawGpsInfo(true);
+ }
+}
+Если вы пришлёте ваш текущий Page1 (ту версию,которая сейчас в Menu.cpp после последних правок),
+я вставлю эти изменения ровно в ваш код с 
+правильными координатами,чтобы ничего не поехало по экрану 320×170.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — готовая доработка ровно вашего Page1,чтобы в пункте GPS показывались:
+
+Sat:использ./видимые + Fix + HDOP
+Sig:avg/max (SNR) + “свежесть” RMC/GGA/GSV
+и чтобы не было “мигания” (перерисовка только при изменении,и не чаще 2 раза/сек).
+
+1) Добавьте новые поля в private: вашего Page1
+В конец private: (перед drawGpsInfo или после) добавьте:
+
+cpp Копировать
+// GPS info caching
+uint32_t _lastGpsInfoMs = 0;
+char _lastGpsLine1[64] = {0};
+char _lastGpsLine2[96] = {0};
+2) Замените update() в Page1 на версию с ограничением частоты
+Было:
+
+cpp Копировать
+void update() override {
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+}
+Сделайте:
+
+cpp Копировать
+void update() override {
+ if (_mode == MODE_GPS) {
+ uint32_t now = millis();
+ if (now - _lastGpsInfoMs >= 500) { // 2 раза/сек
+ _lastGpsInfoMs = now;
+ drawGpsInfo(false);
+ }
+ }
+}
+3) Замените ваш drawGpsInfo(bool clearLine) на двухстрочный (с SNR/HDOP/age)
+Замените метод целиком:
+
+cpp Копировать
+void drawGpsInfo(bool clearLine) {
+ TFT_eSPI* d = tft(); if (!d) return;
+
+ // 2 строки под параметрами GPS:
+ // параметры GPS занимают Y0+0*DY и Y0+1*DY
+ // инфо GPS выводим на Y0+3*DY и Y0+4*DY
+ int y1 = Y0 + 3 * DY;
+ int y2 = Y0 + 4 * DY;
+
+ // Сформируем строки
+ char line1[64];
+ char line2[96];
+
+ // Line1:Sat + Fix + HDOP
+ snprintf(line1,sizeof(line1),
+ "Sat:%u/%u Fix:%s HDOP:%.2f",
+ (unsigned)gGpsSatsUsed,
+ (unsigned)gGpsSatsView,
+ gGpsFix ? "Y" :"N",
+ (double)gGpsHdop_x100 / 100.0);
+
+ // Line2:Signal (SNR) + ages
+ uint32_t now = millis();
+ uint32_t ageR = (gGpsLastRmcMs == 0) ? 99999UL :(now - gGpsLastRmcMs);
+ uint32_t ageG = (gGpsLastGgaMs == 0) ? 99999UL :(now - gGpsLastGgaMs);
+ uint32_t ageV = (gGpsLastGsvMs == 0) ? 99999UL :(now - gGpsLastGsvMs);
+
+ // 0.1s units
+ auto toTenth = [](uint32_t ms)->uint32_t { return (ms + 50) / 100; };
+ uint32_t r = toTenth(ageR);
+ uint32_t g = toTenth(ageG);
+ uint32_t v = toTenth(ageV);
+
+ snprintf(line2,sizeof(line2),
+ "Sig:%u/%u R:%u.%us G:%u.%us V:%u.%us",
+ (unsigned)gGpsSnrAvg,
+ (unsigned)gGpsSnrMax,
+ (unsigned)(r/10),(unsigned)(r%10),
+ (unsigned)(g/10),(unsigned)(g%10),
+ (unsigned)(v/10),(unsigned)(v%10));
+
+ // Очистка (по требованию,или если строки изменились)
+ bool changed1 = (strcmp(_lastGpsLine1,line1) != 0);
+ bool changed2 = (strcmp(_lastGpsLine2,line2) != 0);
+
+ if (clearLine || changed1) {
+ d->fillRect(0,y1,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString(line1,X,y1);
+ strncpy(_lastGpsLine1,line1,sizeof(_lastGpsLine1)-1);
+ _lastGpsLine1[sizeof(_lastGpsLine1)-1] = 0;
+ }
+
+ if (clearLine || changed2) {
+ d->fillRect(0,y2,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ d->drawString(line2,X,y2);
+ strncpy(_lastGpsLine2,line2,sizeof(_lastGpsLine2)-1);
+ _lastGpsLine2[sizeof(_lastGpsLine2)-1] = 0;
+ }
+}
+4) Маленькая правка:сбросить кэш GPS строк при входе в GPS
+В onActivate() после _lastHash = 0; добавьте:
+
+cpp Копировать
+_lastGpsLine1[0] = 0;
+_lastGpsLine2[0] = 0;
+_lastGpsInfoMs = 0;
+Так при первом входе в GPS всё гарантированно перерисуется.
+
+Что получится на экране (пример)
+Sat:15/12 Fix:Y HDOP:0.90
+Sig:30/43 R:0.4s G:0.1s V:1.7s
+Это укладывается в 320×170 и показывает и спутники,и “силу сигнала” (SNR).
+
+Если хотите,могу заменить R/G/V на более понятные подписи или добавить “GPS UTC” третьей 
+строкой (но по высоте на 170 пикселей это уже на грани).

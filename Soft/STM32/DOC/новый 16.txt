@@ -1,0 +1,125 @@
+Понял. У вас сейчас:
+
+В Menu.cpp нужны строки IP (gIp1Str/gIp2Str) → их нужно добавить в NetFeed.h/.cpp и обновлять в .ino.
+В NtpLanService_Generic.h вы уже объявили методы applyUpstream() и applyLanConfig(),но в .cpp их реализаций
+ нет → из‑за этого при линковке будут ошибки (когда вы начнёте вызывать их из applyInternet1FromStore()).
+Ниже — точно что и куда вставить.
+
+1) IP‑строки для меню:куда добавить
+1.1. NetFeed.h — добавить (рядом с другими extern)
+Откройте NetFeed.h и добавьте:
+
+cpp Копировать
+extern char gIp1Str[16];
+extern char gIp2Str[16];
+extern volatile bool gIpUpdated;
+1.2. NetFeed.cpp — добавить определения (ОДИН раз!)
+Откройте NetFeed.cpp и добавьте:
+
+cpp Копировать
+char gIp1Str[16] = "0.0.0.0";
+char gIp2Str[16] = "0.0.0.0";
+volatile bool gIpUpdated = false;
+1.3. .ino — обновлять раз в секунду
+Добавьте в .ino функцию (выше setup()):
+
+cpp Копировать
+static void updateIpFeed1Hz()
+{
+ static uint32_t t0 = 0;
+ uint32_t now = millis();
+ if (now - t0 < 1000) return;
+ t0 = now;
+
+ IPAddress ip = Ethernet.localIP();
+ char buf[16];
+ snprintf(buf,sizeof(buf),"%u.%u.%u.%u",ip[0],ip[1],ip[2],ip[3]);
+
+ bool ch = false;
+ if (strcmp(gIp1Str,buf) != 0) { strncpy(gIp1Str,buf,sizeof(gIp1Str)-1); gIp1Str[15]=0; ch = true; }
+
+ // INTERNET2 пока не реализован
+ if (strcmp(gIp2Str,"0.0.0.0") != 0) { strncpy(gIp2Str,"0.0.0.0",15); gIp2Str[15]=0; ch = true; }
+
+ if (ch) gIpUpdated = true;
+}
+И в loop() после ntpLan.tick();:
+
+cpp Копировать
+updateIpFeed1Hz();
+if (gIpUpdated) { gIpUpdated = false; menu_start.invalidateHome(); }
+2) Реализовать applyUpstream() и applyLanConfig() в NtpLanService_Generic
+Сейчас в .h они объявлены,но в .cpp отсутствуют. Добавляем.
+
+2.1. В NtpLanService_Generic.cpp:внутрь struct NtpLanService_Generic::Impl добавьте 2 метода
+Добавьте в конец структуры Impl (перед закрывающей };) вот это:
+
+cpp Копировать
+void applyUpstream(IPAddress ip,uint32_t periodMs)
+{
+ net.upstreamIp = ip;
+ net.syncPeriodMs = periodMs;
+ forceSyncNow();
+}
+
+void applyLanConfig(bool dhcp,IPAddress ip,IPAddress dns,IPAddress gw,IPAddress mask)
+{
+ net.useDhcp = dhcp;
+ net.ip = ip;
+ net.dns = dns;
+ net.gw = gw;
+ net.mask = mask;
+
+ // снова направляем Ethernet_Generic на SPI_New
+ extern SPIClass* pCUR_SPI;
+ pCUR_SPI = &SPI_New;
+
+ uint16_t idx = net.macIndex % NUMBER_OF_MAC;
+
+ if (net.useDhcp)
+ {
+ int ok = Ethernet.begin(mac[idx],&SPI_New,20000,4000);
+ if (!ok)
+ {
+ SerialDebug.println(F("[ETH] DHCP failed,fallback to static"));
+ Ethernet.begin(mac[idx],net.ip,net.dns,net.gw,net.mask);
+ net.useDhcp = false; // фактически перешли на static
+ }
+ }
+ else
+ {
+ Ethernet.begin(mac[idx],net.ip,net.dns,net.gw,net.mask);
+ }
+
+ // перезапуск UDP сокетов
+ udpSrv.stop();
+ udpCli.stop();
+ udpSrv.begin(NTP_PORT);
+ udpCli.begin(0);
+
+ forceSyncNow();
+}
+Если у вашей версии EthernetUDP вдруг не имеет .stop(),скажите — дам альтернативу (обычно есть).
+
+2.2. В NtpLanService_Generic.cpp:добавьте обёртки класса (внизу файла)
+После вашей строки:
+
+cpp Копировать
+void NtpLanService_Generic::printStatus1Hz() { if (_impl) _impl->printStatus1Hz(); }
+добавьте:
+
+cpp Копировать
+void NtpLanService_Generic::applyUpstream(IPAddress ip,uint32_t periodMs)
+{
+ if (_impl) _impl->applyUpstream(ip,periodMs);
+}
+
+void NtpLanService_Generic::applyLanConfig(bool dhcp,IPAddress ip,IPAddress dns,IPAddress gw,IPAddress mask)
+{
+ if (_impl) _impl->applyLanConfig(dhcp,ip,dns,gw,mask);
+}
+3) Дальше:applyInternet1FromStore()
+Теперь вы сможете из меню INTERNET1 (через applyInternet1FromStore()) реально применять DHCP/static и NTP‑upstream/period.
+
+Если хотите — пришлите ваш applyInternet1FromStore() (или скажите,что его ещё нет),и я дам готовую реализацию 
+под LanIfStore + ваши 5 IP NTP серверов + 6 периодов.

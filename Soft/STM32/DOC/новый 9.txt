@@ -1923,7 +1923,7 @@ tft->drawString("SIG :",10,Y_SIG);
 cpp Копировать
 tft->fillRect(80,Y_DATE,240,20,TFT_BLACK);
 tft->drawString(_lastDate,80,Y_DATE);
-
+ 
 tft->fillRect(80,Y_TIME,240,20,TFT_BLACK);
 tft->drawString(_lastTime,80,Y_TIME);
 

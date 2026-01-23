@@ -1,0 +1,1600 @@
+Изменить меню
+Переход в меню - нажатие SW4
+Поменять местами навигацию кнопками SW2 SW3
+Вход в пункт подменю SW1
+После входа в подменю выбор пункта меню SW1
+Произвести настройки подменю SW2 SW3
+Выход из меню с сохранением SW4
+
+//////////////////////////////////////////////////////////
+
+Ниже — конкретные правки вашего текущего Menu.cpp под новое управление:
+
+Требования:
+
+Вход в меню:SW4
+Навигация SW2/SW3:поменять местами (везде)
+Вход в пункт/подменю:SW1
+В подменю выбор пункта:SW1
+Настройка (изменение значения):SW2/SW3
+Выход из меню с сохранением:SW4 (сохраняем и выходим на HOME)
+Я даю “готовые вставки/замены” для вашего файла (который вы прислали).
+
+1) Обновить таблицу menu[5][5]
+Замените на:
+
+cpp Копировать
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","GSM","СВОБОДНО","СВОБОДНО"},// Str1:источники
+ {"TZ TARGET","TZ NTP"," "," "," "},// Str2:таймзоны
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+2) drawPageSelect() — вход SW4,заголовок и имена меню
+Замените drawPageSelect() целиком на:
+
+cpp Копировать
+void Menu::drawPageSelect()
+{
+ static const char* topMenuNames[5] = {
+ "ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+ "TIME ZONE",
+ "СВОБОДНО",
+ "СВОБОДНО",
+ "СВОБОДНО"
+ };
+
+ tft->fillScreen(TFT_BLACK);
+ tft->setTextSize(2);
+ tft->setTextColor(TFT_CYAN,TFT_BLACK);
+ tft->drawString("ВЫБОР МЕНЮ",10,10);
+
+ // компактный шаг 24
+ for (int i=0;i<5;i++) {
+ bool sel = (i == page);
+ tft->setTextColor(sel ? TFT_GREEN :TFT_WHITE,sel ? TFT_BLUE :TFT_BLACK);
+ tft->fillRect(10,45 + i*24,310,22,TFT_BLACK);
+ tft->drawString(topMenuNames[i],10,45 + i*24);
+ }
+}
+3) Главное:поменять обработку кнопок в Menu::onButtonPressed()
+Замените весь метод Menu::onButtonPressed(int buttonID) на:
+
+cpp Копировать
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:вход в меню по SW4
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW4) activate();
+ return;
+ }
+
+ // PAGE SELECT:
+ // SW2/SW3 поменяны местами
+ // SW1:войти в выбранный пункт меню
+ // SW4:выйти на HOME (сохранений на этом уровне нет)
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) nextPage(); // было наоборот
+ else if (buttonID == BTN_SW3) prevPage();
+ else if (buttonID == BTN_SW1) fixPage(); // вход
+ else if (buttonID == BTN_SW4) backToStart(); // выход
+ return;
+ }
+
+ // ACTIVE PAGE:
+ // Page1/Page2 обрабатывают кнопки сами (в т.ч. SW4=SAVE+EXIT)
+ if (state == MENU_ITEM_SELECT) {
+
+ if ((page == 0 || page == 1) && pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+
+ // для остальных страниц:SW2/SW3 навигация (поменяны местами),SW1=select,SW4=exit
+ if (buttonID == BTN_SW2) nextItem();
+ else if (buttonID == BTN_SW3) prevItem();
+ else if (buttonID == BTN_SW1) {
+ if (pages[page]) pages[page]->onButtonPressed(BTN_SW1); // "выбор"
+ }
+ else if (buttonID == BTN_SW4) backToStart(); // "выход с сохранением" — тут сохранять нечего
+ return;
+ }
+}
+Обратите внимание:мы больше НЕ выходим на HOME по SW1 — теперь SW1 это “enter/select”.
+
+4) Page2 (TIME ZONE):перебор без записи,выбор поля SW1,настройка SW2/SW3,сохранить+выйти SW4
+Замените ваш текущий class Page2 на этот:
+
+cpp Копировать
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+
+ // tmp (перебор без записи)
+ _tmpTarget = cfg.tzTargetHours;
+ _tmpNtp = cfg.tzNtpHours;
+
+ _fieldSel = 0; // 0 target,1 ntp
+ _savedMsgMs = 0;
+
+ _lastTmpTarget = 127;
+ _lastTmpNtp = 127;
+ _lastFieldSel = 255;
+ _lastSavedVisible = false;
+
+ draw();
+ }
+
+ void update() override {
+ if (_savedMsgMs && (millis() - _savedMsgMs) > 1000) {
+ _savedMsgMs = 0;
+ drawDynamic();
+ }
+ }
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic();
+ }
+
+ void onButtonPressed(int buttonID) override {
+
+ // SW1:выбор поля
+ if (buttonID == BTN_SW1) {
+ _fieldSel = (_fieldSel == 0) ? 1 :0;
+ drawDynamic();
+ return;
+ }
+
+ // SW2/SW3:настройка значения (поменяны местами:SW2=PLUS,SW3=MINUS)
+ if (buttonID == BTN_SW2) {
+ if (_fieldSel == 0) { _tmpTarget++; clampTz(_tmpTarget); }
+ else { _tmpNtp++; clampTz(_tmpNtp); }
+ drawDynamic();
+ return;
+ }
+ if (buttonID == BTN_SW3) {
+ if (_fieldSel == 0) { _tmpTarget--; clampTz(_tmpTarget); }
+ else { _tmpNtp--; clampTz(_tmpNtp); }
+ drawDynamic();
+ return;
+ }
+
+ // SW4:СОХРАНИТЬ и ВЫЙТИ на HOME
+ if (buttonID == BTN_SW4) {
+ cfg.tzTargetHours = _tmpTarget;
+ cfg.tzNtpHours = _tmpNtp;
+
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ ee.writeTzNtpHours(cfg.tzNtpHours);
+
+ planner.onSettingsChanged();
+
+ _savedMsgMs = millis();
+ drawDynamic();
+
+ _m->backToStart();
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ bool _staticDrawn = false;
+
+ uint8_t _fieldSel = 0;
+ int8_t _tmpTarget = 0;
+ int8_t _tmpNtp = 0;
+
+ int8_t _lastTmpTarget = 127;
+ int8_t _lastTmpNtp = 127;
+ uint8_t _lastFieldSel = 255;
+
+ uint32_t _savedMsgMs = 0;
+ bool _lastSavedVisible = false;
+
+ // компактная верстка
+ static const int X = 10;
+ static const int Y_TITLE = 10;
+ static const int Y0 = 44;
+ static const int DY = 22;
+
+ static const int Y_L1 = Y0 + 0*DY;
+ static const int Y_L2 = Y0 + 1*DY;
+
+ static const int X_MARK = 0;
+ static const int X_VAL = 210;
+ static const int W_VAL = 100;
+ static const int H_VAL = 18;
+
+ static const int Y_HINT1 = 140;
+ static const int Y_HINT2 = 162;
+ static const int Y_HINT3 = 184;
+
+ static const int X_SAVED = 240;
+ static const int Y_SAVED = 184;
+ static const int W_SAVED = 80;
+ static const int H_SAVED = 18;
+
+ void drawStatic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("TIME ZONE",X,Y_TITLE);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString("TZ target:",X,Y_L1);
+ d->drawString("TZ NTP :",X,Y_L2);
+
+ d->drawString("SW1:FIELD",X,Y_HINT1);
+ d->drawString("SW2:+ SW3:-",X,Y_HINT2);
+ d->drawString("SW4:SAVE+EXIT",X,Y_HINT3);
+
+ d->fillRect(X_MARK,Y_L1,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_MARK,Y_L2,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_L1,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_VAL,Y_L2,W_VAL,H_VAL,TFT_BLACK);
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ }
+
+ void drawDynamic() {
+ TFT_eSPI* d = tft();
+ if (!d) return;
+
+ // маркер выбранного поля
+ if (_lastFieldSel != _fieldSel) {
+ _lastFieldSel = _fieldSel;
+ d->fillRect(X_MARK,Y_L1,10,H_VAL,TFT_BLACK);
+ d->fillRect(X_MARK,Y_L2,10,H_VAL,TFT_BLACK);
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ d->drawString(">",X_MARK,(_fieldSel == 0) ? Y_L1 :Y_L2);
+ }
+
+ if (_lastTmpTarget != _tmpTarget) {
+ _lastTmpTarget = _tmpTarget;
+ d->fillRect(X_VAL,Y_L1,W_VAL,H_VAL,TFT_BLACK);
+ char buf[12]; snprintf(buf,sizeof(buf),"%d",(int)_tmpTarget);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_L1);
+ }
+
+ if (_lastTmpNtp != _tmpNtp) {
+ _lastTmpNtp = _tmpNtp;
+ d->fillRect(X_VAL,Y_L2,W_VAL,H_VAL,TFT_BLACK);
+ char buf[12]; snprintf(buf,sizeof(buf),"%d",(int)_tmpNtp);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(buf,X_VAL,Y_L2);
+ }
+
+ bool savedVisible = (_savedMsgMs != 0);
+ if (_lastSavedVisible != savedVisible) {
+ _lastSavedVisible = savedVisible;
+ d->fillRect(X_SAVED,Y_SAVED,W_SAVED,H_SAVED,TFT_BLACK);
+ if (savedVisible) {
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ d->drawString("SAVED",X_SAVED,Y_SAVED);
+ }
+ }
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+};
+5) Page1 (ИСТОЧНИКИ):вход в подменю SW1,выбор пункта SW1,настройка SW2/SW3,сохранить+выйти SW4
+В вашем текущем файле Page1 пока заглушка. Её нужно заменить на реальную. Скажите — вы хотите одну страницу Page1 с тремя подменю (GPS/ИНТЕРНЕТ/GSM) как мы делали ранее? Если да — я дам готовый class Page1 целиком под эти правила (он длиннее Page2).
+
+Что у вас уже правильно в .ino
+Ваш обработчик кнопок по EDGE_PRESSED/EDGE_RELEASED подходит и менять не нужно.
+
+Уточнение перед тем как выдам Page1 целиком
+Подтвердите,пожалуйста:
+
+В Page1 при выборе источника (GPS/ИНТЕРНЕТ/GSM) вход в его настройки делаем SW1 (выбор источника SW2/SW3). Верно?
+Внутри настройки источника SW1 должен переключать параметр (Enable/Provider/Period). Верно?
+SW4 всегда сохранить изменения источника и выйти на HOME. Верно?
+Как подтвердите — я сформирую полный готовый class Page1 для вашего Menu.cpp (с частичной перерисовкой и компактными строками).
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Понял:оставляем “как было” по управлению меню:
+
+HOME → вход в меню:SW4
+Навигация вниз:SW2
+Навигация вверх:SW3
+А мой прошлый вариант с “вход SW1 / смена навигации” — отменяем.
+
+Но фраза «нет входа в пункты подменю и выбора параметров» требует уточнения: у Page1 (источники) 
+и Page2 (таймзона) параметров несколько. Если совсем не выбирать параметр,то остаётся только вариант 
+разнести каждый параметр на отдельную страницу (иначе непонятно,что менять SW2/SW3).
+
+Сейчас я сделаю корректное управление меню (вход/выход/навигация) и предложу 2 схемы для страниц:
+
+Схема А (рекомендую): в страницах SW1 = переключить редактируемое поле,SW2/SW3 меняют значение,
+SW4 = сохранить+выйти. (Это всё ещё “без подменю”,но выбор параметра есть.)
+Схема B: без выбора параметров → каждый параметр отдельной страницей (например:Page2 только TZ Target,Page3 только TZ NTP).
+Ниже — точный патч для Menu::onButtonPressed() под “как было”.
+
+1) Правильная обработка кнопок меню (Menu.cpp)
+Замените ваш Menu::onButtonPressed(int buttonID) на:
+
+cpp Копировать
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:вход в меню по SW4
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW4) activate();
+ return;
+ }
+
+ // PAGE SELECT:
+ // SW2 вниз (next),SW3 вверх (prev),SW1 войти,SW4 выход на HOME
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) nextPage(); // вниз
+ else if (buttonID == BTN_SW3) prevPage();// вверх
+ else if (buttonID == BTN_SW1) fixPage(); // войти в выбранную страницу
+ else if (buttonID == BTN_SW4) backToStart(); // выход
+ return;
+ }
+
+ // ACTIVE PAGE:
+ if (state == MENU_ITEM_SELECT) {
+
+ // Для Page1/Page2 отдаём кнопки страницам (там ваша логика настроек)
+ if ((page == 0 || page == 1) && pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+
+ // Для остальных страниц — стандарт:
+ if (buttonID == BTN_SW2) nextItem();
+ else if (buttonID == BTN_SW3) prevItem();
+ else if (buttonID == BTN_SW1) backToStart(); // назад
+ else if (buttonID == BTN_SW4) backToStart(); // выход
+
+ if (pages[page]) pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+}
+Это вернёт:
+
+вход в меню SW4
+навигацию SW2 вниз / SW3 вверх
+вход в страницу SW1
+выход SW4
+2) Уточнение по “нет выбора параметров”
+Чтобы двигаться дальше без ошибок,ответьте,пожалуйста,на 1 вопрос:
+
+Как вы хотите на Page2 (TIME ZONE) менять одновременно tzTargetHours и tzNtpHours,если “нет выбора параметров”?
+
+Варианты:
+
+SW1 переключает редактируемое поле (Target/NTP),SW2/SW3 меняют,SW4 сохраняет+выходит.
+Разнести на 2 страницы: Page2 = TZ Target,Page3 = TZ NTP. Тогда выбора параметров действительно нет.
+Ваш вариант (опишите).
+Если выбираете Вариант 2 (без выбора параметров)
+Я сразу переработаю меню так:
+
+Str2 = “TZ Target” (SW2/SW3 изменить,SW4 сохранить+выйти,SW1 назад без сохранения)
+Str3 = “TZ NTP” (аналогично)
+И то же самое для “Источники синхронизации”:можно сделать отдельные страницы:
+
+GPS enable / GPS period
+NET enable / NET server / NET period
+GSM enable / GSM operator / GSM period
+Пришлите,какой вариант выбираете (1 или 2),и я сформирую полностью корректные 
+Page1 и Page2 под ваш стиль без подменю/или с переключением поля.
+
+//******************************************************************
+
+Понял,теперь схема управления такая (без “входа в пункты/режимов выбора”):
+
+HOME → меню: SW4
+Навигация вниз: SW2
+Навигация вверх: SW3
+Вход в страницу/подменю: SW1
+В подменю:
+переключить пункт (1→2→3…): SW1
+изменить параметр выбранного пункта: SW2 (–) / SW3 (+)
+СОХРАНИТЬ и ВЫЙТИ на HOME: SW4
+То есть “выбора списком” нет — активный пункт просто циклически меняется кнопкой SW1,а значения крутятся SW2/SW3.
+
+Ниже — конкретные правки для вашего текущего Menu.cpp.
+
+1) Menu::onButtonPressed — вернуть “как было” (вход SW4,вход в страницу SW1,выход SW4)
+Замените ваш Menu::onButtonPressed(int buttonID) на:
+
+cpp Копировать
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:вход в меню по SW4
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW4) activate();
+ return;
+ }
+
+ // Выбор меню (страниц)
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) nextPage(); // вниз
+ else if (buttonID == BTN_SW3) prevPage(); // вверх
+ else if (buttonID == BTN_SW1) fixPage(); // войти
+ else if (buttonID == BTN_SW4) backToStart(); // выйти на HOME
+ return;
+ }
+
+ // Активная страница
+ if (state == MENU_ITEM_SELECT) {
+
+ // Page1 и Page2 обрабатывают кнопки сами (в т.ч. SAVE+EXIT по SW4)
+ if ((page == 0 || page == 1) && pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+
+ // Для остальных страниц:минимально — выход по SW4 или SW1
+ if (buttonID == BTN_SW4 || buttonID == BTN_SW1) backToStart();
+ return;
+ }
+}
+2) Таблица меню (Str1=источники,Str2=таймзона)
+Замените menu[5][5] на:
+
+cpp Копировать
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","GSM","СВОБОДНО","СВОБОДНО"},
+ {"TIME ZONE"," "," "," "," "},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+3) Page2 (TIME ZONE) — без “выбора параметров списком”
+Замените ваш class Page2 на этот (SW1 циклично выбирает параметр,SW2/3 меняют,SW4 сохраняет+выходит):
+
+cpp Копировать
+class Page2 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _staticDrawn = false;
+
+ _tmpTarget = cfg.tzTargetHours;
+ _tmpNtp = cfg.tzNtpHours;
+
+ _param = 0; // 0=TZ target,1=TZ NTP
+ draw();
+ }
+
+ void update() override {}
+
+ void draw() override {
+ if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+ // SW1:следующий пункт (параметр)
+ if (buttonID == BTN_SW1) {
+ _param = (_param + 1) % 2;
+ drawDynamic(false);
+ return;
+ }
+
+ // SW2:минус
+ if (buttonID == BTN_SW2) {
+ if (_param == 0) { _tmpTarget--; clampTz(_tmpTarget); }
+ else { _tmpNtp--; clampTz(_tmpNtp); }
+ drawDynamic(false);
+ return;
+ }
+
+ // SW3:плюс
+ if (buttonID == BTN_SW3) {
+ if (_param == 0) { _tmpTarget++; clampTz(_tmpTarget); }
+ else { _tmpNtp++; clampTz(_tmpNtp); }
+ drawDynamic(false);
+ return;
+ }
+
+ // SW4:сохранить и выйти на HOME
+ if (buttonID == BTN_SW4) {
+ cfg.tzTargetHours = _tmpTarget;
+ cfg.tzNtpHours = _tmpNtp;
+
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ ee.writeTzNtpHours(cfg.tzNtpHours);
+
+ planner.onSettingsChanged();
+
+ _m->backToStart();
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ bool _staticDrawn = false;
+
+ uint8_t _param = 0;
+ int8_t _tmpTarget = 0;
+ int8_t _tmpNtp = 0;
+
+ // кеш для частичной перерисовки
+ uint8_t _lastParam = 255;
+ int8_t _lastTarget = 127;
+ int8_t _lastNtp = 127;
+
+ // компактная разметка
+ static const int X = 10;
+ static const int Y_TITLE = 10;
+ static const int Y1 = 50;
+ static const int Y2 = 75;
+ static const int H = 20;
+
+ void drawStatic() {
+ auto d = tft(); if(!d) return;
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ d->drawString("TIME ZONE",10,10);
+
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString("1) TZ target:",X,Y1);
+ d->drawString("2) TZ NTP :",X,Y2);
+
+ d->drawString("SW1:NEXT",10,140);
+ d->drawString("SW2:- SW3:+",10,165);
+ d->drawString("SW4:SAVE+EXIT",10,190);
+ }
+
+ void drawDynamic(bool force) {
+ auto d = tft(); if(!d) return;
+
+ if (force || _lastParam != _param) {
+ _lastParam = _param;
+ // маркеры
+ d->fillRect(0,Y1,10,H,TFT_BLACK);
+ d->fillRect(0,Y2,10,H,TFT_BLACK);
+ d->setTextColor(TFT_CYAN,TFT_BLACK);
+ d->drawString(">",0,(_param==0)?Y1:Y2);
+ }
+
+ if (force || _lastTarget != _tmpTarget) {
+ _lastTarget = _tmpTarget;
+ d->fillRect(210,Y1,100,H,TFT_BLACK);
+ char b[8]; snprintf(b,sizeof(b),"%d",(int)_tmpTarget);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(b,210,Y1);
+ }
+
+ if (force || _lastNtp != _tmpNtp) {
+ _lastNtp = _tmpNtp;
+ d->fillRect(210,Y2,100,H,TFT_BLACK);
+ char b[8]; snprintf(b,sizeof(b),"%d",(int)_tmpNtp);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->drawString(b,210,Y2);
+ }
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+};
+4) Page1 (ИСТОЧНИКИ СИНХРОНИЗАЦИИ) по той же логике
+Чтобы сделать “GPS/ИНТЕРНЕТ/GSM” без подменю выбора,нужно заменить ваш Page1 на реальный:
+
+Экран 1:список источников (GPS/ИНТЕРНЕТ/GSM/…)
+SW2 вниз,SW3 вверх,SW1 вход в выбранный источник,SW4 выход HOME
+Экран 2:настройки выбранного источника
+SW1 циклично выбирает пункт (Enable/Provider/Period)
+SW2/3 меняют значение
+SW4 сохраняет в syncData (и при INTERNET обновляет cfg.server+ee.writeSERVER) и выходит на HOME
+Это довольно объёмный класс. Чтобы не ошибиться,подтвердите,пожалуйста,что для источников вы хотите именно такие пункты:
+
+GPS: пункт1 Enable (ДА/НЕТ),пункт2 Period (6 вариантов)
+ИНТЕРНЕТ: пункт1 Enable,пункт2 NTP server (5 вариантов),пункт3 Period
+GSM: пункт1 Enable,пункт2 Operator (5 вариантов),пункт3 Period
+Если да — я сформирую полностью готовый class Page1 и скажу,какие extern должны быть вверху Menu.cpp 
+(у вас они уже есть:syncData/syncStore/planner/ee/cfg).
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Понял. Фиксируем ровно это управление:
+
+HOME: вход в меню = SW4
+В меню (выбор пункта):
+вниз = SW2
+вверх = SW3
+выбор/вход = SW4
+Остаётся один обязательный вопрос:какой кнопкой выход из меню? Обычно это SW1 (“назад/выход”). 
+Если подтверждаете — я включу SW1 как выход на HOME.
+
+Ниже — готовая корректная логика для Menu::onButtonPressed() под ваши правила (с выходом по SW1).
+
+ВАЖНО:если у вас всё ещё SW4_PIN = PC0 и одновременно BUTTON_PIN = PC0,управление будет “ломаться”. Нужны разные пины.
+
+1) Замените Menu::onButtonPressed(int buttonID) (Menu.cpp) на это
+cpp Копировать
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:вход в меню по SW4
+ if (state == MENU_IDLE) {
+ if (buttonID == BTN_SW4) activate();
+ return;
+ }
+
+ // MENU_PAGE_SELECT:список страниц/меню
+ if (state == MENU_PAGE_SELECT) {
+ if (buttonID == BTN_SW2) nextPage(); // вниз
+ else if (buttonID == BTN_SW3) prevPage(); // вверх
+ else if (buttonID == BTN_SW4) fixPage(); // выбрать/войти
+ else if (buttonID == BTN_SW1) backToStart(); // выход на HOME (если подтверждаете)
+ return;
+ }
+
+ // MENU_ITEM_SELECT:внутри выбранной страницы/подменю
+ if (state == MENU_ITEM_SELECT) {
+ // если у вас на странице своя логика — отдайте ей кнопки
+ if (pages[page]) {
+ // Вариант A:отдавать всё странице
+ pages[page]->onButtonPressed(buttonID);
+ // И дополнительно дать общий выход по SW1:
+ if (buttonID == BTN_SW1) backToStart();
+ return;
+ }
+
+ // Вариант B:стандартная навигация по item (если страницы не реализованы)
+ if (buttonID == BTN_SW2) nextItem(); // вниз
+ else if (buttonID == BTN_SW3) prevItem(); // вверх
+ else if (buttonID == BTN_SW4) fixItem(); // выбрать/выполнить
+ else if (buttonID == BTN_SW1) backToStart(); // выход
+ return;
+ }
+}
+2) В .ino обработка кнопок у вас правильная
+То,что вы прислали (EDGE_PRESSED → menu_start.onButtonPressed(...)) — ок.
+
+3) Уточните про выход
+Подтвердите,пожалуйста:выход из меню делать по SW1? Если нет — скажите,какой кнопкой (например,долгое SW4,или SW1,или SW2+SW3 вместе) — подстрою код.
+
+4) Если после этого “всё не так”
+Тогда почти наверняка причина в конфликте пинов. Проверьте:
+
+SW4_PIN и BUTTON_PIN не должны быть одним и тем же GPIO.
+на время отладки меню лучше отключить код,который читает BUTTON_PIN и переключает режим “частота/время”.
+Пришлите,пожалуйста,ваши текущие значения:
+
+cpp Копировать
+#define SW1_PIN ...
+#define SW2_PIN ...
+#define SW3_PIN ...
+#define SW4_PIN ...
+#define BUTTON_PIN ...
+и я скажу сразу,есть ли конфликт.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+Принято:меняем “железную” раскладку кнопок так,как вы написали:
+
+Вызов меню: BTN_SW1
+Вверх по пунктам меню: BTN_SW2
+Вниз по пунктам меню: BTN_SW3
+Выбор/вход в пункт меню: BTN_SW1
+Ниже — точная замена обработчика Menu::onButtonPressed() в вашем menu.cpp.
+
+1) Замените Menu::onButtonPressed(int buttonID) на этот вариант
+cpp Копировать
+void Menu::onButtonPressed(int buttonID)
+{
+ // HOME:вход в меню по SW1
+ if (state == MENU_IDLE)
+ {
+ if (buttonID == BTN_SW1) activate();
+ return;
+ }
+
+ // MENU_PAGE_SELECT:навигация и выбор
+ if (state == MENU_PAGE_SELECT)
+ {
+ if (buttonID == BTN_SW2) prevPage(); // ВВЕРХ
+ else if (buttonID == BTN_SW3) nextPage(); // ВНИЗ
+ else if (buttonID == BTN_SW1) fixPage(); // ВЫБОР/ВХОД
+ else if (buttonID == BTN_SW4) backToStart(); // ВЫХОД на HOME (если нужно)
+ return;
+ }
+
+ // MENU_ITEM_SELECT:внутри страницы
+ if (state == MENU_ITEM_SELECT)
+ {
+ // Отдаём кнопки странице (Page1/Page2 сами решают,что делать)
+ if (pages[page]) {
+ pages[page]->onButtonPressed(buttonID);
+ return;
+ }
+
+ // Если страницы нет — можно сделать базовую навигацию по item:
+ if (buttonID == BTN_SW2) prevItem(); // ВВЕРХ
+ else if (buttonID == BTN_SW3) nextItem(); // ВНИЗ
+ else if (buttonID == BTN_SW1) fixItem(); // ВЫБОР
+ else if (buttonID == BTN_SW4) backToStart(); // ВЫХОД
+ return;
+ }
+}
+2) Обязательно поправьте “подсказки” на экране (если выводите)
+У вас в Page1::drawStatic() сейчас подсказки были под старую схему (SW3/SW2:SELECT и т.п.). Теперь логично так:
+
+Вверх: SW2
+Вниз: SW3
+Выбор/вход: SW1
+Выход/сохранение: SW4 (если вы так используете)
+Замените строки подсказок соответственно,иначе будет путаница.
+
+3) Проверка,что события приходят от нужной кнопки
+Если после замены “всё равно” меню открывается другой кнопкой — значит в .ino перепутано соответствие пинов кнопкам. В вашем .ino должно быть:
+
+cpp Копировать
+if (btnSW1.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW1);
+...
+Если это так,то проблема только в том,какая физическая кнопка подключена к SW1_PIN.
+
+Если хотите — пришлите ваши строки:
+
+cpp Копировать
+#define SW1_PIN ...
+#define SW2_PIN ...
+#define SW3_PIN ...
+#define SW4_PIN ...
+и я скажу,как именно должны быть подключены кнопки,чтобы работало “по железу” как вы описали.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+У вас тут две разные проблемы,и обе видны прямо из показанного фрагмента.
+
+1) Почему “сообщение сразу удаляется” (подсказки исчезают)
+Вы рисуете подсказки на y = 120 / 135 / 150,а ниже в drawStatic()/drawDynamic() 
+у вас есть очистка строк меню через fillRect() начиная с Y0 = 40 с шагом DY = 22.
+
+При i = 4..6 это попадает ровно в диапазон 120..150:
+
+40 + 4*22 = 128
+40 + 5*22 = 150
+40 + 6*22 = 172
+То есть вы сами затираете эти строки при отрисовке пунктов меню/подменю.
+
+Исправление
+Подсказки рисовать ниже,например в районе 200..244 (как было раньше),или уменьшить зону очистки.
+
+Самый простой вариант — перенести подсказки вниз и больше их не затирать:
+
+Замените в Page1::drawStatic() блок подсказок на такой:
+
+cpp Копировать
+if (_mode == MODE_LIST)
+{
+ d->drawString("SW2:UP SW3:DOWN",10,200);
+ d->drawString("SW1:ENTER",10,222);
+ d->drawString("SW4:HOME",10,244);
+}
+else
+{
+ d->drawString("SW2/SW3:CHANGE",10,200);
+ d->drawString("SW1:EDIT/SAVE",10,222);
+ d->drawString("SW4:BACK",10,244);
+}
+(координаты 200/222/244 гарантированно ниже ваших “строк списка”)
+
+2) Почему в “ИСТОЧНИКИ СИНХРОНИЗАЦИИ → GPS” не появляется пункт ВКЛ:
+Потому что у вас вход в GPS сейчас завязан на BTN_SW4:
+
+cpp Копировать
+if (_mode == MODE_LIST) {
+ ...
+ if (buttonID == BTN_SW4) { _mode = MODE_GPS; ... }
+}
+А вы написали,что по “железу”:
+
+вызов меню = BTN_SW1
+выбор пункта меню = BTN_SW1
+То есть вы нажимаете SW1,а код ждёт SW4 → в MODE_GPS вы никогда не попадаете,и строки ВКЛ: не рисуются.
+
+Исправление (под вашу “железную” раскладку)
+В Page1::onButtonPressed():
+
+Назад/выход сделайте по BTN_SW4 (а не по SW1)
+Вход/выбор/редактирование/сохранение делайте по BTN_SW1
+Навигация по списку:SW2 вверх,SW3 вниз (как вы описали)
+2.1. Замените “BACK/CANCEL” блок в начале
+Было:
+
+cpp Копировать
+if (buttonID == BTN_SW1) { ... back/cancel ... }
+Сделайте:
+
+cpp Копировать
+if (buttonID == BTN_SW4) // BACK/CANCEL/HOME
+{
+ if (_mode == MODE_LIST) { _m->backToStart(); return; }
+
+ if (_edit) {
+ _tmp = syncData;
+ _edit = false;
+ _savedMsgMs = 0;
+ drawDynamic();
+ return;
+ }
+
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+}
+2.2. Вход в GPS/ИНТЕРНЕТ/GSM сделать по BTN_SW1
+В MODE_LIST замените:
+
+cpp Копировать
+if (buttonID == BTN_SW4) { ... enter ... }
+на:
+
+cpp Копировать
+if (buttonID == BTN_SW1) { ... enter ... }
+И навигацию сделайте строго как вы хотели:
+
+SW2 = вверх
+SW3 = вниз
+То есть:
+
+cpp Копировать
+if (buttonID == BTN_SW2) { _sel = (_sel + 4) % 5; drawDynamic(); return; } // UP
+if (buttonID == BTN_SW3) { _sel = (_sel + 1) % 5; drawDynamic(); return; } // DOWN
+if (buttonID == BTN_SW1) { /* ENTER */ ... }
+2.3. В подменю вход в EDIT и SAVE тоже по BTN_SW1
+В подменю замените:
+
+BTN_SW4 -> EDIT на BTN_SW1 -> EDIT
+BTN_SW4 -> SAVE на BTN_SW1 -> SAVE
+А изменение значения оставьте на SW2/SW3 (у вас уже почти так,просто проверьте знак).
+
+Минимальный контроль после правок
+Открыли меню SW1 → вошли в “ИСТОЧНИКИ…” (Page1).
+SW2/SW3 двигают выбор.
+SW1 входит в GPS → на экране появляется строка 1) ВКЛ:ДА/НЕТ.
+Если хотите,я могу собрать вам полностью готовый Page1 под вашу “железную” схему 
+(SW1=enter/edit/save,SW2=up/+,SW3=down/−,SW4=back/home) одной вставкой,чтобы вы не правили 
+вручную и не ловили рассинхрон подсказок/кнопок. Для этого подтвердите окончательно назначение кнопок внутри подменю:
+
+SW2/SW3 в режиме EDIT:это “+/-” или “UP/DOWN”? (что удобнее)
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — готовый Page1 для вашего Menu.cpp,адаптированный под дисплей 320×170 (landscape) и управление:
+
+SW1 (BTN_SW1):войти в выбранный источник (в списке) / в подменю — переключить пункт 1→2→3…
+SW2 (BTN_SW2):в списке ↑,в подменю “-”
+SW3 (BTN_SW3):в списке ↓,в подменю “+”
+SW4 (BTN_SW4):
+в списке:выход на HOME
+в подменю:СОХРАНИТЬ и вернуться в список источников
+Изменения внутри подменю выполняются во временной копии (_tmp) и в EEPROM пишутся только при SW4.
+
+Вставьте этот класс вместо вашего текущего class Page1 в Menu.cpp.
+
+Требуются extern как у вас уже есть в Menu.cpp: ee,cfg,syncStore,syncData,planner,gGpsSatsUsed/gGpsSatsView/gGpsFix
+ и массивы kNtpServers/kGsmProviders/kPeriodsName.
+
+Готовый class Page1
+cpp Копировать
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _mode = MODE_LIST;
+ _sel = 0;
+ _param = 0;
+
+ _tmp = syncData; // работаем с копией (без записи)
+ _staticDrawn = false;
+
+ _lastSel = 255;
+ _lastParam = 255;
+ _lastLineHash = 0;
+
+ draw();
+ }
+
+ void update() override {
+ // GPS info можно обновлять хоть каждую итерацию (строка одна)
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ // сброс кешей,чтобы первая динамика точно нарисовалась
+ _lastSel = 255;
+ _lastParam = 255;
+ _lastLineHash = 0;
+ }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+
+ // ---------- LIST MODE ----------
+ if (_mode == MODE_LIST) {
+
+ if (buttonID == BTN_SW2) { // UP
+ _sel = (_sel + 4) % 5;
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW3) { // DOWN
+ _sel = (_sel + 1) % 5;
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW1) { // ENTER selected source
+ if (_sel == 0) _mode = MODE_GPS;
+ else if (_sel == 1) _mode = MODE_NET;
+ else if (_sel == 2) _mode = MODE_GSM;
+ else return; // "СВОБОДНО"
+
+ _param = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+
+ if (buttonID == BTN_SW4) { // EXIT to HOME
+ _m->backToStart();
+ return;
+ }
+
+ return;
+ }
+
+ // ---------- SUBMENU (GPS/NET/GSM) ----------
+ // SW1:next parameter
+ if (buttonID == BTN_SW1) {
+ _param = (_param + 1) % paramCount();
+ drawDynamic(false);
+ return;
+ }
+
+ // SW2:"-" ,SW3:"+"
+ if (buttonID == BTN_SW2) {
+ changeParam(-1);
+ drawDynamic(false);
+ return;
+ }
+ if (buttonID == BTN_SW3) {
+ changeParam(+1);
+ drawDynamic(false);
+ return;
+ }
+
+ // SW4:SAVE and back to list
+ if (buttonID == BTN_SW4) {
+ commitSave();
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum Mode :uint8_t { MODE_LIST=0,MODE_GPS=1,MODE_NET=2,MODE_GSM=3 };
+
+ // Экран 320x170:разметка
+ static const int X = 10;
+ static const int Y_TITLE = 0;
+ static const int Y0 = 22;
+ static const int DY = 22; // 5 строк *22 = 110,влезает
+ static const int LINE_W = 320;
+ static const int LINE_H = 20;
+
+ static const int Y_HINT1 = 132; // подсказки внизу (не затираются)
+ static const int Y_HINT2 = 148;
+
+ Mode _mode = MODE_LIST;
+ bool _staticDrawn = false;
+
+ uint8_t _sel = 0; // выбор источника в списке (0..4)
+ uint8_t _param = 0; // выбор пункта в подменю (циклом)
+
+ SyncSourcesStore::Data _tmp;
+
+ // кеши для частичной перерисовки
+ uint8_t _lastSel = 255;
+ uint8_t _lastParam = 255;
+ uint32_t _lastLineHash = 0;
+
+ // ----- helpers -----
+ uint8_t paramCount() const {
+ if (_mode == MODE_GPS) return 2; // enable,period
+ if (_mode == MODE_NET) return 3; // enable,server,period
+ if (_mode == MODE_GSM) return 3; // enable,operator,period
+ return 0;
+ }
+
+ void drawStatic() {
+ TFT_eSPI* d = tft(); if (!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+ if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",X,Y_TITLE);
+ else if (_mode == MODE_GPS) d->drawString("GPS",X,Y_TITLE);
+ else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+ else if (_mode == MODE_GSM) d->drawString("GSM",X,Y_TITLE);
+
+ // очистка области строк
+ for (int i=0;i<6;i++) d->fillRect(0,Y0 + i*DY,LINE_W,LINE_H,TFT_BLACK);
+
+ // подсказки (мелким шрифтом)
+ d->setTextSize(1);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+
+ if (_mode == MODE_LIST) {
+ d->drawString("SW2:UP SW3:DOWN SW1:ENTER",X,Y_HINT1);
+ d->drawString("SW4:HOME",X,Y_HINT2);
+ } else {
+ d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+ d->drawString("SW4:SAVE+BACK",X,Y_HINT2);
+ }
+
+ // вернуть размер текста для контента
+ d->setTextSize(2);
+ }
+
+ void drawDynamic(bool force) {
+ TFT_eSPI* d = tft(); if (!d) return;
+
+ if (_mode == MODE_LIST) {
+ if (!force && _lastSel == _sel) return;
+ _lastSel = _sel;
+
+ for (int i=0;i<5;i++) {
+ d->fillRect(0,Y0 + i*DY,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor((i==_sel) ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),X,Y0 + i*DY);
+ }
+ return;
+ }
+
+ // Подменю:перерисуем только если изменился _param или изменились значения
+ uint32_t h = calcStateHash();
+ if (!force && _lastParam == _param && _lastLineHash == h) {
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ return;
+ }
+ _lastParam = _param;
+ _lastLineHash = h;
+
+ // Рисуем параметры (2 или 3 строки)
+ uint8_t n = paramCount();
+ for (uint8_t i=0;i<n;i++) {
+ d->fillRect(0,Y0 + i*DY,LINE_W,LINE_H,TFT_BLACK);
+
+ // маркер активного пункта
+ d->setTextColor((i==_param) ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+ if (i==_param) d->drawString(">",0,Y0 + i*DY);
+
+ char line[64];
+ buildParamLine(i,line,sizeof(line));
+ d->drawString(line,X,Y0 + i*DY);
+ }
+
+ if (_mode == MODE_GPS) drawGpsInfo(true);
+ }
+
+ uint32_t calcStateHash() const {
+ // дешёвый хеш для определения изменения содержимого
+ uint32_t h = 2166136261u;
+ auto mix = [&](uint32_t v){ h ^= v; h *= 16777619u; };
+
+ if (_mode == MODE_GPS) {
+ mix(_tmp.gpsEnable); mix(_tmp.gpsPeriodIdx);
+ } else if (_mode == MODE_NET) {
+ mix(_tmp.netEnable); mix(_tmp.netProviderIdx); mix(_tmp.netPeriodIdx);
+ } else if (_mode == MODE_GSM) {
+ mix(_tmp.gsmEnable); mix(_tmp.gsmProviderIdx); mix(_tmp.gsmPeriodIdx);
+ }
+ mix(_param);
+ return h;
+ }
+
+ void buildParamLine(uint8_t i,char* out,size_t n) const {
+ if (_mode == MODE_GPS) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gpsEnable ? "ДА":"НЕТ");
+ else snprintf(out,n,"2) ПЕР:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+ return;
+ }
+
+ if (_mode == MODE_NET) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.netEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) NTP:%s",kNtpServers[_tmp.netProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+ return;
+ }
+
+ // MODE_GSM
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gsmEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) ОП:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+ }
+
+ void changeParam(int delta) {
+ // delta:-1/+1
+ if (_mode == MODE_GPS) {
+ if (_param == 0) {
+ // ВКЛ:переключение при любом знаке
+ _tmp.gpsEnable = _tmp.gpsEnable ? 0 :1;
+ } else {
+ // период
+ _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ }
+ return;
+ }
+
+ if (_mode == MODE_NET) {
+ if (_param == 0) _tmp.netEnable = _tmp.netEnable ? 0 :1;
+ else if (_param == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta > 0 ? 1 :4)) % 5);
+ else _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ return;
+ }
+
+ // MODE_GSM
+ if (_param == 0) _tmp.gsmEnable = _tmp.gsmEnable ? 0 :1;
+ else if (_param == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta > 0 ? 1 :4)) % 5);
+ else _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+ }
+
+ void commitSave() {
+ // записываем только по SW4
+ syncData = _tmp;
+ syncStore.save(syncData);
+
+ // INTERNET:выбранный NTP сервер -> cfg.server -> EEPROM cfg
+ if (_mode == MODE_NET) {
+ const char* s = kNtpServers[syncData.netProviderIdx % 5];
+ strncpy(cfg.server,s,sizeof(cfg.server) - 1);
+ cfg.server[sizeof(cfg.server) - 1] = 0;
+ ee.writeSERVER(cfg.server);
+ }
+
+ planner.onSettingsChanged();
+ }
+
+ void drawGpsInfo(bool clearLine) {
+ TFT_eSPI* d = tft(); if (!d) return;
+ // строка под параметрами (Y0 + 3*DY = 88) — влезает
+ int y = Y0 + 3*DY;
+ if (clearLine) d->fillRect(0,y,LINE_W,LINE_H,TFT_BLACK);
+
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ char buf[64];
+ snprintf(buf,sizeof(buf),"SAT:%u/%u FIX:%s",
+ (unsigned)gGpsSatsUsed,(unsigned)gGpsSatsView,gGpsFix ? "YES" :"NO");
+ d->drawString(buf,X,y);
+ }
+};
+Что было “сообщение сразу удаляется” и почему теперь не будет
+Раньше подсказки рисовались на y=120..150 и затирались fillRect-ами строк меню. 
+Теперь подсказки вынесены в низ Y_HINT1=132 / Y_HINT2=148 и область строк меню рисуется только в зоне Y0..Y0+DY*5.
+
+Проверка после вставки
+HOME → меню:как у вас настроено (BTN_SW1 или BTN_SW4).
+В “ИСТОЧНИКИ…”:
+SW2 вверх / SW3 вниз — выбор GPS/ИНТЕРНЕТ/GSM
+SW1 — вход
+В GPS:
+SW1 переключает между пунктами 1/2
+SW2 “-” (переключит ДА/НЕТ или уменьшит период)
+SW3 “+” (аналогично)
+SW4 — сохранить и вернуться к списку источников
+Если хотите,я подстрою поведение SW2/SW3 для булевого пункта “ВКЛ” так,чтобы SW2=НЕТ,SW3=ДА (не toggle),если это удобнее.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Сделаем так:
+
+“TIME ZONE” как отдельный пункт меню убрать (на экране выбора меню/страниц он больше не показывается и не открывается).
+Настройки tzTargetHours и tzNtpHours перенести в подменю “GSM” внутри “ИСТОЧНИКИ СИНХРОНИЗАЦИИ”.
+Ниже — точные правки в menu.cpp. Я даю готовый код для обновлённого Page1 (с добавленными пунктами 
+TZ в GSM) + что поменять в menu[] и drawPageSelect().
+
+1) Удалить пункт “TIME ZONE” из выбора меню
+1.1. Таблица меню menu[5][5]
+Замените на (вторая строка больше не “TIME ZONE”):
+
+cpp Копировать
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","GSM","СВОБОДНО","СВОБОДНО"},// Str1
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},// Str2 (было TIME ZONE)
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+1.2. drawPageSelect() (верхние названия)
+В topMenuNames замените "TIME ZONE" на "СВОБОДНО":
+
+cpp Копировать
+static const char* topMenuNames[5] = {
+ "ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+ "СВОБОДНО",
+ "СВОБОДНО",
+ "СВОБОДНО",
+ "СВОБОДНО"
+};
+Можно оставить Page2 как заглушку (PAGE 2),просто она станет недоступной/не нужной.
+
+2) Перенести настройки TZ в подменю GSM (Page1)
+Ниже — готовый Page1,в котором для GSM добавлены пункты:
+
+TZ target (cfg.tzTargetHours)
+TZ NTP (cfg.tzNtpHours)
+Изменения:
+
+При входе в GSM мы копируем TZ из cfg во временные переменные _tzTargetTmp/_tzNtpTmp.
+Меняем их SW2(–)/SW3(+).
+Запись в EEPROM только по SW4 (как и остальные параметры).
+При SAVE в GSM записываем:
+syncStore.save(syncData) (как раньше)
+ee.writeTzTargetHours(cfg.tzTargetHours) и ee.writeTzNtpHours(cfg.tzNtpHours)
+Замените ваш текущий class Page1 на этот
+cpp Копировать
+class Page1 :public PageBase {
+public:
+ using PageBase::PageBase;
+
+ void setup() override {}
+
+ void onActivate() override {
+ _mode = MODE_LIST;
+ _sel = 0;
+ _param = 0;
+
+ _tmp = syncData;
+
+ // TZ временные (актуализируются при входе в GSM)
+ _tzTargetTmp = cfg.tzTargetHours;
+ _tzNtpTmp = cfg.tzNtpHours;
+
+ _staticDrawn = false;
+ _lastSel = 255;
+ _lastParam = 255;
+ _lastHash = 0;
+
+ draw();
+ }
+
+ void update() override {
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ }
+
+ void draw() override {
+ if (!_staticDrawn) {
+ drawStatic();
+ _staticDrawn = true;
+ _lastSel = 255;
+ _lastParam = 255;
+ _lastHash = 0;
+ }
+ drawDynamic(true);
+ }
+
+ void onButtonPressed(int buttonID) override {
+
+ // ---- LIST ----
+ if (_mode == MODE_LIST) {
+ if (buttonID == BTN_SW2) { // UP
+ _sel = (_sel + 4) % 5;
+ drawDynamic(false);
+ return;
+ }
+ if (buttonID == BTN_SW3) { // DOWN
+ _sel = (_sel + 1) % 5;
+ drawDynamic(false);
+ return;
+ }
+ if (buttonID == BTN_SW1) { // ENTER
+ if (_sel == 0) _mode = MODE_GPS;
+ else if (_sel == 1) _mode = MODE_NET;
+ else if (_sel == 2) _mode = MODE_GSM;
+ else return;
+
+ _param = 0;
+
+ // при входе в GSM подтянуть TZ в tmp
+ if (_mode == MODE_GSM) {
+ _tzTargetTmp = cfg.tzTargetHours;
+ _tzNtpTmp = cfg.tzNtpHours;
+ }
+
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ if (buttonID == BTN_SW4) { // HOME
+ _m->backToStart();
+ return;
+ }
+ return;
+ }
+
+ // ---- SUBMENU (GPS/NET/GSM) ----
+ if (buttonID == BTN_SW1) { // NEXT PARAM
+ _param = (_param + 1) % paramCount();
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW2) { // "-"
+ changeParam(-1);
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW3) { // "+"
+ changeParam(+1);
+ drawDynamic(false);
+ return;
+ }
+
+ if (buttonID == BTN_SW4) { // SAVE + BACK TO LIST
+ commitSave();
+ _mode = MODE_LIST;
+ _sel = 0;
+ _staticDrawn = false;
+ draw();
+ return;
+ }
+ }
+
+ void onButtonReleased(int) override {}
+
+private:
+ enum Mode :uint8_t { MODE_LIST=0,MODE_GPS=1,MODE_NET=2,MODE_GSM=3 };
+
+ // 320x170 layout
+ static const int X = 10;
+ static const int Y_TITLE = 0;
+ static const int Y0 = 22;
+ static const int DY = 22;
+ static const int LINE_W = 320;
+ static const int LINE_H = 20;
+
+ static const int Y_HINT1 = 132;
+ static const int Y_HINT2 = 148;
+
+ Mode _mode = MODE_LIST;
+ bool _staticDrawn = false;
+
+ uint8_t _sel = 0;
+ uint8_t _param = 0;
+
+ SyncSourcesStore::Data _tmp;
+
+ // TZ tmp for GSM submenu
+ int8_t _tzTargetTmp = 0;
+ int8_t _tzNtpTmp = 0;
+
+ // cache
+ uint8_t _lastSel = 255;
+ uint8_t _lastParam = 255;
+ uint32_t _lastHash = 0;
+
+ uint8_t paramCount() const {
+ if (_mode == MODE_GPS) return 2;
+ if (_mode == MODE_NET) return 3;
+ if (_mode == MODE_GSM) return 5; // + TZ target + TZ NTP
+ return 0;
+ }
+
+ void drawStatic() {
+ TFT_eSPI* d = tft(); if(!d) return;
+
+ d->fillScreen(TFT_BLACK);
+ d->setTextSize(2);
+ d->setTextColor(TFT_YELLOW,TFT_BLACK);
+
+ if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",X,Y_TITLE);
+ else if (_mode == MODE_GPS) d->drawString("GPS",X,Y_TITLE);
+ else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+ else if (_mode == MODE_GSM) d->drawString("GSM",X,Y_TITLE);
+
+ for (int i=0;i<6;i++) d->fillRect(0,Y0 + i*DY,LINE_W,LINE_H,TFT_BLACK);
+
+ d->setTextSize(1);
+ d->setTextColor(TFT_WHITE,TFT_BLACK);
+ d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+
+ if (_mode == MODE_LIST) {
+ d->drawString("SW2:UP SW3:DOWN SW1:ENTER",X,Y_HINT1);
+ d->drawString("SW4:HOME",X,Y_HINT2);
+ } else {
+ d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+ d->drawString("SW4:SAVE+BACK",X,Y_HINT2);
+ }
+
+ d->setTextSize(2);
+ }
+
+ void drawDynamic(bool force) {
+ TFT_eSPI* d = tft(); if(!d) return;
+
+ if (_mode == MODE_LIST) {
+ if (!force && _lastSel == _sel) return;
+ _lastSel = _sel;
+
+ for (int i=0;i<5;i++) {
+ d->fillRect(0,Y0 + i*DY,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor((i==_sel) ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+ d->drawString(_m->itemLabel(0,i),X,Y0 + i*DY);
+ }
+ return;
+ }
+
+ uint32_t h = calcHash();
+ if (!force && _lastParam == _param && _lastHash == h) {
+ if (_mode == MODE_GPS) drawGpsInfo(false);
+ return;
+ }
+ _lastParam = _param;
+ _lastHash = h;
+
+ uint8_t n = paramCount();
+ for (uint8_t i=0;i<n;i++) {
+ d->fillRect(0,Y0 + i*DY,LINE_W,LINE_H,TFT_BLACK);
+ d->setTextColor((i==_param) ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+ if (i==_param) d->drawString(">",0,Y0 + i*DY);
+
+ char line[80];
+ buildLine(i,line,sizeof(line));
+ d->drawString(line,X,Y0 + i*DY);
+ }
+
+ if (_mode == MODE_GPS) drawGpsInfo(true);
+ }
+
+ uint32_t calcHash() const {
+ uint32_t h = 2166136261u;
+ auto mix=[&](uint32_t v){ h ^= v; h *= 16777619u; };
+
+ if (_mode == MODE_GPS) {
+ mix(_tmp.gpsEnable); mix(_tmp.gpsPeriodIdx);
+ } else if (_mode == MODE_NET) {
+ mix(_tmp.netEnable); mix(_tmp.netProviderIdx); mix(_tmp.netPeriodIdx);
+ } else if (_mode == MODE_GSM) {
+ mix(_tmp.gsmEnable); mix(_tmp.gsmProviderIdx); mix(_tmp.gsmPeriodIdx);
+ mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+ }
+ mix(_param);
+ return h;
+ }
+
+ void buildLine(uint8_t i,char* out,size_t n) const {
+ if (_mode == MODE_GPS) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gpsEnable ? "ДА":"НЕТ");
+ else snprintf(out,n,"2) ПЕР:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+ return;
+ }
+
+ if (_mode == MODE_NET) {
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.netEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) NTP:%s",kNtpServers[_tmp.netProviderIdx % 5]);
+ else snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+ return;
+ }
+
+ // MODE_GSM (5 пунктов)
+ if (i==0) snprintf(out,n,"1) ВКЛ:%s",_tmp.gsmEnable ? "ДА":"НЕТ");
+ else if (i==1) snprintf(out,n,"2) ОП:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+ else if (i==2) snprintf(out,n,"3) ПЕР:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+ else if (i==3) snprintf(out,n,"4) TZ target:%d",(int)_tzTargetTmp);
+ else snprintf(out,n,"5) TZ NTP:%d",(int)_tzNtpTmp);
+ }
+
+ static void clampTz(int8_t& tz) {
+ if (tz < -12) tz = -12;
+ if (tz > 14) tz = 14;
+ }
+
+ void changeParam(int delta) {
+ if (_mode == MODE_GPS) {
+ if (_param == 0) _tmp.gpsEnable = _tmp.gpsEnable ? 0 :1;
+ else _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+
+ if (_mode == MODE_NET) {
+ if (_param == 0) _tmp.netEnable = _tmp.netEnable ? 0 :1;
+ else if (_param == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta>0?1:4)) % 5);
+ else _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta>0?1:5)) % 6);
+ return;
+ }
+
+ // MODE_GSM
+ if (_param == 0) _tmp.gsmEnable = _tmp.gsmEnable ? 0 :1;
+ else if (_param == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta>0?1:4)) % 5);
+ else if (_param == 2) _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta>0?1:5)) % 6);
+ else if (_param == 3) { _tzTargetTmp += (delta>0?1:-1); clampTz(_tzTargetTmp); }
+ else { _tzNtpTmp += (delta>0?1:-1); clampTz(_tzNtpTmp); }
+ }
+
+ void commitSave() {
+ // Сохраняем настройки источников
+ syncData = _tmp;
+ syncStore.save(syncData);
+
+ // INTERNET:NTP server -> cfg.server -> EEPROM cfg
+ if (_mode == MODE_NET) {
+ const char* s = kNtpServers[syncData.netProviderIdx % 5];
+ strncpy(cfg.server,s,sizeof(cfg.server)-1);
+ cfg.server[sizeof(cfg.server)-1] = 0;
+ ee.writeSERVER(cfg.server);
+ }
+
+ // GSM:сохраняем TZ в cfg + EEPROM cfg
+ if (_mode == MODE_GSM) {
+ cfg.tzTargetHours = _tzTargetTmp;
+ cfg.tzNtpHours = _tzNtpTmp;
+ ee.writeTzTargetHours(cfg.tzTargetHours);
+ ee.writeTzNtpHours(cfg.tzNtpHours);
+ }
+
+ planner.onSettingsChanged();
+ }
+
+ void drawGpsInfo(bool clearLine) {
+ TFT_eSPI* d = tft(); if(!d) return;
+ int y = Y0 + 3*DY;
+ if (clearLine) d->fillRect(0,y,LINE_W,LINE_H,TFT_BLACK);
+
+ d->setTextColor(TFT_GREEN,TFT_BLACK);
+ char buf[64];
+ snprintf(buf,sizeof(buf),"SAT:%u/%u FIX:%s",
+ (unsigned)gGpsSatsUsed,(unsigned)gGpsSatsView,gGpsFix ? "YES":"NO");
+ d->drawString(buf,X,y);
+ }
+};
+3) Удалить/отключить Page2
+После того как TIME ZONE убран из списка меню,Page2 можно оставить заглушкой (она не будет выбрана),или вообще не прикреплять.
+
+Самый простой:оставить Page2 как пустую (PAGE 2) — ничего не сломает.
+
+Если хотите,я могу собрать вам обновлённый Menu.cpp целиком (с уже удалённым Page2 из attachPages() 
+и обновлённым drawPageSelect()),но для этого уточните:вы хотите,чтобы SW2/SW3 в выборе страниц (MENU_PAGE_SELECT)
+ оставались как сейчас (SW2 вниз/SW3 вверх),
+или как обычно (SW2 вниз/SW3 вверх — это у вас уже так).
