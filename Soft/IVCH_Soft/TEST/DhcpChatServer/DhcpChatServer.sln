@@ -1,0 +1,35 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.36107.64
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DhcpChatServer", "DhcpChatServer.vcxproj", "{030FDD53-F22C-4F85-9169-9FE84EC538A9}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|ARM = Debug|ARM
+		Debug|ARM64 = Debug|ARM64
+		Release|ARM = Release|ARM
+		Release|ARM64 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Debug|ARM.ActiveCfg = Debug|ARM
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Debug|ARM.Build.0 = Debug|ARM
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Debug|ARM.Deploy.0 = Debug|ARM
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Debug|ARM64.Build.0 = Debug|ARM64
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Debug|ARM64.Deploy.0 = Debug|ARM64
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Release|ARM.ActiveCfg = Release|ARM
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Release|ARM.Build.0 = Release|ARM
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Release|ARM.Deploy.0 = Release|ARM
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Release|ARM64.ActiveCfg = Release|ARM64
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Release|ARM64.Build.0 = Release|ARM64
+		{030FDD53-F22C-4F85-9169-9FE84EC538A9}.Release|ARM64.Deploy.0 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {69947E65-CA06-40FF-A709-BB652A337496}
+	EndGlobalSection
+EndGlobal

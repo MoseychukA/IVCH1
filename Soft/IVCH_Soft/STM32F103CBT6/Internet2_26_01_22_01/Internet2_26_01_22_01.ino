@@ -25,9 +25,28 @@ HardwareSerial U3(PB11, PB10);// = Serial3; // PB11 RX,PB10 TX
 
 TimeSerialServices serialSvc(U2, U3, net2);
 
+#define W5500_RST_PIN PB1
+
+static void w5500HardReset()
+{
+	pinMode(W5500_RST_PIN, OUTPUT);
+	digitalWrite(W5500_RST_PIN, HIGH);
+	delay(10);
+
+	digitalWrite(W5500_RST_PIN, LOW);
+	delay(50); // импульс reset
+
+	digitalWrite(W5500_RST_PIN, HIGH);
+	delay(200); // дать чипу стартануть
+}
+
+
 void setup() {
 	Serial.begin(115200);
-	delay(1500);
+	delay(1000);
+
+	w5500HardReset();
+
 	Serial.println("Internet2 slave start");
 
 	Wire.begin(I2C_ADDR);

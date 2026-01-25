@@ -1,0 +1,4388 @@
+Ниже внесены изменения по вашим пунктам:
+
+В меню вместо TZ target теперь Часовой пояс (и выводится в виде UTC+3/UTC-2,а не просто число).
+Добавлен отдельный файл EepromMap.h — единая карта адресов EEPROM для прошивки и внешних программ.
+В модулях,где адреса были “зашиты” (AT24C128Settings,LanIfStore,SyncSourcesStore) адреса должны браться 
+только из EepromMap.h (ниже даю готовый файл + точные правки).
+1) Новый файл EepromMap.h (добавить в проект)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// Единая карта EEPROM (AT24C128,I2C 0x50)
+// Используется прошивкой и внешними программами.
+namespace EepromMap {
+
+static constexpr uint8_t I2C_ADDR = 0x50;
+static constexpr uint16_t EEPROM_SIZE_BYTES = 16u * 1024u; // 0x0000..0x3FFF
+
+// -------------------- AT24C128Settings --------------------
+namespace Settings {
+static constexpr uint16_t ADDR_MAGIC = 0x0000; // u32 'S8CF' LE
+static constexpr uint16_t ADDR_VER = 0x0004; // u8
+static constexpr uint16_t ADDR_ENFALL = 0x0005; // u8 0/1
+static constexpr uint16_t ADDR_TZ_TARGET = 0x0006; // i8 (часовой пояс для RTC/экрана)
+static constexpr uint16_t ADDR_TZ_NTP = 0x0007; // i8 (TZ для AT+CNTP,обычно 0)
+static constexpr uint16_t ADDR_PERIOD = 0x0008; // u32 LE
+
+static constexpr uint16_t ADDR_APN = 0x0100; // 32
+static constexpr uint16_t ADDR_USER = 0x0120; // 32
+static constexpr uint16_t ADDR_PASS = 0x0140; // 32
+static constexpr uint16_t ADDR_SERVER = 0x0160; // 48
+
+static constexpr uint16_t END = ADDR_SERVER + 48; // 0x0190
+} // namespace Settings
+
+// -------------------- LanIfStore --------------------
+namespace LanIf {
+static constexpr uint16_t BLOCK_SIZE = 0x0040; // 64 bytes
+static constexpr uint16_t BASE_IF1 = 0x0200; // 0x0200..0x023F
+static constexpr uint16_t BASE_IF2 = 0x0240; // 0x0240..0x027F
+static constexpr uint16_t END = BASE_IF2 + BLOCK_SIZE; // 0x0280
+} // namespace LanIf
+
+// -------------------- SyncSourcesStore --------------------
+namespace SyncSources {
+static constexpr uint16_t BLOCK_SIZE = 0x0040; // 64 bytes
+static constexpr uint16_t BASE = 0x0280; // 0x0280..0x02BF
+static constexpr uint16_t END = BASE + BLOCK_SIZE; // 0x02C0
+} // namespace SyncSources
+
+// -------------------- Sanity checks --------------------
+static_assert(Settings::END <= LanIf::BASE_IF1,"EEPROM map overlap:Settings overlaps LanIf IF1");
+static_assert(LanIf::END <= SyncSources::BASE,"EEPROM map overlap:LanIf overlaps SyncSources");
+static_assert(SyncSources::END <= EEPROM_SIZE_BYTES,"EEPROM map exceeds AT24C128 size");
+
+} // namespace EepromMap
+2) Menu.cpp — внесены изменения и выдан полностью
+Изменения только в Page1:
+
+TZ target → Часовой пояс
+отображение:Часовой пояс:UTC+3
+“выберите один”:при включении источника выключаются остальные; выключить последний активный не даём.
+Скопируйте ваш Menu.cpp и замените на этот (полностью):
+
+cpp Копировать
+// Требования:
+// - HOME показывает IP1 и IP2 (gIp1Str/gIp2Str)
+// - "ВЫБОР МЕНЮ" показывает только пункты (без IP)
+// - Page1 "ИСТОЧНИКИ СИНХРОНИЗАЦИИ":GPS / INTERNET / INTERNET2 / GSM + Часовой пояс/TZ NTP
+// - Page2 INTERNET1:настройка + STATUS:OK/NO IP=...
+// - Page3 INTERNET2:настройка + STATUS:OK/NO IP=... + SAVE вызывает applyInternet2FromStore()
+
+#include "Menu.h"
+#include <TFT_eSPI.h>
+#include <string.h>
+
+#include "TimeFeed.h" // gDateStr,gTimeStr,gTimeUpdated
+#include "NetFeed.h" // gNetRegistered,gRssiDbm,gSignalBars,gCsqRssi,gIp1Str,gIp2Str,...
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+#include "LanIfStore.h"
+
+#include "NtpLanService_Generic.h" // INTERNET1 status
+#include "Internet2Client.h" // INTERNET2 status
+
+// --- externs from .ino ---
+extern AT24C128Settings ee;
+extern AT24C128Settings::Config cfg;
+
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+
+extern TimeSyncPlanner planner;
+
+extern LanIfStore lanStore; // INTERNET store in EEPROM
+extern void applyInternet1FromStore(); // применить INTERNET1 (в .ino)
+extern void applyInternet2FromStore(); // применить INTERNET2 (I2C) (в .ino)
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GPS globals
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+extern uint16_t gGpsHdop_x100;
+extern uint8_t gGpsSnrAvg;
+extern uint8_t gGpsSnrMax;
+extern uint32_t gGpsLastRmcMs;
+extern uint32_t gGpsLastGgaMs;
+extern uint32_t gGpsLastGsvMs;
+
+// Fonts
+#include "zTimesNRItalic18.h"
+#include "zTimesNRItalic24.h"
+#include "zTimesNRItalic28.h"
+#include "zTimesNRItalic36.h"
+#include "zCalibri36.h"
+#include "zTimesNR28.h"
+#include "zTimesNR14.h"
+#include "zTimesNR18.h"
+#include "zTimesNR24.h"
+
+#define AA_FONT_CALI zCalibri36
+#define AA_FONT_TIME18I zTimesNRItalic18
+#define AA_FONT_TIME24I zTimesNRItalic24
+#define AA_FONT_TIME28I zTimesNRItalic28
+#define AA_FONT_TIME36I zTimesNRItalic36
+#define AA_FONT_TIME28 zTimesNR28
+#define AA_FONT_TIME18 zTimesNR18
+#define AA_FONT_TIME24 zTimesNR24
+
+// ---------------- HOME layout for 320x170 ----------------
+static const int Y_HOME = 10;
+
+static const int Y_IP1 = 32;
+static const int Y_IP2 = 52;
+
+static const int Y_DATE = 72;
+static const int Y_NET = 94;
+static const int Y_SIG = 116;
+
+static const int Y_VER = 140;
+
+// --- NTP upstream list (только IP,индекс 0..4) ---
+static const char* kNtpIpStr[5] = {
+ "162.159.200.123",
+ "162.159.200.1",
+ "129.6.15.28",
+ "132.163.96.1",
+ "216.239.35.0"
+};
+
+// --- Period names (idx 0..5) ---
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// --- GSM provider names ---
+static const char* kGsmProviders[5] = { "МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2" };
+
+// Таблица строк для Page1->MODE_LIST (page=0,row=item)
+const char* menu[5][5] = {
+ {"GPS","ИНТЕРНЕТ","ИНТЕРНЕТ2","GSM",""},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"},
+ {"СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО","СВОБОДНО"}
+};
+
+// -------------------- Base for pages --------------------
+class PageBase :public IMenuPage {
+public:
+	explicit PageBase(Menu* m) :_m(m) {}
+protected:
+	Menu* _m = nullptr;
+	TFT_eSPI* tft() const { return _m ? _m->display() :nullptr; }
+};
+
+static void ipToOctets(const IPAddress& ip,uint8_t out[4])
+{
+	out[0] = ip[0];
+	out[1] = ip[1];
+	out[2] = ip[2];
+	out[3] = ip[3];
+}
+
+// -------------------- Helpers for GPS info --------------------
+static void formatGpsLine1(char* out,size_t n)
+{
+	snprintf(out,n,"Sat:%u/%u Fix:%s HDOP:%.2f",
+		(unsigned)gGpsSatsUsed,
+		(unsigned)gGpsSatsView,
+		gGpsFix ? "Y" :"N",
+		(double)gGpsHdop_x100 / 100.0);
+}
+
+static void formatGpsLine2(char* out,size_t n)
+{
+	uint32_t now = millis();
+	uint32_t ageR = (gGpsLastRmcMs == 0) ? 99999UL :(now - gGpsLastRmcMs);
+	uint32_t ageG = (gGpsLastGgaMs == 0) ? 99999UL :(now - gGpsLastGgaMs);
+	uint32_t ageV = (gGpsLastGsvMs == 0) ? 99999UL :(now - gGpsLastGsvMs);
+
+	auto toTenth = [](uint32_t ms)->uint32_t { return (ms + 50) / 100; };
+	uint32_t r = toTenth(ageR);
+	uint32_t g = toTenth(ageG);
+	uint32_t v = toTenth(ageV);
+
+	snprintf(out,n,"Sig:%u/%u R:%u.%us G:%u.%us V:%u.%us",
+		(unsigned)gGpsSnrAvg,
+		(unsigned)gGpsSnrMax,
+		(unsigned)(r / 10),(unsigned)(r % 10),
+		(unsigned)(g / 10),(unsigned)(g % 10),
+		(unsigned)(v / 10),(unsigned)(v % 10));
+}
+
+// -------------------- Page1:ИСТОЧНИКИ СИНХРОНИЗАЦИИ --------------------
+class Page1 :public PageBase {
+public:
+	using PageBase::PageBase;
+
+	void setup() override {}
+
+	void onActivate() override {
+		_mode = MODE_LIST;
+		_sel = 0;
+		_param = 0;
+
+		_tmp = syncData;
+
+		_tzTargetTmp = cfg.tzTargetHours;
+		_tzNtpTmp = cfg.tzNtpHours;
+
+		_staticDrawn = false;
+		_lastSel = 255;
+		_lastParam = 255;
+		_lastHash = 0;
+
+		_lastGpsLine1[0] = 0;
+		_lastGpsLine2[0] = 0;
+		_lastGpsInfoMs = 0;
+
+		draw();
+	}
+
+	void update() override {
+		if (_mode == MODE_GPS) {
+			uint32_t now = millis();
+			if (now - _lastGpsInfoMs >= 500) {
+				_lastGpsInfoMs = now;
+				drawGpsInfo(false);
+			}
+		}
+	}
+
+	void draw() override {
+		if (!_staticDrawn) {
+			drawStatic();
+			_staticDrawn = true;
+			_lastSel = 255;
+			_lastParam = 255;
+			_lastHash = 0;
+		}
+		drawDynamic(true);
+	}
+
+	void onButtonPressed(int buttonID) override {
+
+		// ---- LIST ----
+		if (_mode == MODE_LIST) {
+			if (buttonID == BTN_SW2) { // UP
+				_sel = (_sel + 4) % 5;
+				drawDynamic(false);
+				return;
+			}
+			if (buttonID == BTN_SW3) { // DOWN
+				_sel = (_sel + 1) % 5;
+				drawDynamic(false);
+				return;
+			}
+			if (buttonID == BTN_SW1) { // ENTER
+				if (_sel == 0) _mode = MODE_GPS;
+				else if (_sel == 1) _mode = MODE_NET;
+				else if (_sel == 2) _mode = MODE_NET2;
+				else if (_sel == 3) _mode = MODE_GSM;
+				else return;
+
+				_param = 0;
+				_tzTargetTmp = cfg.tzTargetHours;
+				_tzNtpTmp = cfg.tzNtpHours;
+
+				_staticDrawn = false;
+				draw();
+				return;
+			}
+			if (buttonID == BTN_SW4) { // HOME
+				_m->backToStart();
+				return;
+			}
+			return;
+		}
+
+		// ---- SUBMENU ----
+		if (buttonID == BTN_SW1)
+		{ // NEXT PARAM
+			_param = (_param + 1) % paramCount();
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW2) { // "-"
+			changeParam(-1);
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW3) { // "+"
+			changeParam(+1);
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW4) { // SAVE + BACK
+			commitSave();
+			_mode = MODE_LIST;
+			_sel = 0;
+			_staticDrawn = false;
+			draw();
+			return;
+		}
+	}
+
+	void onButtonReleased(int) override {}
+
+private:
+	enum Mode :uint8_t { MODE_LIST = 0,MODE_GPS = 1,MODE_NET = 2,MODE_NET2 = 3,MODE_GSM = 4 };
+
+	static const int X = 10;
+	static const int Y_TITLE = 0;
+	static const int Y0 = 22;
+	static const int DY = 22;
+	static const int LINE_W = 320;
+	static const int LINE_H = 20;
+
+	static const int Y_HINT1 = 132;
+	static const int Y_HINT2 = 148;
+
+	Mode _mode = MODE_LIST;
+	bool _staticDrawn = false;
+
+	uint8_t _sel = 0;
+	uint8_t _param = 0;
+
+	SyncSourcesStore::Data _tmp;
+
+	int8_t _tzTargetTmp = 0;
+	int8_t _tzNtpTmp = 0;
+
+	uint8_t _lastSel = 255;
+	uint8_t _lastParam = 255;
+	uint32_t _lastHash = 0;
+
+	uint32_t _lastGpsInfoMs = 0;
+	char _lastGpsLine1[64] = { 0 };
+	char _lastGpsLine2[96] = { 0 };
+
+	static void clampTz(int8_t& tz) {
+		if (tz < -12) tz = -12;
+		if (tz > 14) tz = 14;
+	}
+
+	static void formatTz(char* out,size_t n,int8_t tzHours) {
+		// Печатать как UTC+3 / UTC-2 / UTC
+		if (tzHours == 0) snprintf(out,n,"UTC");
+		else snprintf(out,n,"UTC%+d",(int)tzHours);
+	}
+
+	bool anyEnabledExceptCurrent(Mode m) const {
+		const bool gps = (_tmp.gpsEnable != 0);
+		const bool net = (_tmp.netEnable != 0);
+		const bool net2 = (_tmp.net2Enable != 0);
+		const bool gsm = (_tmp.gsmEnable != 0);
+
+		if (m == MODE_GPS) return (net || net2 || gsm);
+		if (m == MODE_NET) return (gps || net2 || gsm);
+		if (m == MODE_NET2) return (gps || net || gsm);
+		if (m == MODE_GSM) return (gps || net || net2);
+		return false;
+	}
+
+	void setExclusive(Mode m) {
+		_tmp.gpsEnable = 0;
+		_tmp.netEnable = 0;
+		_tmp.net2Enable = 0;
+		_tmp.gsmEnable = 0;
+
+		if (m == MODE_GPS) _tmp.gpsEnable = 1;
+		else if (m == MODE_NET) _tmp.netEnable = 1;
+		else if (m == MODE_NET2) _tmp.net2Enable = 1;
+		else if (m == MODE_GSM) _tmp.gsmEnable = 1;
+	}
+
+	uint8_t paramCount() const {
+		if (_mode == MODE_GPS) return 4; // enable,period,Часовой пояс,TZ NTP
+		if (_mode == MODE_NET) return 5; // enable,ntpIdx,period,Часовой пояс,TZ NTP
+		if (_mode == MODE_NET2) return 4; // enable,period,Часовой пояс,TZ NTP
+		if (_mode == MODE_GSM) return 5; // enable,operator,period,Часовой пояс,TZ NTP
+		return 0;
+	}
+
+	void drawStatic() {
+		TFT_eSPI* d = tft(); if (!d) return;
+
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+
+		if (_mode == MODE_LIST) d->drawString("ИСТОЧНИКИ СИНХРОНИЗАЦИИ",X,Y_TITLE);
+		else if (_mode == MODE_GPS) d->drawString("GPS",X,Y_TITLE);
+		else if (_mode == MODE_NET) d->drawString("ИНТЕРНЕТ",X,Y_TITLE);
+		else if (_mode == MODE_NET2) d->drawString("ИНТЕРНЕТ2 (I2C)",X,Y_TITLE);
+		else if (_mode == MODE_GSM) d->drawString("GSM (SIM800)",X,Y_TITLE);
+
+		for (int i = 0; i < 6; i++) d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+
+		d->setTextSize(1);
+		d->setTextColor(TFT_WHITE,TFT_BLACK);
+		d->fillRect(0,Y_HINT1,320,38,TFT_BLACK);
+
+		if (_mode == MODE_LIST) {
+			d->drawString("SW2:UP SW3:DOWN SW1:ENTER",X,Y_HINT1);
+			d->drawString("SW4:HOME",X,Y_HINT2);
+		}
+		else {
+			d->drawString("SW1:NEXT SW2:- SW3:+",X,Y_HINT1);
+			d->drawString("SW4:SAVE+BACK",X,Y_HINT2);
+		}
+
+		d->setTextSize(2);
+	}
+
+	void drawDynamic(bool force) {
+		TFT_eSPI* d = tft(); if (!d) return;
+
+		if (_mode == MODE_LIST) {
+			if (!force && _lastSel == _sel) return;
+			_lastSel = _sel;
+
+			for (int i = 0; i < 5; i++) {
+				d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+				d->setTextColor((i == _sel) ? TFT_GREEN :TFT_WHITE,TFT_BLACK);
+				d->drawString(_m->itemLabel(0,i),X,Y0 + i * DY);
+			}
+			return;
+		}
+
+		uint32_t h = calcHash();
+		if (!force && _lastParam == _param && _lastHash == h) {
+			if (_mode == MODE_GPS) drawGpsInfo(false);
+			return;
+		}
+		_lastParam = _param;
+		_lastHash = h;
+
+		uint8_t n = paramCount();
+		for (uint8_t i = 0; i < n; i++) {
+			d->fillRect(0,Y0 + i * DY,LINE_W,LINE_H,TFT_BLACK);
+			d->setTextColor((i == _param) ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+			if (i == _param) d->drawString(">",0,Y0 + i * DY);
+
+			char line[96];
+			buildLine(i,line,sizeof(line));
+			d->drawString(line,X,Y0 + i * DY);
+		}
+
+		if (_mode == MODE_GPS) drawGpsInfo(true);
+	}
+
+	uint32_t calcHash() const {
+		uint32_t h = 2166136261u;
+		auto mix = [&](uint32_t v) { h ^= v; h *= 16777619u; };
+
+		if (_mode == MODE_GPS) {
+			mix(_tmp.gpsEnable); mix(_tmp.gpsPeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		else if (_mode == MODE_NET) {
+			mix(_tmp.netEnable); mix(_tmp.netProviderIdx); mix(_tmp.netPeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		else if (_mode == MODE_NET2) {
+			mix(_tmp.net2Enable); mix(_tmp.net2PeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		else if (_mode == MODE_GSM) {
+			mix(_tmp.gsmEnable); mix(_tmp.gsmProviderIdx); mix(_tmp.gsmPeriodIdx);
+			mix((uint8_t)_tzTargetTmp); mix((uint8_t)_tzNtpTmp);
+		}
+		mix(_param);
+		return h;
+	}
+
+	void buildLine(uint8_t i,char* out,size_t n) const {
+		char tzBuf[16];
+		formatTz(tzBuf,sizeof(tzBuf),_tzTargetTmp);
+
+		if (_mode == MODE_GPS) {
+			if (i == 0) snprintf(out,n,"1) GPS:%s",_tmp.gpsEnable ? "ON" :"OFF");
+			else if (i == 1) snprintf(out,n,"2) PER:%s",kPeriodsName[_tmp.gpsPeriodIdx % 6]);
+			else if (i == 2) snprintf(out,n,"3) Часовой пояс:%s",tzBuf);
+			else snprintf(out,n,"4) TZ NTP:%d",(int)_tzNtpTmp);
+			return;
+		}
+
+		if (_mode == MODE_NET) {
+			if (i == 0) snprintf(out,n,"1) NTP:%s",_tmp.netEnable ? "ON" :"OFF");
+			else if (i == 1) snprintf(out,n,"2) NTP IP:%s",kNtpIpStr[_tmp.netProviderIdx % 5]);
+			else if (i == 2) snprintf(out,n,"3) PER:%s",kPeriodsName[_tmp.netPeriodIdx % 6]);
+			else if (i == 3) snprintf(out,n,"4) Часовой пояс:%s",tzBuf);
+			else snprintf(out,n,"5) TZ NTP:%d",(int)_tzNtpTmp);
+			return;
+		}
+
+		if (_mode == MODE_NET2) {
+			if (i == 0) snprintf(out,n,"1) NET2:%s",_tmp.net2Enable ? "ON" :"OFF");
+			else if (i == 1) snprintf(out,n,"2) PER:%s",kPeriodsName[_tmp.net2PeriodIdx % 6]);
+			else if (i == 2) snprintf(out,n,"3) Часовой пояс:%s",tzBuf);
+			else snprintf(out,n,"4) TZ NTP:%d",(int)_tzNtpTmp);
+			return;
+		}
+
+		// MODE_GSM
+		if (i == 0) snprintf(out,n,"1) GSM:%s",_tmp.gsmEnable ? "ON" :"OFF");
+		else if (i == 1) snprintf(out,n,"2) OP:%s",kGsmProviders[_tmp.gsmProviderIdx % 5]);
+		else if (i == 2) snprintf(out,n,"3) PER:%s",kPeriodsName[_tmp.gsmPeriodIdx % 6]);
+		else if (i == 3) snprintf(out,n,"4) Часовой пояс:%s",tzBuf);
+		else snprintf(out,n,"5) TZ NTP:%d",(int)_tzNtpTmp);
+	}
+
+	void changeParam(int delta) {
+		// ВАЖНО:"выберите один" — при включении делаем источник эксклюзивным.
+		// Выключить последний активный источник не даём.
+
+		if (_mode == MODE_GPS) {
+			if (_param == 0) {
+				if (_tmp.gpsEnable) {
+					// пытаются выключить GPS
+					if (!anyEnabledExceptCurrent(MODE_GPS)) { /* последний -> не выключаем */ }
+					else _tmp.gpsEnable = 0;
+				} else {
+					setExclusive(MODE_GPS);
+				}
+			}
+			else if (_param == 1) _tmp.gpsPeriodIdx = (uint8_t)((_tmp.gpsPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+			else if (_param == 2) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+			else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+			return;
+		}
+
+		if (_mode == MODE_NET) {
+			if (_param == 0) {
+				if (_tmp.netEnable) {
+					if (!anyEnabledExceptCurrent(MODE_NET)) { }
+					else _tmp.netEnable = 0;
+				} else {
+					setExclusive(MODE_NET);
+				}
+			}
+			else if (_param == 1) _tmp.netProviderIdx = (uint8_t)((_tmp.netProviderIdx + (delta > 0 ? 1 :4)) % 5);
+			else if (_param == 2) _tmp.netPeriodIdx = (uint8_t)((_tmp.netPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+			else if (_param == 3) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+			else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+			return;
+		}
+
+		if (_mode == MODE_NET2) {
+			if (_param == 0) {
+				if (_tmp.net2Enable) {
+					if (!anyEnabledExceptCurrent(MODE_NET2)) { }
+					else _tmp.net2Enable = 0;
+				} else {
+					setExclusive(MODE_NET2);
+				}
+			}
+			else if (_param == 1) _tmp.net2PeriodIdx = (uint8_t)((_tmp.net2PeriodIdx + (delta > 0 ? 1 :5)) % 6);
+			else if (_param == 2) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+			else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+			return;
+		}
+
+		// GSM
+		if (_param == 0) {
+			if (_tmp.gsmEnable) {
+				if (!anyEnabledExceptCurrent(MODE_GSM)) { }
+				else _tmp.gsmEnable = 0;
+			} else {
+				setExclusive(MODE_GSM);
+			}
+		}
+		else if (_param == 1) _tmp.gsmProviderIdx = (uint8_t)((_tmp.gsmProviderIdx + (delta > 0 ? 1 :4)) % 5);
+		else if (_param == 2) _tmp.gsmPeriodIdx = (uint8_t)((_tmp.gsmPeriodIdx + (delta > 0 ? 1 :5)) % 6);
+		else if (_param == 3) { _tzTargetTmp += (delta > 0 ? 1 :-1); clampTz(_tzTargetTmp); }
+		else { _tzNtpTmp += (delta > 0 ? 1 :-1); clampTz(_tzNtpTmp); }
+	}
+
+	void commitSave() {
+		// 1) sync sources
+		syncData = _tmp;
+		bool okSync = syncStore.save(syncData);
+		if (!okSync) {
+			// если не пишется физически — хотя бы увидим в Serial
+			Serial.println(F("SyncSourcesStore.save FAILED"));
+		}
+
+		// 2) timezones
+		cfg.tzTargetHours = _tzTargetTmp;
+		cfg.tzNtpHours = _tzNtpTmp;
+		(void)ee.writeTzTargetHours(cfg.tzTargetHours);
+		(void)ee.writeTzNtpHours(cfg.tzNtpHours);
+
+		planner.onSettingsChanged();
+	}
+
+	void drawGpsInfo(bool clearLine) {
+		TFT_eSPI* d = tft(); if (!d) return;
+
+		int y1 = Y0 + 3 * DY;
+		int y2 = Y0 + 4 * DY;
+
+		char line1[64];
+		char line2[96];
+		formatGpsLine1(line1,sizeof(line1));
+		formatGpsLine2(line2,sizeof(line2));
+
+		bool changed1 = (strcmp(_lastGpsLine1,line1) != 0);
+		bool changed2 = (strcmp(_lastGpsLine2,line2) != 0);
+
+		if (clearLine || changed1) {
+			d->fillRect(0,y1,LINE_W,LINE_H,TFT_BLACK);
+			d->setTextColor(TFT_GREEN,TFT_BLACK);
+			d->drawString(line1,X,y1);
+			strncpy(_lastGpsLine1,line1,sizeof(_lastGpsLine1) - 1);
+			_lastGpsLine1[sizeof(_lastGpsLine1) - 1] = 0;
+		}
+
+		if (clearLine || changed2) {
+			d->fillRect(0,y2,LINE_W,LINE_H,TFT_BLACK);
+			d->setTextColor(TFT_CYAN,TFT_BLACK);
+			d->drawString(line2,X,y2);
+			strncpy(_lastGpsLine2,line2,sizeof(_lastGpsLine2) - 1);
+			_lastGpsLine2[sizeof(_lastGpsLine2) - 1] = 0;
+		}
+	}
+};
+
+// -------------------- Internet pages base --------------------
+class InternetPageBase :public PageBase {
+public:
+	using PageBase::PageBase;
+
+protected:
+	static const int X = 10,Y_TITLE = 0,Y0 = 22,DY = 20,W = 320,H = 18;
+	static const int Y_HINT1 = 132,Y_HINT2 = 148;
+
+	enum Param :uint8_t {
+		P_DHCP = 0,
+		P_NTP = 1,
+		P_PERIOD = 2,
+		PARAM_COUNT = 3
+	};
+
+	void drawIpLineRO(TFT_eSPI* d,const char* name,uint8_t v[4],int row) {
+		d->setTextColor(TFT_WHITE,TFT_BLACK);
+		d->drawString(" ",0,Y0 + row * DY);
+
+		char s[40];
+		snprintf(s,sizeof(s),"%s %u.%u.%u.%u",name,v[0],v[1],v[2],v[3]);
+		d->drawString(s,X,Y0 + row * DY);
+	}
+
+	void drawIpLine(TFT_eSPI* d,const char* name,uint8_t v[4],uint8_t p,int row,uint8_t curParam) {
+		d->setTextColor(curParam == p ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(curParam == p ? ">" :" ",0,Y0 + row * DY);
+
+		char s[40];
+		snprintf(s,sizeof(s),"%s %u.%u.%u.%u",name,v[0],v[1],v[2],v[3]);
+		d->drawString(s,X,Y0 + row * DY);
+	}
+};
+
+// -------------------- Page2:ИНТЕРНЕТ1 --------------------
+class Page2 :public InternetPageBase {
+public:
+	using InternetPageBase::InternetPageBase;
+
+	void setup() override {}
+
+	void onActivate() override {
+		_staticDrawn = false;
+		_param = 0;
+		lanStore.load(LanIfStore::IF1,_cfg,false);
+
+		_statLine[0] = 0;
+		_lastStatMs = 0;
+
+		draw();
+	}
+
+	void update() override
+	{
+		uint32_t now = millis();
+		if (now - _lastStatMs < 1000) return;
+		_lastStatMs = now;
+
+		IPAddress ip = ntpLan.localIP();
+		bool ok = !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+
+		char line[64];
+		snprintf(line,sizeof(line),"STATUS :%s",ok ? "OK" :"NO");
+
+		if (strcmp(_statLine,line) != 0)
+		{
+			strncpy(_statLine,line,sizeof(_statLine) - 1);
+			_statLine[sizeof(_statLine) - 1] = 0;
+			drawStatusLine();
+		}
+	}
+
+	void draw() override
+	{
+		if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+		drawDynamic(true);
+	}
+
+	void onButtonPressed(int buttonID) override
+	{
+		if (buttonID == BTN_SW4) { // SAVE+HOME
+			lanStore.save(LanIfStore::IF1,_cfg,true);
+			applyInternet1FromStore();
+			_m->backToStart();
+			return;
+		}
+
+		if (buttonID == BTN_SW1) { // NEXT (только DHCP/NTP/PER)
+			_param = (_param + 1) % PARAM_COUNT;
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW2 || buttonID == BTN_SW3)
+		{
+			int delta = (buttonID == BTN_SW3) ? +1 :-1;
+			applyDelta(delta);
+			drawDynamic(false);
+			return;
+		}
+	}
+
+	void onButtonReleased(int) override {}
+
+private:
+	LanIfStore::IfConfig _cfg{};
+	bool _staticDrawn = false;
+	uint8_t _param = 0;
+
+	uint32_t _lastStatMs = 0;
+	char _statLine[48] = { 0 };
+
+	void drawStatusLine()
+	{
+		auto d = tft(); if (!d) return;
+
+		d->setTextSize(1);
+		d->fillRect(140,0,170,16,TFT_BLACK);
+
+		bool ok = (strstr(_statLine,"STATUS :OK") != nullptr);
+		d->setTextColor(ok ? TFT_GREEN :TFT_RED,TFT_BLACK);
+		d->drawString(_statLine,140,Y_TITLE);
+
+		d->setTextSize(2);
+	}
+
+	void drawStatic()
+	{
+		auto d = tft(); if (!d) return;
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		d->drawString("INTERNET 1",X,Y_TITLE);
+
+		drawStatusLine();
+		d->setTextSize(2);
+	}
+
+	void drawDynamic(bool)
+	{
+		auto d = tft(); if (!d) return;
+
+		for (int i = 0; i < 7; i++) d->fillRect(0,Y0 + i * DY,W,H,TFT_BLACK);
+
+		d->setTextColor(_param == P_DHCP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_DHCP ? ">" :" ",0,Y0 + 0 * DY);
+		d->drawString(_cfg.dhcp ? "DHCP :ON" :"DHCP :OFF",X,Y0 + 0 * DY);
+
+		char b[64];
+		d->setTextColor(_param == P_NTP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_NTP ? ">" :" ",0,Y0 + 1 * DY);
+		snprintf(b,sizeof(b),"NTP :%s",kNtpIpStr[_cfg.ntpIdx % 5]);
+		d->drawString(b,X,Y0 + 1 * DY);
+
+		d->setTextColor(_param == P_PERIOD ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_PERIOD ? ">" :" ",0,Y0 + 2 * DY);
+		snprintf(b,sizeof(b),"ПЕРИОД :%s",kPeriodsName[_cfg.periodIdx % 6]);
+		d->drawString(b,X,Y0 + 2 * DY);
+
+		uint8_t ipNow[4];
+		ipToOctets(ntpLan.localIP(),ipNow);
+		drawIpLineRO(d,"IP :",ipNow,3);
+		drawIpLineRO(d,"MASK :",_cfg.mask,4);
+		drawIpLineRO(d,"CW :",_cfg.gw,5);
+		drawIpLineRO(d,"DNS :",_cfg.dns,6);
+	}
+
+	void applyDelta(int delta) {
+		if (_param == P_DHCP) { _cfg.dhcp = _cfg.dhcp ? 0 :1; return; }
+		if (_param == P_NTP) { _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta > 0 ? 1 :4)) % 5); return; }
+		if (_param == P_PERIOD) { _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta > 0 ? 1 :5)) % 6); return; }
+	}
+};
+
+// -------------------- Page3:ИНТЕРНЕТ2 --------------------
+class Page3 :public InternetPageBase {
+public:
+	using InternetPageBase::InternetPageBase;
+
+	void setup() override {}
+
+	void onActivate() override {
+		_staticDrawn = false;
+		_param = 0;
+		lanStore.load(LanIfStore::IF2,_cfg,false);
+
+		_statLine[0] = 0;
+		_lastStatMs = 0;
+
+		draw();
+	}
+
+	void update() override
+	{
+		uint32_t now = millis();
+		if (now - _lastStatMs < 1000) return;
+		_lastStatMs = now;
+
+		Internet2Client::Status st;
+		bool okRead = internet2.readStatus(st);
+		_stValid = okRead;
+		if (okRead) _st = st;
+		IPAddress ip = okRead ? st.ip :IPAddress(0,0,0,0);
+		bool ok = okRead && !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+
+		char line[48];
+		snprintf(line,sizeof(line),"STATUS :%s",ok ? "OK" :"NO");
+
+		if (strcmp(_statLine,line) != 0) {
+			strncpy(_statLine,line,sizeof(_statLine) - 1);
+			_statLine[sizeof(_statLine) - 1] = 0;
+			drawStatusLine();
+		}
+	}
+
+	void draw() override {
+		if (!_staticDrawn) { drawStatic(); _staticDrawn = true; }
+		drawDynamic(true);
+	}
+
+	void onButtonPressed(int buttonID) override {
+		if (buttonID == BTN_SW4) { // SAVE+HOME
+			lanStore.save(LanIfStore::IF2,_cfg,true);
+			applyInternet2FromStore();
+			_m->backToStart();
+			return;
+		}
+
+		if (buttonID == BTN_SW1) {
+			_param = (_param + 1) % PARAM_COUNT;
+			drawDynamic(false);
+			return;
+		}
+
+		if (buttonID == BTN_SW2 || buttonID == BTN_SW3) {
+			int delta = (buttonID == BTN_SW3) ? +1 :-1;
+			applyDelta(delta);
+			drawDynamic(false);
+			return;
+		}
+	}
+
+	void onButtonReleased(int) override {}
+
+private:
+	LanIfStore::IfConfig _cfg{};
+	bool _staticDrawn = false;
+	uint8_t _param = 0;
+	uint8_t _oct = 0;
+
+	uint32_t _lastStatMs = 0;
+	char _statLine[48] = { 0 };
+	Internet2Client::Status _st{};
+	bool _stValid = false;
+
+	void drawStatusLine()
+	{
+		auto d = tft(); if (!d) return;
+
+		d->setTextSize(1);
+		d->fillRect(140,0,170,16,TFT_BLACK);
+
+		bool ok = (strstr(_statLine,"STATUS :OK") != nullptr);
+		d->setTextColor(ok ? TFT_GREEN :TFT_RED,TFT_BLACK);
+		d->drawString(_statLine,140,Y_TITLE);
+
+		d->setTextSize(2);
+	}
+
+	void drawStatic()
+	{
+		auto d = tft(); if (!d) return;
+		d->fillScreen(TFT_BLACK);
+		d->setTextSize(2);
+		d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		d->drawString("INTERNET 2",X,Y_TITLE);
+
+		drawStatusLine();
+		d->setTextSize(2);
+	}
+
+	void drawDynamic(bool)
+	{
+		auto d = tft(); if (!d) return;
+
+		for (int i = 0; i < 7; i++) d->fillRect(0,Y0 + i * DY,W,H,TFT_BLACK);
+
+		d->setTextColor(_param == P_DHCP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_DHCP ? ">" :" ",0,Y0 + 0 * DY);
+		d->drawString(_cfg.dhcp ? "DHCP :ON" :"DHCP :OFF",X,Y0 + 0 * DY);
+
+		char b[64];
+		d->setTextColor(_param == P_NTP ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_NTP ? ">" :" ",0,Y0 + 1 * DY);
+		snprintf(b,sizeof(b),"NTP :%s",kNtpIpStr[_cfg.ntpIdx % 5]);
+		d->drawString(b,X,Y0 + 1 * DY);
+
+		d->setTextColor(_param == P_PERIOD ? TFT_CYAN :TFT_WHITE,TFT_BLACK);
+		d->drawString(_param == P_PERIOD ? ">" :" ",0,Y0 + 2 * DY);
+		snprintf(b,sizeof(b),"ПЕРИОД :%s",kPeriodsName[_cfg.periodIdx % 6]);
+		d->drawString(b,X,Y0 + 2 * DY);
+
+		uint8_t ipNow[4];
+		IPAddress ip = (_stValid ? _st.ip :IPAddress(0,0,0,0));
+		ipToOctets(ip,ipNow);
+		drawIpLineRO(d,"IP :",ipNow,3);
+		drawIpLineRO(d,"MASK :",_cfg.mask,4);
+		drawIpLineRO(d,"CW :",_cfg.gw,5);
+		drawIpLineRO(d,"DNS :",_cfg.dns,6);
+	}
+
+	void applyDelta(int delta) {
+		if (_param == P_DHCP) { _cfg.dhcp = _cfg.dhcp ? 0 :1; return; }
+		if (_param == P_NTP) { _cfg.ntpIdx = (uint8_t)((_cfg.ntpIdx + (delta > 0 ? 1 :4)) % 5); return; }
+		if (_param == P_PERIOD) { _cfg.periodIdx = (uint8_t)((_cfg.periodIdx + (delta > 0 ? 1 :5)) % 6); return; }
+	}
+};
+
+// -------------------- Page4/5 stubs --------------------
+class Page4 :public PageBase {
+public:using PageBase::PageBase;
+	 void setup() override {}
+	 void onActivate() override { draw(); }
+	 void update() override {}
+	 void draw() override {
+		 auto d = tft(); if (!d) return;
+		 d->fillScreen(TFT_BLACK);
+		 d->setTextSize(2);
+		 d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		 d->drawString("PAGE 4",10,10);
+	 }
+	 void onButtonPressed(int) override {}
+	 void onButtonReleased(int) override {}
+};
+
+class Page5 :public PageBase {
+public:using PageBase::PageBase;
+	 void setup() override {}
+	 void onActivate() override { draw(); }
+	 void update() override {}
+	 void draw() override {
+		 auto d = tft(); if (!d) return;
+		 d->fillScreen(TFT_BLACK);
+		 d->setTextSize(2);
+		 d->setTextColor(TFT_YELLOW,TFT_BLACK);
+		 d->drawString("PAGE 5",10,10);
+	 }
+	 void onButtonPressed(int) override {}
+	 void onButtonReleased(int) override {}
+};
+
+// ---------------------------------------------------------
+
+Menu::Menu(TFT_eSPI* disp) :tft(disp) {}
+
+void Menu::attachPages()
+{
+	static Page1 p1(this);
+	static Page2 p2(this);
+	static Page3 p3(this);
+	static Page4 p4(this);
+	static Page5 p5(this);
+
+	pages[0] = &p1; // SOURCES
+	pages[1] = &p2; // INTERNET1
+	pages[2] = &p3; // INTERNET2
+	pages[3] = &p4;
+	pages[4] = &p5;
+}
+
+void Menu::setup(const String& ver)
+{
+	versionString = ver;
+
+	tft->init();
+	tft->setRotation(3);
+	tft->fillScreen(TFT_NAVY);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+
+	// стартовый экран
+	tft->loadFont(AA_FONT_CALI);
+	tft->setCursor(120,20); tft->println("IVCH");
+	tft->setCursor(100,50); tft->println("DECIMA");
+
+	tft->loadFont(AA_FONT_TIME24I);
+	tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+	tft->setCursor(84,90); tft->println("ВКЛЮЧЕНИЕ");
+
+	tft->loadFont(AA_FONT_TIME18);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->setCursor(5,130); tft->println("(C) 2026");
+	tft->setCursor(5,150); tft->println("www.decima.ru");
+
+	uint16_t tbw = tft->textWidth(versionString);
+	uint16_t x = (tft->width() - tbw) - 4;
+	tft->setCursor(x,150);
+	tft->print(versionString);
+
+	attachPages();
+	for (int i = 0; i < 5; i++) if (pages[i]) pages[i]->setup();
+
+	drawStartPage();
+}
+
+void Menu::update()
+{
+	const uint32_t now = millis();
+
+	if (state == MENU_IDLE) {
+		if (!_homeStaticDrawn) {
+			drawHomeStatic();
+			_homeStaticDrawn = true;
+			_homeDirty = true;
+		}
+
+		if (_homeDirty || (now - _lastHomeTickMs) >= 500) {
+			_lastHomeTickMs = now;
+			drawHomeDynamic();
+			_homeDirty = false;
+		}
+		return;
+	}
+
+	if (state == MENU_ITEM_SELECT) {
+		if (pages[page]) pages[page]->update();
+	}
+}
+
+void Menu::invalidateHome() { _homeDirty = true; }
+
+void Menu::drawStartPage()
+{
+	state = MENU_IDLE;
+	_homeStaticDrawn = false;
+	_homeDirty = true;
+}
+
+void Menu::drawHomeStatic()
+{
+	tft->fillScreen(TFT_BLACK);
+	tft->setTextSize(2);
+
+	tft->setTextColor(TFT_CYAN,TFT_BLACK);
+	tft->drawString("HOME",10,Y_HOME);
+
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->drawString("IP1:",10,Y_IP1);
+	tft->drawString("IP2:",10,Y_IP2);
+	tft->drawString("DATE:",10,Y_DATE);
+	tft->drawString("NET GSM :",10,Y_NET);
+	tft->drawString("SIG :",10,Y_SIG);
+
+	tft->setTextColor(TFT_YELLOW,TFT_BLACK);
+	tft->drawString(versionString,10,Y_VER);
+
+	_lastIp[0] = 0;
+	_lastIp2[0] = 0;
+	_lastDate[0] = 0;
+	_lastNet = !gNetRegistered;
+	_lastBars = 255;
+}
+
+void Menu::drawHomeDynamic()
+{
+	// IP1
+	if (strcmp(_lastIp,gIp1Str) != 0) {
+		strncpy(_lastIp,gIp1Str,sizeof(_lastIp) - 1);
+		_lastIp[sizeof(_lastIp) - 1] = 0;
+		tft->fillRect(80,Y_IP1,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		tft->drawString(_lastIp,80,Y_IP1);
+	}
+
+	// IP2
+	if (strcmp(_lastIp2,gIp2Str) != 0) {
+		strncpy(_lastIp2,gIp2Str,sizeof(_lastIp2) - 1);
+		_lastIp2[sizeof(_lastIp2) - 1] = 0;
+		tft->fillRect(80,Y_IP2,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		tft->drawString(_lastIp2,80,Y_IP2);
+	}
+
+	// Date
+	if (strcmp(_lastDate,gDateStr) != 0) {
+		strncpy(_lastDate,gDateStr,sizeof(_lastDate) - 1);
+		_lastDate[sizeof(_lastDate) - 1] = 0;
+		tft->fillRect(80,Y_DATE,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		tft->drawString(_lastDate,80,Y_DATE);
+	}
+
+	// Net (SIM800 registration)
+	if (_lastNet != gNetRegistered) {
+		_lastNet = gNetRegistered;
+		tft->fillRect(100,Y_NET,240,20,TFT_BLACK);
+		tft->setTextColor(gNetRegistered ? TFT_GREEN :TFT_RED,TFT_BLACK);
+		tft->drawString(gNetRegistered ? "CONNECTED" :"NO",100,Y_NET);
+	}
+
+	// Signal
+	if (_lastBars != gSignalBars) {
+		_lastBars = gSignalBars;
+		tft->fillRect(80,Y_SIG,240,20,TFT_BLACK);
+		tft->setTextColor(TFT_WHITE,TFT_BLACK);
+		char buf[32];
+		if (gCsqRssi == 99 || gRssiDbm == 0) snprintf(buf,sizeof(buf),"-- [0/5]");
+		else snprintf(buf,sizeof(buf),"%ddBm [%u/5]",(int)gRssiDbm,(unsigned)gSignalBars);
+		tft->drawString(buf,80,Y_SIG);
+	}
+}
+
+void Menu::activate()
+{
+	page = 0;
+	item = 0;
+	state = MENU_PAGE_SELECT;
+	draw();
+}
+
+void Menu::deactivate()
+{
+	drawStartPage();
+}
+
+bool Menu::isActive() const { return state != MENU_IDLE; }
+MenuState Menu::getState() const { return state; }
+
+void Menu::prevPage() { if (state == MENU_PAGE_SELECT) { page = (page + 4) % 5; drawPageSelect(); } }
+void Menu::nextPage() { if (state == MENU_PAGE_SELECT) { page = (page + 1) % 5; drawPageSelect(); } }
+
+void Menu::prevItem() { if (state == MENU_ITEM_SELECT) { item = (item + 4) % 5; drawActivePage(); } }
+void Menu::nextItem() { if (state == MENU_ITEM_SELECT) { item = (item + 1) % 5; drawActivePage(); } }
+
+void Menu::fixPage()
+{
+	if (state == MENU_PAGE_SELECT) {
+		item = 0;
+		state = MENU_ITEM_SELECT;
+		if (pages[page]) pages[page]->onActivate();
+		else drawActivePage();
+	}
+}
+
+void Menu::fixItem()
+{
+	// legacy:в нашем UI item не используется как отдельный уровень
+}
+
+void Menu::backToStart() { deactivate(); }
+
+void Menu::select() {}
+void Menu::runTest() { state = MENU_TEST; draw(); }
+
+void Menu::draw()
+{
+	if (state == MENU_PAGE_SELECT) drawPageSelect();
+	else if (state == MENU_ITEM_SELECT) drawActivePage();
+	else if (state == MENU_TEST) drawTestPage();
+	else drawStartPage();
+}
+
+void Menu::drawPageSelect()
+{
+	static const char* topMenuNames[5] = {
+	"ИСТОЧНИКИ СИНХРОНИЗАЦИИ",
+	"НАСТРОЙКИ ИНТЕРНЕТ1",
+	"НАСТРОЙКИ ИНТЕРНЕТ2",
+	"СВОБОДНО",
+	"СВОБОДНО"
+	};
+
+	tft->fillScreen(TFT_BLACK);
+	tft->setTextSize(2);
+	tft->setTextColor(TFT_CYAN,TFT_BLACK);
+	tft->drawString("ВЫБОР МЕНЮ",10,10);
+
+	for (int i = 0; i < 5; i++) {
+		bool sel = (i == page);
+		tft->setTextColor(sel ? TFT_GREEN :TFT_WHITE,sel ? TFT_BLUE :TFT_BLACK);
+		tft->fillRect(10,35 + i * 24,310,22,TFT_BLACK);
+		tft->drawString(topMenuNames[i],10,35 + i * 24);
+	}
+}
+
+void Menu::drawActivePage()
+{
+	if (pages[page]) pages[page]->draw();
+}
+
+void Menu::onButtonPressed(int buttonID)
+{
+	// HOME:вход в меню по SW1
+	if (state == MENU_IDLE) {
+		if (buttonID == BTN_SW1) activate();
+		return;
+	}
+
+	// MENU_PAGE_SELECT
+	if (state == MENU_PAGE_SELECT) {
+		if (buttonID == BTN_SW2) prevPage();
+		else if (buttonID == BTN_SW3) nextPage();
+		else if (buttonID == BTN_SW1) fixPage();
+		else if (buttonID == BTN_SW4) backToStart();
+		return;
+	}
+
+	// MENU_ITEM_SELECT
+	if (state == MENU_ITEM_SELECT) {
+		if (pages[page]) {
+			pages[page]->onButtonPressed(buttonID);
+			return;
+		}
+	}
+
+	// MENU_TEST
+	if (state == MENU_TEST) {
+		if (buttonID == BTN_SW4 || buttonID == BTN_SW1) backToStart();
+		return;
+	}
+}
+
+void Menu::onButtonReleased(int buttonID)
+{
+	if (state == MENU_ITEM_SELECT && pages[page]) pages[page]->onButtonReleased(buttonID);
+}
+
+const char* Menu::itemLabel(int p,int i) const
+{
+	if (p < 0 || p > 4 || i < 0 || i > 4) return "";
+	return menu[p][i];
+}
+
+void Menu::drawTestPage()
+{
+	tft->fillScreen(TFT_BLACK);
+	tft->setTextColor(TFT_RED,TFT_BLACK);
+	tft->setTextSize(2);
+	tft->drawString("TEST (legacy)",20,60);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->drawString("SW4 - exit",20,120);
+}
+3) Правки по адресам в “программах,где применяются адреса”
+Вы уже прислали AT24C128Settings.*,LanIfStore.*,SyncSourcesStore.*. В них нужно сделать однотипно:
+
+В каждом .h
+добавить #include "EepromMap.h"
+заменить фиксированные адреса на EepromMap::...
+Например,в AT24C128Settings.h заменить:
+
+cpp Копировать
+static constexpr uint16_t ADDR_MAGIC = 0x0000;
+...
+static constexpr uint16_t ADDR_SERVER = 0x0160;
+на:
+
+cpp Копировать
+static constexpr uint16_t ADDR_MAGIC = EepromMap::Settings::ADDR_MAGIC;
+...
+static constexpr uint16_t ADDR_SERVER = EepromMap::Settings::ADDR_SERVER;
+Аналогично:
+
+LanIfStore::BASE_IF1/BASE_IF2 → EepromMap::LanIf::BASE_IF1/BASE_IF2
+SyncSourcesStore::BASE → EepromMap::SyncSources::BASE
+Если после этого “НЕ сохраняется”,то по вашему Menu.cpp сохранение вызывается (syncStore.save(syncData)),
+значит нужно смотреть возврат save() (я добавил Serial.println,если fail) и/или кто перетирает EEPROM по этим адресам. 
+Скажите,что пишет в Serial после нажатия SW4:SAVE+BACK на Page1.
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++-------------------------------********************
+
+1) Почему «по прежнему не сохраняется источник синхронизации»
+По вашему Menu.cpp сохранение вызывается:
+
+cpp Копировать
+syncData = _tmp;
+syncStore.save(syncData);
+Значит проблема одна из двух:
+
+syncStore.save() возвращает false (запись реально не происходит)
+запись проходит,но потом данные затираются (перезапись другим модулем / адреса «заворачиваются» из‑за не той EEPROM)
+Самая частая причина «всё пишу по 0x0280,а после перезагрузки пусто» — на плате стоит EEPROM меньшего объёма 
+(например 24C02/24C04/24C08). У таких чипов:
+
+адреса выше 0x00FF заворачиваются,
+размер страницы не 64 (у 24C02 обычно 8/16),и ваш PAGE_SIZE=64 ломает запись страницами.
+Нужно подтвердить маркировку микросхемы EEPROM на плате (фото/надпись). Пока это не подтверждено,можно
+бесконечно “переносить BASE”,но сохранение будет «пропадать».
+
+Мини‑диагностика прямо сейчас (без споров)
+В commitSave() добавьте проверку “записал/прочитал обратно”:
+
+cpp Копировать
+void commitSave() {
+ syncData = _tmp;
+
+ bool ok = syncStore.save(syncData);
+ Serial.print("syncStore.save="); Serial.println(ok);
+
+ SyncSourcesStore::Data rd;
+ bool ok2 = syncStore.load(rd);
+ Serial.print("syncStore.load="); Serial.println(ok2);
+ Serial.print("rd:gps="); Serial.print(rd.gpsEnable);
+ Serial.print(" net1="); Serial.print(rd.netEnable);
+ Serial.print(" net2="); Serial.print(rd.net2Enable);
+ Serial.print(" gsm="); Serial.println(rd.gsmEnable);
+
+ ...
+}
+Если ok=false → проблема записи I2C EEPROM (тип/страницы/WP/шина)
+Если ok=true и ok2=true и rd совпадает → запись в EEPROM есть,тогда “не сохраняется” означает,что при 
+следующем старте setup() не загружает,или загружает,но потом где-то перетирается в RAM
+2) “Переделать на возможность синхронизации от нескольких источников + фиксированный приоритет”
+Вы хотите:
+
+можно включить несколько источников одновременно
+приоритет всегда:GPS → INTERNET1 → INTERNET2 → GSM
+Что менять
+В меню Page1 убрать логику “выберите один / exclusive” и сделать обычные ON/OFF.
+В TimeSyncPlanner выбирать источник по приоритету из включённых и доступных.
+Изменение в меню (Page1):убрать эксклюзивность
+Сейчас у вас при переключении enable вы просто инвертируете флаг — это уже “мульти-источники”. 
+Но вы писали ранее “выберите один”,и мы могли внедрить эксклюзивность. В вашем текущем Menu.cpp эксклюзивности нет 
+(в присланной версии) — значит меню уже подходит для multi-source.
+
+Единственное:поменять текст “Источник (выберите один)” на “Источники (можно несколько)” и оставить ON/OFF.
+
+3) Приоритет в планировщике (GPS > INTERNET1 > INTERNET2 > GSM)
+У вас в loop() комментарий сейчас другой:GPS > NET2 > NET(sim NTP) > GSM. Нужно поменять порядок.
+
+Так как код TimeSyncPlanner вы не прислали,даю правильный шаблон логики (внутри planner.tick() или где вы выбираете источник):
+
+cpp Копировать
+// псевдо:в каждом tick пытаемся синхронизироваться по первому доступному
+if (syncData.gpsEnable && gpsIsValidFix()) {
+ trySyncFromGps();
+ return;
+}
+if (syncData.netEnable && internet1IsReady()) { // INTERNET1 (LAN NTP)
+ trySyncFromInternet1();
+ return;
+}
+if (syncData.net2Enable && internet2IsReady()) { // INTERNET2 (I2C/W5500)
+ trySyncFromInternet2();
+ return;
+}
+if (syncData.gsmEnable && simTimeIsReady()) { // GSM (CCLK)
+ trySyncFromGsm();
+ return;
+}
+Где internet1IsReady() — это ваш критерий “есть IP / ntpLan поднят”,а internet2IsReady() — “модуль отвечает и имеет IP”.
+
+Пришлите TimeSyncPlanner.cpp — я внесу правки в ваш реальный код и выдам файл полностью.
+
+4) WEB-доступ:заменить “BasicAuth+EEPROM” на “WEB-доступ (пароль)”
+Тут важно уточнение:какой именно веб-сервер/класс у вас используется (где находится web.begin(); web.tick();). 
+Вы не прислали Web*.cpp/.h,поэтому я не могу корректно “внести правки и выдать полностью” именно веб-модуль.
+
+Но архитектуру и EEPROM‑часть можно подготовить уже сейчас:
+
+4.1 Добавляем пароль в EEPROM (Settings)
+Добавьте поле в AT24C128Settings::Config:
+
+cpp Копировать
+char webPassword[16]; // 15 + '\0'
+И фиксированный адрес в карте EEPROM (после server):
+
+ADDR_SERVER = 0x0160 (48 байт) занимает до 0x018F
+следующий свободный:0x0190
+Обновление карты адресов (EepromMap.h)
+Добавьте:
+
+cpp Копировать
+static constexpr uint16_t ADDR_WEBPASS = 0x0190; // 16 bytes
+static constexpr uint16_t END = ADDR_WEBPASS + 16; // 0x01A0
+Методы в AT24C128Settings
+Добавить:
+
+writeWebPassword(const char*)
+readWebPassword(char*,size_t)
+Пароль хранить в EEPROM можно как строку (да,не криптостойко,но вы и BasicAuth в EEPROM хранили примерно так же). 
+Если хотите “нормально” — можно хранить хэш (SHA-256),но это уже отдельная задача.
+
+4.2 Как заменить BasicAuth на “пароль”
+Варианта два:
+
+Вариант A (самый простой):пароль в параметре URL
+Все запросы должны содержать ?pw=XXXX. Плюсы:очень просто. Минусы:пароль светится в URL.
+
+Вариант B (нормальный для UI):форма логина + cookie
+/login отдаёт HTML форму (password input)
+POST /login → если пароль верный,сервер ставит cookie SID=...
+все защищённые страницы требуют SID
+Плюсы:удобно,минусы:чуть больше кода.
+
+Что мне нужно,чтобы сделать WEB правки “полностью”
+Пришлите файлы веб-модуля:
+
+Web*.h/.cpp (или как называется класс web)
+где сейчас реализован BasicAuth (обычно проверка заголовка Authorization)
+где читаете/пишете логин/пароль из EEPROM
+После этого я:
+
+удалю BasicAuth,
+добавлю один пароль,
+сделаю /login + cookie (или вариант A — как скажете),
+привяжу пароль к AT24C128Settings (EEPROM).
+5) И последнее:“TZ target” → “Часовой пояс”
+В вашем Menu.cpp замените строки формирования:
+
+cpp Копировать
+snprintf(out,n,"3) TZ target:%d",(int)_tzTargetTmp);
+на:
+
+cpp Копировать
+char tz[16];
+if (_tzTargetTmp == 0) snprintf(tz,sizeof(tz),"UTC");
+else snprintf(tz,sizeof(tz),"UTC%+d",(int)_tzTargetTmp);
+snprintf(out,n,"3) Часовой пояс:%s",tz);
+(Аналогично для NET/NET2/GSM строк.)
+
+Следующий шаг (чтобы закрыть “не сохраняется”)
+Подтвердите маркировку EEPROM на плате (AT24C128/24LC128 или что-то меньше).
+Скажите,что печатает Serial по диагностике save/load из пункта 1.
+Пришлите TimeSyncPlanner.cpp и файлы web.* — я внесу правки и выдам полностью.
+
+//+++++++++++++++++++++++/////////////////////////////////////////////////////////////////
+
+Ниже два блока:
+
+что прямо сейчас мешает «сохранению источника» и как это починить без гаданий;
+полный рефактор WebUI:BasicAuth+EEPROM → пароль + сессия,плюс мульти‑источники (можно включать несколько) и UI/сохранение под приоритет GPS → INTERNET1 → INTERNET2 → GSM.
+1) Почему «не сохраняется источник синхронизации» (при AT24C128 это почти всегда логика загрузки/перезаписи)
+У вас сохранение вызывается и из меню,и из WebUI:
+
+Menu.cpp:syncStore.save(syncData);
+WebUI.cpp:syncStore.save(syncData);
+Если после перезагрузки «откат»,то обычно одно из двух:
+
+A) На старте вы затираете EEPROM дефолтами
+Если у вас в setup() стоит логика типа:
+
+cpp Копировать
+syncStore.defaults(syncData);
+if (!syncStore.load(syncData)) {
+ (void)syncStore.save(syncData); // <-- вот это затирает сохранённое при любом сбое чтения
+}
+то при любом неудачном чтении (I2C глитч/шина занята/EEPROM не успела после питания) вы переписываете EEPROM дефолтом,и кажется что «не сохраняется».
+
+Исправление: при load()==false НЕ делать auto-save,только оставить defaults в RAM.
+
+B) Вы сохраняете,но не проверяете что реально записалось/прочиталось
+Сделайте проверку “save → load → сравнение” (временно) и сразу станет ясно:запись не проходит или чтение/логика старта откатывает.
+
+Куда вставить: в Menu.cpp::commitSave() и в WebUI.cpp::actionCfgSave() после syncStore.save().
+
+Пример (универсально):
+
+cpp Копировать
+bool ok = syncStore.save(syncData);
+Serial.print("SyncSources save="); Serial.println(ok);
+
+SyncSourcesStore::Data rd;
+bool ok2 = syncStore.load(rd);
+Serial.print("SyncSources load="); Serial.println(ok2);
+
+Serial.print("rd gps="); Serial.print(rd.gpsEnable);
+Serial.print(" net1="); Serial.print(rd.netEnable);
+Serial.print(" net2="); Serial.print(rd.net2Enable);
+Serial.print(" gsm="); Serial.println(rd.gsmEnable);
+Если save=true,load=true,а после перезагрузки опять «старое» — значит в setup/где-то ещё снова грузят defaults или перетирают syncData.
+
+2) WEB-доступ:убираем BasicAuth+user/pass в EEPROM → делаем доступ по паролю (EEPROM) + cookie-сессия
+Вы прислали WebUI.h/.cpp — можно переделать “полностью”.
+
+Что будет:
+/login — страница ввода пароля
+после успешного входа ставится cookie IVCH=<token> (токен хранится в RAM,после перезагрузки сессия слетает — нормально)
+BasicAuth полностью удалён
+пароль хранится в EEPROM (0x50) по фиксированным адресам (ниже)
+на странице /cfg можно сменить пароль (старый → новый)
+Важно про адреса
+У вас сейчас в WebUI жёстко:
+
+cpp Копировать
+static constexpr uint16_t AUTH_BASE = 0x0190;
+Это место свободно (после ADDR_SERVER=0x0160 (48 байт) последний байт 0x018F),так что нормально. Но чтобы «разные программы» читали одинаково — лучше вынести в единый map-файл (если вы уже делали EepromMap.h,добавьте туда Web секцию).
+
+Ниже я оставлю в WebUI адрес 0x0190,но под пароль.
+
+3) Мульти‑источники + фиксированный приоритет
+Вы просите:синхронизация от нескольких источников,приоритет всегда:
+
+GPS → INTERNET1 → INTERNET2 → GSM
+
+Это означает:
+
+в настройках можно включить несколько Enable
+планировщик всегда берёт первый доступный по приоритету
+Что я меняю в WebUI:
+вместо radio src=gps/net/net2/gsm → checkbox src_gps/src_net1/src_net2/src_gsm
+на странице статуса показываем:включённые источники + строка приоритета
+Что нужно поменять в TimeSyncPlanner
+Файл TimeSyncPlanner.cpp вы не прислали,поэтому я не могу “выдать полностью” именно его. Но логика должна быть такая (внутри planner.tick()/выбора источника):
+
+cpp Копировать
+if (syncData.gpsEnable && gpsReady) useGPS();
+else if (syncData.netEnable && inet1Ready) useINET1();
+else if (syncData.net2Enable && inet2Ready) useINET2();
+else if (syncData.gsmEnable && gsmReady) useGSM();
+Пришлёте TimeSyncPlanner.* — внесу правки и верну файлы целиком.
+
+WebUI.h (полностью,НОВЫЙ:пароль + сессия,без BasicAuth)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Ethernet_Generic.hpp>
+
+class WebUI
+{
+public:
+	explicit WebUI(uint16_t port = 80);
+
+	void begin(); // поднимет server + создаст дефолтный пароль в EEPROM при отсутствии
+	void tick();
+
+	static void htmlEscPrint(EthernetClient& c,const char* s);
+
+private:
+	EthernetServer _srv;
+
+	// ---- session (RAM) ----
+	uint32_t _sessionToken = 0;
+	bool _sessionValid = false;
+
+	// ------------ HTTP ------------
+	void handleClient(EthernetClient& c);
+
+	bool readLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs);
+
+	// читает заголовки,вытаскивает Cookie и Content-Length
+	bool readHeaders(EthernetClient& c,
+		char* cookieLine,size_t cookieLineN,
+		size_t& contentLength,
+		uint32_t timeoutMs);
+
+	// читает POST body (x-www-form-urlencoded) по Content-Length
+	bool readBody(EthernetClient& c,char* out,size_t outN,size_t contentLength,uint32_t timeoutMs);
+
+	// auth/session
+	bool isLoggedIn(const char* cookieLine) const;
+	void doLogin(EthernetClient& c,const char* nextLocation);
+	void doLogout(EthernetClient& c);
+
+	void sendForbidden(EthernetClient& c);
+	void sendRedirect(EthernetClient& c,const char* location);
+	void sendRedirectWithCookie(EthernetClient& c,const char* location,uint32_t token);
+	void sendClearCookie(EthernetClient& c,const char* location);
+
+	static bool startsWithI(const char* s,const char* pref); // case-insensitive
+	static bool startsWith(const char* s,const char* pref);
+
+	static void urlDecodeInPlace(char* s);
+	static const char* findParam(char* query,const char* key);
+
+	static bool parseBool01(const char* s,bool& out);
+	static bool parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV);
+	static bool parseI8(const char* s,int8_t& out,int8_t minV,int8_t maxV);
+	static bool parseIp4(const char* s,uint8_t out[4]);
+
+	// checkbox:param present => true
+	static bool parseCheckbox(char* params,const char* key);
+
+	void sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct);
+
+	// ------------ Pages ------------
+	void pageLogin(EthernetClient& c,const char* next);
+	void pageStatus(EthernetClient& c);
+	void pageCfg(EthernetClient& c);
+	void pageGsm(EthernetClient& c);
+	void pageNotFound(EthernetClient& c);
+
+	// ------------ JSON ------------
+	void apiStatus(EthernetClient& c);
+	void apiConfig(EthernetClient& c);
+
+	// ------------ Actions ------------
+	void actionLogin(EthernetClient& c,char* params); // POST /login
+	void actionCfgSave(EthernetClient& c,char* params); // POST /cfg/save
+	void actionGsmSave(EthernetClient& c,char* params); // POST /gsm/save
+
+	// ------------ EEPROM password (0x50 / 0x0190..) ------------
+	struct PwRec {
+		char pass[16]; // 15 + '\0'
+	};
+
+	bool pwLoad(PwRec& out) const;
+	bool pwSave(const PwRec& in);
+	void pwLoadOrDefaults(PwRec& out,bool& existed) const;
+
+	// ------------ low-level EEPROM I2C helpers ------------
+	static constexpr uint8_t EEPROM_ADDR = 0x50;
+	static constexpr uint8_t EEPROM_PAGE = 64;
+
+	bool eepromRead(uint16_t memAddr,uint8_t* out,size_t len) const;
+	bool eepromWrite(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool eepromWritePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool eepromWaitReady(uint32_t timeoutMs = 50);
+
+	static void trimSpaces(char* s);
+
+	// helpers
+	static void printIpOct(EthernetClient& c,const uint8_t ip[4]);
+	static bool parseCookieToken(const char* cookieLine,uint32_t& tok);
+	static uint32_t parseHexU32(const char* s,bool& ok);
+};
+WebUI.cpp (полностью,НОВЫЙ:пароль + сессия,мульти‑источники)
+cpp Копировать
+#include "WebUI.h"
+
+#include <IPAddress.h>
+#include <Wire.h>
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+// проектные заголовки
+#include "LanIfStore.h"
+#include "SyncSourcesStore.h"
+#include "AT24C128Settings.h"
+#include "TimeSyncPlanner.h"
+#include "NetFeed.h"
+#include "Internet2Client.h"
+#include "NtpLanService_Generic.h"
+
+// --- externs из проекта ---
+extern LanIfStore lanStore;
+
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+
+extern AT24C128Settings ee;
+extern AT24C128Settings::Config cfg;
+
+extern TimeSyncPlanner planner;
+
+extern void applyInternet1FromStore();
+extern void applyInternet2FromStore();
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GSM globals
+extern bool gNetRegistered;
+extern int16_t gRssiDbm;
+extern uint8_t gSignalBars;
+
+// GPS globals
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+
+// --- списки ---
+static const char* kNtpIpStr[5] = {
+	"162.159.200.123",
+	"162.159.200.1",
+	"129.6.15.28",
+	"132.163.96.1",
+	"216.239.35.0"
+};
+
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// ================== ctor ==================
+WebUI::WebUI(uint16_t port) :_srv(port) {}
+
+// ================== helpers ==================
+bool WebUI::startsWith(const char* s,const char* pref)
+{
+	while (*pref) { if (*s++ != *pref++) return false; }
+	return true;
+}
+
+bool WebUI::startsWithI(const char* s,const char* pref)
+{
+	auto up = [](char c)->char {
+		if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
+		return c;
+	};
+	while (*pref) {
+		if (up(*s++) != up(*pref++)) return false;
+	}
+	return true;
+}
+
+void WebUI::htmlEscPrint(EthernetClient& c,const char* s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '&':c.print(F("&amp;")); break;
+		case '<':c.print(F("&lt;")); break;
+		case '>':c.print(F("&gt;")); break;
+		case '"':c.print(F("&quot;")); break;
+		default:c.write(*s); break;
+		}
+	}
+}
+
+void WebUI::printIpOct(EthernetClient& c,const uint8_t ip[4])
+{
+	c.print(ip[0]); c.print('.');
+	c.print(ip[1]); c.print('.');
+	c.print(ip[2]); c.print('.');
+	c.print(ip[3]);
+}
+
+void WebUI::trimSpaces(char* s)
+{
+	while (*s == ' ' || *s == '\t') memmove(s,s + 1,strlen(s));
+	size_t n = strlen(s);
+	while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) {
+		s[n - 1] = 0;
+		n--;
+	}
+}
+
+uint32_t WebUI::parseHexU32(const char* s,bool& ok)
+{
+	ok = false;
+	if (!s || !*s) return 0;
+	uint32_t v = 0;
+	for (int i = 0; i < 8 && s[i]; i++) {
+		char c = s[i];
+		uint8_t d;
+		if (c >= '0' && c <= '9') d = (uint8_t)(c - '0');
+		else if (c >= 'A' && c <= 'F') d = (uint8_t)(10 + (c - 'A'));
+		else if (c >= 'a' && c <= 'f') d = (uint8_t)(10 + (c - 'a'));
+		else return 0;
+		v = (v << 4) | d;
+	}
+	ok = true;
+	return v;
+}
+
+bool WebUI::parseCookieToken(const char* cookieLine,uint32_t& tok)
+{
+	// Cookie:a=b; IVCH=0123ABCD; x=y
+	if (!cookieLine) return false;
+	const char* p = strstr(cookieLine,"IVCH=");
+	if (!p) return false;
+	p += 5;
+	bool ok = false;
+	tok = parseHexU32(p,ok);
+	return ok;
+}
+
+// ================== EEPROM low level (0x50) ==================
+bool WebUI::eepromWaitReady(uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs) {
+		Wire.beginTransmission(EEPROM_ADDR);
+		if (Wire.endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool WebUI::eepromRead(uint16_t memAddr,uint8_t* out,size_t len) const
+{
+	Wire.beginTransmission(EEPROM_ADDR);
+	Wire.write((uint8_t)(memAddr >> 8));
+	Wire.write((uint8_t)(memAddr & 0xFF));
+	if (Wire.endTransmission(false) != 0) return false;
+
+	size_t got = Wire.requestFrom((int)EEPROM_ADDR,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++) {
+		int v = Wire.read();
+		if (v < 0) return false;
+		out[i] = (uint8_t)v;
+	}
+	return true;
+}
+
+bool WebUI::eepromWritePage(uint16_t memAddr,const uint8_t* data,size_t len)
+{
+	Wire.beginTransmission(EEPROM_ADDR);
+	Wire.write((uint8_t)(memAddr >> 8));
+	Wire.write((uint8_t)(memAddr & 0xFF));
+	for (size_t i = 0; i < len; i++) Wire.write(data[i]);
+	return (Wire.endTransmission() == 0);
+}
+
+bool WebUI::eepromWrite(uint16_t memAddr,const uint8_t* data,size_t len)
+{
+	size_t off = 0;
+	while (off < len)
+	{
+		uint16_t a = (uint16_t)(memAddr + off);
+		uint8_t pageOff = (uint8_t)(a % EEPROM_PAGE);
+		size_t chunk = min((size_t)(EEPROM_PAGE - pageOff),len - off);
+
+		if (!eepromWritePage(a,data + off,chunk)) return false;
+		if (!eepromWaitReady(50)) return false;
+
+		off += chunk;
+	}
+	return true;
+}
+
+// ================== Password store (0x0190..) ==================
+static constexpr uint16_t WEBPW_BASE = 0x0190;
+static constexpr uint16_t WEBPW_MAGIC_ADDR = WEBPW_BASE + 0; // u16
+static constexpr uint16_t WEBPW_VER_ADDR = WEBPW_BASE + 2; // u8
+static constexpr uint16_t WEBPW_DATA_ADDR = WEBPW_BASE + 4; // pass[16]
+static constexpr uint16_t WEBPW_MAGIC = 0x5057; // 'W''P'
+static constexpr uint8_t WEBPW_VER = 1;
+
+bool WebUI::pwLoad(PwRec& out) const
+{
+	uint8_t b[2];
+	if (!eepromRead(WEBPW_MAGIC_ADDR,b,2)) return false;
+	uint16_t mg = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+	if (mg != WEBPW_MAGIC) return false;
+
+	uint8_t ver = 0;
+	if (!eepromRead(WEBPW_VER_ADDR,&ver,1)) return false;
+	if (ver != WEBPW_VER) return false;
+
+	uint8_t raw[16];
+	if (!eepromRead(WEBPW_DATA_ADDR,raw,sizeof(raw))) return false;
+
+	memcpy(out.pass,raw,16);
+	out.pass[15] = 0;
+	trimSpaces(out.pass);
+	return (out.pass[0] != 0);
+}
+
+bool WebUI::pwSave(const PwRec& in)
+{
+	PwRec w = in;
+	w.pass[15] = 0;
+	trimSpaces(w.pass);
+
+	if (!w.pass[0]) return false;
+
+	uint8_t mg[2] = { (uint8_t)(WEBPW_MAGIC & 0xFF),(uint8_t)(WEBPW_MAGIC >> 8) };
+	if (!eepromWrite(WEBPW_DATA_ADDR,(const uint8_t*)w.pass,16)) return false;
+
+	uint8_t ver = WEBPW_VER;
+	if (!eepromWrite(WEBPW_VER_ADDR,&ver,1)) return false;
+	if (!eepromWrite(WEBPW_MAGIC_ADDR,mg,2)) return false;
+
+	return true;
+}
+
+void WebUI::pwLoadOrDefaults(PwRec& out,bool& existed) const
+{
+	existed = pwLoad(out);
+	if (existed) return;
+
+	memset(&out,0,sizeof(out));
+	strncpy(out.pass,"admin",sizeof(out.pass) - 1);
+}
+
+// ================== session/auth ==================
+bool WebUI::isLoggedIn(const char* cookieLine) const
+{
+	if (!_sessionValid) return false;
+	uint32_t tok = 0;
+	if (!parseCookieToken(cookieLine,tok)) return false;
+	return tok == _sessionToken;
+}
+
+void WebUI::sendForbidden(EthernetClient& c)
+{
+	sendHeader(c,403,F("text/plain; charset=utf-8"));
+	c.print(F("Доступ запрещён"));
+}
+
+void WebUI::sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct)
+{
+	if (code == 200) c.print(F("HTTP/1.1 200 OK\r\n"));
+	else if (code == 303) c.print(F("HTTP/1.1 303 See Other\r\n"));
+	else if (code == 403) c.print(F("HTTP/1.1 403 Forbidden\r\n"));
+	else c.print(F("HTTP/1.1 404 Not Found\r\n"));
+
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Content-Type:"));
+	c.print(ct);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendRedirect(EthernetClient& c,const char* location)
+{
+	c.print(F("HTTP/1.1 303 See Other\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Location:"));
+	c.print(location);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendRedirectWithCookie(EthernetClient& c,const char* location,uint32_t token)
+{
+	char tok[16];
+	snprintf(tok,sizeof(tok),"%08lX",(unsigned long)token);
+
+	c.print(F("HTTP/1.1 303 See Other\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Set-Cookie:IVCH="));
+	c.print(tok);
+	c.print(F("; Path=/; Max-Age=3600\r\n"));
+	c.print(F("Location:"));
+	c.print(location);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendClearCookie(EthernetClient& c,const char* location)
+{
+	c.print(F("HTTP/1.1 303 See Other\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Set-Cookie:IVCH=; Path=/; Max-Age=0\r\n"));
+	c.print(F("Location:"));
+	c.print(location);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::doLogin(EthernetClient& c,const char* nextLocation)
+{
+	_sessionToken = ((uint32_t)millis() ^ ((uint32_t)micros() * 2654435761u) ^ 0xA53C9E2Bu);
+	_sessionValid = true;
+	sendRedirectWithCookie(c,nextLocation ? nextLocation :"/",_sessionToken);
+}
+
+void WebUI::doLogout(EthernetClient& c)
+{
+	_sessionValid = false;
+	_sessionToken = 0;
+	sendClearCookie(c,"/login");
+}
+
+// ================== HTTP parsing ==================
+bool WebUI::readLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	size_t n = 0;
+
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\r') continue;
+			if (ch == '\n') { out[n] = 0; return true; }
+			if (n + 1 < outN) out[n++] = ch;
+		}
+	}
+	out[0] = 0;
+	return false;
+}
+
+bool WebUI::readHeaders(EthernetClient& c,
+	char* cookieLine,size_t cookieLineN,
+	size_t& contentLength,
+	uint32_t timeoutMs)
+{
+	if (cookieLine && cookieLineN) cookieLine[0] = 0;
+	contentLength = 0;
+
+	char line[192];
+	while (true)
+	{
+		if (!readLine(c,line,sizeof(line),timeoutMs)) return false;
+		if (line[0] == 0) return true;
+
+		if (startsWithI(line,"Cookie:"))
+		{
+			const char* p = line + strlen("Cookie:");
+			while (*p == ' ' || *p == '\t') p++;
+			if (cookieLine && cookieLineN) {
+				strncpy(cookieLine,p,cookieLineN - 1);
+				cookieLine[cookieLineN - 1] = 0;
+				trimSpaces(cookieLine);
+			}
+		}
+		else if (startsWithI(line,"Content-Length:"))
+		{
+			const char* p = line + strlen("Content-Length:");
+			while (*p == ' ' || *p == '\t') p++;
+			long v = strtol(p,nullptr,10);
+			if (v > 0) contentLength = (size_t)v;
+		}
+	}
+}
+
+void WebUI::urlDecodeInPlace(char* s)
+{
+	auto hex = [](char c)->int {
+		if (c >= '0' && c <= '9') return c - '0';
+		if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+		if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+		return -1;
+	};
+
+	char* w = s;
+	for (char* r = s; *r; r++) {
+		if (*r == '+') { *w++ = ' '; continue; }
+		if (*r == '%' && r[1] && r[2]) {
+			int hi = hex(r[1]),lo = hex(r[2]);
+			if (hi >= 0 && lo >= 0) {
+				*w++ = (char)((hi << 4) | lo);
+				r += 2;
+				continue;
+			}
+		}
+		*w++ = *r;
+	}
+	*w = 0;
+}
+
+bool WebUI::readBody(EthernetClient& c,char* out,size_t outN,size_t contentLength,uint32_t timeoutMs)
+{
+	if (!out || outN == 0) return false;
+	if (contentLength == 0) { out[0] = 0; return true; }
+
+	if (contentLength + 1 > outN) return false;
+
+	uint32_t t0 = millis();
+	size_t n = 0;
+	while (n < contentLength && (millis() - t0) < timeoutMs)
+	{
+		while (c.available() && n < contentLength)
+		{
+			out[n++] = (char)c.read();
+		}
+	}
+	if (n != contentLength) return false;
+
+	out[n] = 0;
+	urlDecodeInPlace(out);
+	return true;
+}
+
+const char* WebUI::findParam(char* query,const char* key)
+{
+	if (!query || !key) return nullptr;
+
+	size_t klen = strlen(key);
+	char* p = query;
+
+	while (p && *p) {
+		char* amp = strchr(p,'&');
+		if (amp) *amp = 0;
+
+		char* eq = strchr(p,'=');
+		if (eq) {
+			*eq = 0;
+			if (strlen(p) == klen && strcmp(p,key) == 0) {
+				char* val = eq + 1;
+				if (amp) *amp = '&';
+				*eq = '=';
+				return val;
+			}
+			*eq = '=';
+		}
+
+		if (amp) {
+			*amp = '&';
+			p = amp + 1;
+		}
+		else break;
+	}
+	return nullptr;
+}
+
+bool WebUI::parseCheckbox(char* params,const char* key)
+{
+	// для checkbox достаточно "ключ присутствует" (value может быть "1" или "on")
+	const char* v = findParam(params,key);
+	return (v != nullptr);
+}
+
+bool WebUI::parseBool01(const char* s,bool& out)
+{
+	if (!s) return false;
+	if (strcmp(s,"0") == 0) { out = false; return true; }
+	if (strcmp(s,"1") == 0) { out = true; return true; }
+	return false;
+}
+
+bool WebUI::parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV)
+{
+	if (!s) return false;
+	long v = strtol(s,nullptr,10);
+	if (v < minV || v > maxV) return false;
+	out = (uint8_t)v;
+	return true;
+}
+
+bool WebUI::parseI8(const char* s,int8_t& out,int8_t minV,int8_t maxV)
+{
+	if (!s) return false;
+	long v = strtol(s,nullptr,10);
+	if (v < minV || v > maxV) return false;
+	out = (int8_t)v;
+	return true;
+}
+
+bool WebUI::parseIp4(const char* s,uint8_t out[4])
+{
+	if (!s) return false;
+	int a,b,c,d;
+	if (sscanf(s,"%d.%d.%d.%d",&a,&b,&c,&d) != 4) return false;
+	if ((unsigned)a > 255 || (unsigned)b > 255 || (unsigned)c > 255 || (unsigned)d > 255) return false;
+	out[0] = (uint8_t)a; out[1] = (uint8_t)b; out[2] = (uint8_t)c; out[3] = (uint8_t)d;
+	return true;
+}
+
+// ================== lifecycle ==================
+void WebUI::begin()
+{
+	PwRec p{};
+	bool existed = false;
+	pwLoadOrDefaults(p,existed);
+	if (!existed) (void)pwSave(p);
+
+	_srv.begin();
+}
+
+void WebUI::tick()
+{
+	EthernetClient c = _srv.available();
+	if (!c) return;
+	handleClient(c);
+}
+
+// ================== routing ==================
+void WebUI::handleClient(EthernetClient& c)
+{
+	char req[192];
+	if (!readLine(c,req,sizeof(req),1500)) { c.stop(); return; }
+
+	bool isGet = startsWith(req,"GET ");
+	bool isPost = startsWith(req,"POST ");
+	if (!isGet && !isPost) { sendHeader(c,404,F("text/plain; charset=utf-8")); c.print(F("Неверный метод")); c.stop(); return; }
+
+	const char* p = isGet ? (req + 4) :(req + 5);
+	char path[160];
+	size_t i = 0;
+	while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+	path[i] = 0;
+
+	// Headers
+	char cookieLine[160];
+	size_t contentLen = 0;
+	if (!readHeaders(c,cookieLine,sizeof(cookieLine),contentLen,1500)) { c.stop(); return; }
+
+	// Query/body params
+	char* q = strchr(path,'?');
+	char* params = nullptr;
+
+	static char bodyBuf[900];
+	bodyBuf[0] = 0;
+
+	if (q) { *q = 0; params = q + 1; urlDecodeInPlace(params); }
+
+	if (isPost)
+	{
+		if (contentLen > 0)
+		{
+			if (!readBody(c,bodyBuf,sizeof(bodyBuf),contentLen,2000))
+			{
+				sendHeader(c,200,F("text/plain; charset=utf-8"));
+				c.print(F("Ошибка чтения POST данных"));
+				c.stop();
+				return;
+			}
+			params = bodyBuf;
+		}
+	}
+
+	// --- Public routes ---
+	if (isGet && strcmp(path,"/login") == 0) { pageLogin(c,(params ? findParam(params,"next") :nullptr)); c.stop(); return; }
+	if (isPost && strcmp(path,"/login") == 0) { actionLogin(c,params); c.stop(); return; }
+	if (isGet && strcmp(path,"/logout") == 0) { doLogout(c); c.stop(); return; }
+
+	// --- Protected routes ---
+	if (!isLoggedIn(cookieLine))
+	{
+		// редирект на login
+		sendRedirect(c,"/login");
+		c.stop();
+		return;
+	}
+
+	// Routes
+	if (isGet && strcmp(path,"/") == 0) pageStatus(c);
+	else if (isGet && strcmp(path,"/cfg") == 0) pageCfg(c);
+	else if (isGet && strcmp(path,"/gsm") == 0) pageGsm(c);
+
+	else if (isGet && strcmp(path,"/api/status") == 0) apiStatus(c);
+	else if (isGet && strcmp(path,"/api/config") == 0) apiConfig(c);
+
+	else if (isPost && strcmp(path,"/cfg/save") == 0) actionCfgSave(c,params);
+	else if (isPost && strcmp(path,"/gsm/save") == 0) actionGsmSave(c,params);
+
+	else pageNotFound(c);
+
+	c.stop();
+}
+
+// ================== HTML header/footer ==================
+static void htmlHeader(EthernetClient& c,const __FlashStringHelper* title)
+{
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"));
+	c.print(F("<title>")); c.print(title); c.print(F("</title>"));
+	c.print(F("<style>"
+		"body{font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.25;margin:10px;}"
+		"h2{font-size:16px;margin:8px 0;}"
+		"h3{font-size:14px;margin:10px 0 6px;}"
+		"code{background:#eee;padding:1px 3px;}"
+		"input,select,button{font-size:12px;padding:2px 4px;}"
+		".pw{font-size:18px;padding:4px 6px;}"
+		".nav a{margin-right:10px;}"
+		".box{border:1px solid #ddd;padding:8px;margin:8px 0;}"
+		"</style>"));
+	c.print(F("</head><body>"));
+	c.print(F("<div class='nav'>"
+		"<a href='/'>СТАТУС</a>"
+		"<a href='/cfg'>НАСТРОЙКИ</a>"
+		"<a href='/gsm'>GSM</a>"
+		"<a href='/logout'>ВЫХОД</a>"
+		"</div><hr>"));
+}
+
+static void htmlFooter(EthernetClient& c)
+{
+	c.print(F("</body></html>"));
+}
+
+// ================== Pages ==================
+void WebUI::pageLogin(EthernetClient& c,const char* next)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'><title>Вход</title></head><body>"));
+	c.print(F("<h3>WEB-доступ</h3>"));
+	c.print(F("<form method='post' action='/login'>"));
+	if (next && next[0]) {
+		c.print(F("<input type='hidden' name='next' value='"));
+		htmlEscPrint(c,next);
+		c.print(F("'>"));
+	}
+	c.print(F("<p>Пароль:<input class='pw' type='password' name='pw'></p>"));
+	c.print(F("<p><button type='submit'>ВОЙТИ</button></p>"));
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageStatus(EthernetClient& c)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+	htmlHeader(c,F("СТАТУС"));
+
+	c.print(F("<div class='box'><h3>ПРИОРИТЕТ СИНХРОНИЗАЦИИ</h3>"));
+	c.print(F("GPS → INTERNET1 → INTERNET2 → GSM"));
+	c.print(F("</div>"));
+
+	c.print(F("<div class='box'><h3>ВКЛЮЧЕННЫЕ ИСТОЧНИКИ</h3><p><code>"));
+	c.print(syncData.gpsEnable ? "GPS " :"");
+	c.print(syncData.netEnable ? "INTERNET1 " :"");
+	c.print(syncData.net2Enable ? "INTERNET2 " :"");
+	c.print(syncData.gsmEnable ? "GSM " :"");
+	c.print(F("</code></p></div>"));
+
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 1</h3>"));
+	c.print(F("IP:<code>")); c.print(ntpLan.localIP()); c.print(F("</code><br>"));
+	c.print(F("Линк:<code>")); c.print(Ethernet.linkReport()); c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	Internet2Client::Status st{};
+	bool ok2 = internet2.readStatus(st);
+
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 2</h3>"));
+	c.print(F("Статус чтения:<code>")); c.print(ok2 ? "OK" :"ОШИБКА"); c.print(F("</code><br>"));
+	c.print(F("IP:<code>")); c.print(ok2 ? st.ip :IPAddress(0,0,0,0)); c.print(F("</code><br>"));
+	c.print(F("Последняя синхронизация:<code>")); c.print((ok2 && st.lastSyncOk) ? "УСПЕХ" :"НЕТ"); c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	c.print(F("<div class='box'><h3>ЧАСОВОЙ ПОЯС</h3>"));
+	c.print(F("Часовой пояс:<code>UTC"));
+	c.print((int)cfg.tzTargetHours >= 0 ? "+" :"");
+	c.print((int)cfg.tzTargetHours);
+	c.print(F("</code><br>"));
+	c.print(F("Часовой пояс NTP:<code>UTC"));
+	c.print((int)cfg.tzNtpHours >= 0 ? "+" :"");
+	c.print((int)cfg.tzNtpHours);
+	c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	c.print(F("<div class='box'><h3>GSM</h3>"));
+	c.print(F("Регистрация:<code>")); c.print(gNetRegistered ? "ДА" :"НЕТ"); c.print(F("</code><br>"));
+	c.print(F("RSSI:<code>")); c.print((int)gRssiDbm); c.print(F(" dBm</code><br>"));
+	c.print(F("Уровень:<code>")); c.print((int)gSignalBars); c.print(F("/5</code>"));
+	c.print(F("</div>"));
+
+	c.print(F("<div class='box'><h3>GPS</h3>"));
+	c.print(F("Fix:<code>")); c.print(gGpsFix ? "ДА" :"НЕТ"); c.print(F("</code><br>"));
+	c.print(F("Спутники:<code>"));
+	c.print((int)gGpsSatsUsed); c.print('/'); c.print((int)gGpsSatsView);
+	c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	htmlFooter(c);
+}
+
+static void printSelectU8(EthernetClient& c,const char* name,uint8_t cur,uint8_t count,const char* const* labels)
+{
+	c.print(F("<select name='")); c.print(name); c.print(F("'>"));
+	for (uint8_t i = 0; i < count; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if (i == cur) c.print(F(" selected"));
+		c.print(F(">"));
+		WebUI::htmlEscPrint(c,labels[i]);
+		c.print(F("</option>"));
+	}
+	c.print(F("</select>"));
+}
+
+static void printIpInput(EthernetClient& c,const char* name,const uint8_t ip[4])
+{
+	c.print(F("<input name='"));
+	c.print(name);
+	c.print(F("' value='"));
+	c.print(ip[0]); c.print('.'); c.print(ip[1]); c.print('.'); c.print(ip[2]); c.print('.'); c.print(ip[3]);
+	c.print(F("'>"));
+}
+
+void WebUI::pageCfg(EthernetClient& c)
+{
+	LanIfStore::IfConfig if1{},if2{};
+	bool okIf1 = lanStore.load(LanIfStore::IF1,if1,true);
+	if (!okIf1) LanIfStore::defaults(LanIfStore::IF1,if1);
+	bool okIf2 = lanStore.load(LanIfStore::IF2,if2,true);
+	if (!okIf2) LanIfStore::defaults(LanIfStore::IF2,if2);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+	htmlHeader(c,F("НАСТРОЙКИ"));
+
+	c.print(F("<form method='post' action='/cfg/save'>"));
+
+	// TZ
+	c.print(F("<div class='box'><h3>Часовые пояса</h3>"));
+	c.print(F("<p>Часовой пояс (-12..14):<input name='tzTarget' value='"));
+	c.print((int)cfg.tzTargetHours);
+	c.print(F("'></p>"));
+	c.print(F("<p>Часовой пояс NTP (-12..14):<input name='tzNtp' value='"));
+	c.print((int)cfg.tzNtpHours);
+	c.print(F("'></p>"));
+	c.print(F("</div>"));
+
+	// multi-sources
+	c.print(F("<div class='box'><h3>Источники синхронизации (можно несколько)</h3>"));
+	c.print(F("<p><small>Приоритет:GPS → INTERNET1 → INTERNET2 → GSM</small></p><p>"));
+
+	auto cb = [&](const char* name,const char* label,bool checked) {
+		c.print(F("<label><input type='checkbox' name='"));
+		c.print(name);
+		c.print(F("' value='1'"));
+		if (checked) c.print(F(" checked"));
+		c.print(F("> "));
+		c.print(label);
+		c.print(F("</label> "));
+	};
+
+	cb("src_gps","GPS",syncData.gpsEnable);
+	cb("src_net1","INTERNET 1",syncData.netEnable);
+	cb("src_net2","INTERNET 2",syncData.net2Enable);
+	cb("src_gsm","GSM",syncData.gsmEnable);
+
+	c.print(F("</p></div>"));
+
+	// INTERNET1/2 store (как было)
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 1 (EEPROM)</h3>"));
+	c.print(F("<p>DHCP:<select name='if1_dhcp'>"));
+	c.print(F("<option value='1'")); if (if1.dhcp) c.print(F(" selected")); c.print(F(">ВКЛ</option>"));
+	c.print(F("<option value='0'")); if (!if1.dhcp) c.print(F(" selected")); c.print(F(">ВЫКЛ</option>"));
+	c.print(F("</select></p>"));
+	c.print(F("<p>NTP-сервер:")); printSelectU8(c,"if1_ntpIdx",if1.ntpIdx % 5,5,kNtpIpStr); c.print(F("</p>"));
+	c.print(F("<p>Период:")); printSelectU8(c,"if1_perIdx",if1.periodIdx % 6,6,kPeriodsName); c.print(F("</p>"));
+	c.print(F("<p>IP:")); printIpInput(c,"if1_ip",if1.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"if1_mask",if1.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"if1_gw",if1.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"if1_dns",if1.dns); c.print(F("</p>"));
+	c.print(F("</div>"));
+
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 2 (EEPROM)</h3>"));
+	c.print(F("<p>DHCP:<select name='if2_dhcp'>"));
+	c.print(F("<option value='1'")); if (if2.dhcp) c.print(F(" selected")); c.print(F(">ВКЛ</option>"));
+	c.print(F("<option value='0'")); if (!if2.dhcp) c.print(F(" selected")); c.print(F(">ВЫКЛ</option>"));
+	c.print(F("</select></p>"));
+	c.print(F("<p>NTP-сервер:")); printSelectU8(c,"if2_ntpIdx",if2.ntpIdx % 5,5,kNtpIpStr); c.print(F("</p>"));
+	c.print(F("<p>Период:")); printSelectU8(c,"if2_perIdx",if2.periodIdx % 6,6,kPeriodsName); c.print(F("</p>"));
+	c.print(F("<p>IP:")); printIpInput(c,"if2_ip",if2.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"if2_mask",if2.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"if2_gw",if2.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"if2_dns",if2.dns); c.print(F("</p>"));
+	c.print(F("</div>"));
+
+	// WEB password change
+	c.print(F("<div class='box'><h3>WEB-доступ (пароль)</h3>"));
+	c.print(F("<p>Сменить пароль:</p>"));
+	c.print(F("<p>Старый пароль:<input class='pw' type='password' name='web_old'></p>"));
+	c.print(F("<p>Новый пароль:<input class='pw' type='password' name='web_new'></p>"));
+	c.print(F("<p><small>Если поля пустые — пароль не меняется.</small></p>"));
+	c.print(F("</div>"));
+
+	c.print(F("<p><button type='submit'>СОХРАНИТЬ + ПРИМЕНИТЬ</button></p>"));
+	c.print(F("</form>"));
+
+	htmlFooter(c);
+}
+
+void WebUI::pageGsm(EthernetClient& c)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+	htmlHeader(c,F("НАСТРОЙКИ GSM"));
+
+	static const char* kGsmProviders[5] = { "МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2" };
+	static const char* kPeriodsRu[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+	c.print(F("<div class='box'><h3>Статус GSM</h3>"));
+	c.print(F("Регистрация:<code>")); c.print(gNetRegistered ? "ДА" :"НЕТ"); c.print(F("</code><br>"));
+	c.print(F("RSSI:<code>")); c.print((int)gRssiDbm); c.print(F(" dBm</code><br>"));
+	c.print(F("Уровень:<code>")); c.print((int)gSignalBars); c.print(F("/5</code>"));
+	c.print(F("</div>"));
+
+	c.print(F("<div class='box'><h3>Параметры GSM</h3>"));
+	c.print(F("<form method='post' action='/gsm/save'>"));
+
+	c.print(F("<p>Включить GSM:<select name='gsm_en'>"));
+	c.print(F("<option value='1'")); if (syncData.gsmEnable) c.print(F(" selected")); c.print(F(">ВКЛ</option>"));
+	c.print(F("<option value='0'")); if (!syncData.gsmEnable) c.print(F(" selected")); c.print(F(">ВЫКЛ</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>Оператор:<select name='gsm_op'>"));
+	for (uint8_t i = 0; i < 5; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if ((syncData.gsmProviderIdx % 5) == i) c.print(F(" selected"));
+		c.print(F(">")); htmlEscPrint(c,kGsmProviders[i]); c.print(F("</option>"));
+	}
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>Период:<select name='gsm_per'>"));
+	for (uint8_t i = 0; i < 6; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if ((syncData.gsmPeriodIdx % 6) == i) c.print(F(" selected"));
+		c.print(F(">")); htmlEscPrint(c,kPeriodsRu[i]); c.print(F("</option>"));
+	}
+	c.print(F("</select></p>"));
+
+	c.print(F("<p><button type='submit'>СОХРАНИТЬ</button></p>"));
+	c.print(F("</form></div>"));
+
+	htmlFooter(c);
+}
+
+void WebUI::pageNotFound(EthernetClient& c)
+{
+	sendHeader(c,404,F("text/plain; charset=utf-8"));
+	c.print(F("404 Не найдено"));
+}
+
+// ================== JSON ==================
+static void jsonStr(EthernetClient& c,const char* s)
+{
+	c.print('"');
+	for (; *s; s++) {
+		if (*s == '"' || *s == '\\') { c.print('\\'); c.print(*s); }
+		else if (*s == '\n') c.print(F("\\n"));
+		else if (*s == '\r') c.print(F("\\r"));
+		else c.print(*s);
+	}
+	c.print('"');
+}
+
+void WebUI::apiStatus(EthernetClient& c)
+{
+	sendHeader(c,200,F("application/json; charset=utf-8"));
+
+	Internet2Client::Status st{};
+	bool ok2 = internet2.readStatus(st);
+
+	String ip1s = ntpLan.localIP().toString();
+	String ip2s = (ok2 ? st.ip :IPAddress(0,0,0,0)).toString();
+
+	c.print(F("{"));
+	c.print(F("\"ip1\":")); jsonStr(c,ip1s.c_str()); c.print(F(","));
+	c.print(F("\"ip2\":")); jsonStr(c,ip2s.c_str()); c.print(F(","));
+	c.print(F("\"tz_target\":")); c.print((int)cfg.tzTargetHours); c.print(F(","));
+	c.print(F("\"gps_en\":")); c.print(syncData.gpsEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"net1_en\":")); c.print(syncData.netEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"net2_en\":")); c.print(syncData.net2Enable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"gsm_en\":")); c.print(syncData.gsmEnable ? F("true") :F("false"));
+	c.print(F("}"));
+}
+
+void WebUI::apiConfig(EthernetClient& c)
+{
+	LanIfStore::IfConfig if1{},if2{};
+	bool okIf1 = lanStore.load(LanIfStore::IF1,if1,true);
+	if (!okIf1) LanIfStore::defaults(LanIfStore::IF1,if1);
+	bool okIf2 = lanStore.load(LanIfStore::IF2,if2,true);
+	if (!okIf2) LanIfStore::defaults(LanIfStore::IF2,if2);
+
+	sendHeader(c,200,F("application/json; charset=utf-8"));
+
+	c.print(F("{"));
+	c.print(F("\"tz_target\":")); c.print((int)cfg.tzTargetHours); c.print(F(","));
+	c.print(F("\"tz_ntp\":")); c.print((int)cfg.tzNtpHours); c.print(F(","));
+
+	c.print(F("\"sources\":{"));
+	c.print(F("\"gps\":")); c.print(syncData.gpsEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"net1\":")); c.print(syncData.netEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"net2\":")); c.print(syncData.net2Enable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"gsm\":")); c.print(syncData.gsmEnable ? F("true") :F("false"));
+	c.print(F("}"));
+
+	c.print(F("}"));
+}
+
+// ================== Actions ==================
+void WebUI::actionLogin(EthernetClient& c,char* params)
+{
+	const char* pw = params ? findParam(params,"pw") :nullptr;
+	const char* next = params ? findParam(params,"next") :nullptr;
+	if (!next || !next[0]) next = "/";
+
+	PwRec p{};
+	bool existed = false;
+	pwLoadOrDefaults(p,existed);
+
+	if (!pw || !pw[0]) { sendRedirect(c,"/login"); return; }
+
+	// сравнение
+	if (strncmp(pw,p.pass,15) == 0 && strlen(pw) == strlen(p.pass)) {
+		doLogin(c,next);
+	} else {
+		sendRedirect(c,"/login");
+	}
+}
+
+void WebUI::actionCfgSave(EthernetClient& c,char* params)
+{
+	if (!params) { sendRedirect(c,"/cfg"); return; }
+
+	// TZ
+	int8_t tzT,tzN;
+	if (parseI8(findParam(params,"tzTarget"),tzT,-12,14)) {
+		cfg.tzTargetHours = tzT;
+		(void)ee.writeTzTargetHours(cfg.tzTargetHours);
+	}
+	if (parseI8(findParam(params,"tzNtp"),tzN,-12,14)) {
+		cfg.tzNtpHours = tzN;
+		(void)ee.writeTzNtpHours(cfg.tzNtpHours);
+	}
+
+	// Multi-sources
+	syncData.gpsEnable = parseCheckbox(params,"src_gps") ? 1 :0;
+	syncData.netEnable = parseCheckbox(params,"src_net1") ? 1 :0;
+	syncData.net2Enable = parseCheckbox(params,"src_net2") ? 1 :0;
+	syncData.gsmEnable = parseCheckbox(params,"src_gsm") ? 1 :0;
+
+	bool okS = syncStore.save(syncData);
+	Serial.print("Web:syncStore.save="); Serial.println(okS);
+
+	// INTERNET1/2 store
+	LanIfStore::IfConfig if1{},if2{};
+	lanStore.load(LanIfStore::IF1,if1,false);
+	lanStore.load(LanIfStore::IF2,if2,false);
+
+	bool b;
+	uint8_t u8;
+	uint8_t ip[4];
+
+	if (parseBool01(findParam(params,"if1_dhcp"),b)) if1.dhcp = b ? 1 :0;
+	if (parseU8(findParam(params,"if1_ntpIdx"),u8,0,4)) if1.ntpIdx = u8;
+	if (parseU8(findParam(params,"if1_perIdx"),u8,0,5)) if1.periodIdx = u8;
+	if (parseIp4(findParam(params,"if1_ip"),ip)) memcpy(if1.ip,ip,4);
+	if (parseIp4(findParam(params,"if1_mask"),ip)) memcpy(if1.mask,ip,4);
+	if (parseIp4(findParam(params,"if1_gw"),ip)) memcpy(if1.gw,ip,4);
+	if (parseIp4(findParam(params,"if1_dns"),ip)) memcpy(if1.dns,ip,4);
+
+	if (parseBool01(findParam(params,"if2_dhcp"),b)) if2.dhcp = b ? 1 :0;
+	if (parseU8(findParam(params,"if2_ntpIdx"),u8,0,4)) if2.ntpIdx = u8;
+	if (parseU8(findParam(params,"if2_perIdx"),u8,0,5)) if2.periodIdx = u8;
+	if (parseIp4(findParam(params,"if2_ip"),ip)) memcpy(if2.ip,ip,4);
+	if (parseIp4(findParam(params,"if2_mask"),ip)) memcpy(if2.mask,ip,4);
+	if (parseIp4(findParam(params,"if2_gw"),ip)) memcpy(if2.gw,ip,4);
+	if (parseIp4(findParam(params,"if2_dns"),ip)) memcpy(if2.dns,ip,4);
+
+	lanStore.save(LanIfStore::IF1,if1,true);
+	lanStore.save(LanIfStore::IF2,if2,true);
+
+	applyInternet1FromStore();
+	applyInternet2FromStore();
+
+	// смена WEB-пароля (если заданы оба)
+	const char* oldp = findParam(params,"web_old");
+	const char* newp = findParam(params,"web_new");
+	if (oldp && newp && oldp[0] && newp[0]) {
+		PwRec cur{};
+		bool existed = false;
+		pwLoadOrDefaults(cur,existed);
+
+		if (strcmp(oldp,cur.pass) == 0) {
+			PwRec nw{};
+			memset(&nw,0,sizeof(nw));
+			strncpy(nw.pass,newp,sizeof(nw.pass) - 1);
+			(void)pwSave(nw);
+
+			// после смены пароля — сбросим сессию
+			_sessionValid = false;
+			_sessionToken = 0;
+			sendClearCookie(c,"/login");
+			return;
+		}
+	}
+
+	planner.onSettingsChanged();
+	sendRedirect(c,"/cfg");
+}
+
+void WebUI::actionGsmSave(EthernetClient& c,char* params)
+{
+	if (!params) { sendRedirect(c,"/gsm"); return; }
+
+	bool en;
+	uint8_t u8;
+
+	if (parseBool01(findParam(params,"gsm_en"),en)) syncData.gsmEnable = en ? 1 :0;
+	if (parseU8(findParam(params,"gsm_op"),u8,0,4)) syncData.gsmProviderIdx = u8;
+	if (parseU8(findParam(params,"gsm_per"),u8,0,5)) syncData.gsmPeriodIdx = u8;
+
+	bool okS = syncStore.save(syncData);
+	Serial.print("Web:syncStore.save="); Serial.println(okS);
+
+	planner.onSettingsChanged();
+	sendRedirect(c,"/gsm");
+}
+4) Что сделать в setup(),чтобы перестало “само откатываться”
+Покажите ваш актуальный фрагмент setup() со syncStore.load(...). Но базовое правило:
+
+НЕ делайте auto-save defaults при load()==false
+распечатайте,загрузилось ли вообще
+Рекомендуемый блок:
+
+cpp Копировать
+syncStore.defaults(syncData);
+
+if (!syncStore.begin()) {
+ Serial.println("SyncSourcesStore:EEPROM NACK");
+} else {
+ bool ok = syncStore.load(syncData);
+ Serial.print("SyncSourcesStore.load="); Serial.println(ok);
+ Serial.print("loaded gps="); Serial.print(syncData.gpsEnable);
+ Serial.print(" net1="); Serial.print(syncData.netEnable);
+ Serial.print(" net2="); Serial.print(syncData.net2Enable);
+ Serial.print(" gsm="); Serial.println(syncData.gsmEnable);
+ // ВАЖНО:тут НЕ сохраняем defaults
+}
+5) Следующий шаг от вас (чтобы добить “не сохраняется” окончательно)
+Пришлите ваш текущий SyncSourcesStore.h/.cpp (который реально в проекте) — особенно save() (есть ли commit+verify).
+Пришлите кусок setup() с syncStore.begin/load.
+Скажите:после нажатия SAVE в меню или в вебе что пишет Serial по строкам Web:syncStore.save=... и (если добавите)
+ SyncSourcesStore.load=....
+После этого я скажу точно:это не пишет (I2C/EEPROM),или пишет,но вы сами перетираете при старте/в другом месте.
+
+///////////////////////////////////////**************************************---------------------------
+
+1) Про “BasicAuth+user/pass”:ничего не меняем по механике,меняем только «человеческое» название
+Чтобы людям было понятно,в UI/WEB вместо “BasicAuth / user/pass” пишем,например:
+
+“Доступ к WEB‑интерфейсу (логин/пароль)”
+Поля:“Логин” и “Пароль”
+(мелким текстом можно):“Авторизация HTTP (Basic)”
+Где менять у вас
+В WebUI.cpp в pageCfg() сейчас блок:
+
+cpp Копировать
+// WEB auth
+c.print(F("<div class='box'><h3>WEB-доступ</h3>"));
+c.print(F("<p>Текущий логин:<code>")); c.print(a.user); ...
+c.print(F("<p>Новый логин:<input class='pw' name='web_user' value=''></p>"));
+c.print(F("<p>Новый пароль:<input class='pw' type='password' name='web_pass' value=''></p>"));
+Замените на:
+
+cpp Копировать
+c.print(F("<div class='box'><h3>Доступ к WEB-интерфейсу (логин/пароль)</h3>"));
+c.print(F("<p>Текущий логин:<code>")); c.print(a.user); c.print(F("</code></p>"));
+c.print(F("<p>Новый логин:<input class='pw' name='web_user' value=''></p>"));
+c.print(F("<p>Новый пароль:<input class='pw' type='password' name='web_pass' value=''></p>"));
+c.print(F("<p><small>Введите оба поля,чтобы изменить учетные данные.</small></p>"));
+c.print(F("</div>"));
+Этого достаточно,чтобы термин “BasicAuth” вообще не светился пользователю.
+
+2) Почему “не сохраняется источник синхронизации” — у вас есть гарантированный «самозатиратель»
+В setup() у вас сейчас:
+
+cpp Копировать
+if (!syncStore.load(syncData)) {
+ Serial.println(F("SyncSourcesStore:no valid data ... using defaults"));
+ (void)syncStore.save(syncData); // <-- ВОТ ЭТО
+}
+Это опасно:если при старте по любой причине load() не смог прочитать (глитч I2C на питании,шина 
+занята,EEPROM еще не готова и т.п.),вы перезаписываете EEPROM дефолтами (gsmEnable=1,остальное 0). 
+В итоге пользователь сохраняет,а при следующем старте может снова “не прочиталось” → и всё “как будто не сохраняется”.
+
+Исправление:НЕ делать auto-save defaults при load()==false
+Замените блок на такой:
+
+cpp Копировать
+// Stores (SyncSourcesStore:strict)
+syncStore.defaults(syncData);
+
+if (!syncStore.begin()) {
+ Serial.println(F("SyncSourcesStore:EEPROM(0x50) not found (I2C NACK)"));
+} else {
+ bool ok = syncStore.load(syncData);
+ Serial.print(F("SyncSourcesStore.load=")); Serial.println(ok ? F("OK") :F("FAIL"));
+ // ВАЖНО:не сохраняем defaults автоматически
+}
+После этого “самозатирание” исчезнет.
+
+3) Почему в Serial “только INTERNET1 DHCP begin…” при “СОХРАНИТЬ+ПРИМЕНИТЬ” (WEB)
+Это нормально:у вас в actionCfgSave() в конце вызывается:
+
+cpp Копировать
+applyInternet1FromStore();
+applyInternet2FromStore();
+И именно applyInternet1FromStore() печатает DHCP‑логи.
+
+Но у вас нет ни одного Serial.print про syncStore.save(),поэтому сейчас вы не видите — сохранилось оно или нет.
+
+Добавьте 3 строки в WebUI.cpp (actionCfgSave)
+Сразу после syncStore.save(syncData);:
+
+cpp Копировать
+bool okS = syncStore.save(syncData);
+Serial.print(F("Web:SyncSources save=")); Serial.println(okS);
+
+SyncSourcesStore::Data rd;
+bool okL = syncStore.load(rd);
+Serial.print(F("Web:SyncSources load=")); Serial.println(okL);
+Serial.print(F("Web:rd gps=")); Serial.print(rd.gpsEnable);
+Serial.print(F(" net1=")); Serial.print(rd.netEnable);
+Serial.print(F(" net2=")); Serial.print(rd.net2Enable);
+Serial.print(F(" gsm=")); Serial.println(rd.gsmEnable);
+Тогда станет ясно,это не пишет или пишет,но потом затирается.
+
+4) “Переделать на возможность синхронизации от нескольких источников” + фиксированный приоритет
+Состояние сейчас
+В SyncSourcesStore::Data уже есть отдельные gpsEnable/netEnable/net2Enable/gsmEnable — это уже модель “несколько источников”.
+Но ваш WEB сейчас делает “выберите один”:
+cpp Копировать
+syncData.gpsEnable = 0;
+syncData.netEnable = 0;
+syncData.net2Enable = 0;
+syncData.gsmEnable = 0;
+// потом включает один по src
+Нужно:
+В WEB сделать checkbox вместо radio
+В планировщике (TimeSyncPlanner) выбрать по приоритету: GPS → INTERNET1 → INTERNET2 → GSM
+WEB:правки в pageCfg() (HTML)
+Замените блок “выберите один” на:
+
+cpp Копировать
+c.print(F("<div class='box'><h3>Источники синхронизации (можно несколько)</h3>"));
+c.print(F("<p><small>Приоритет:GPS → INTERNET1 → INTERNET2 → GSM</small></p>"));
+c.print(F("<label><input type='checkbox' name='src_gps' value='1'"));
+if (syncData.gpsEnable) c.print(F(" checked"));
+c.print(F("> GPS</label> "));
+
+c.print(F("<label><input type='checkbox' name='src_net1' value='1'"));
+if (syncData.netEnable) c.print(F(" checked"));
+c.print(F("> INTERNET 1</label> "));
+
+c.print(F("<label><input type='checkbox' name='src_net2' value='1'"));
+if (syncData.net2Enable) c.print(F(" checked"));
+c.print(F("> INTERNET 2</label> "));
+
+c.print(F("<label><input type='checkbox' name='src_gsm' value='1'"));
+if (syncData.gsmEnable) c.print(F(" checked"));
+c.print(F("> GSM</label> "));
+c.print(F("</div>"));
+WEB:правки в actionCfgSave() (парсинг)
+Вместо radio src:
+
+cpp Копировать
+syncData.gpsEnable = (findParam(params,"src_gps") ? 1 :0);
+syncData.netEnable = (findParam(params,"src_net1") ? 1 :0);
+syncData.net2Enable = (findParam(params,"src_net2") ? 1 :0);
+syncData.gsmEnable = (findParam(params,"src_gsm") ? 1 :0);
+
+syncStore.save(syncData);
+Планировщик (TimeSyncPlanner)
+Вы просите приоритет именно: GPS → INTERNET1 → INTERNET2 → GSM.
+
+Мне нужен ваш TimeSyncPlanner.cpp (или хотя бы функция выбора источника),и я внесу правку точно по вашему API. 
+Сейчас у вас в комментарии в loop() приоритет другой,так что там точно надо менять.
+
+5) Минимум,который надо сделать прямо сейчас,чтобы “сохранение” стало стабильным
+Убрать из setup() auto-save defaults при load()==false (см. пункт 2).
+Добавить Serial‑диагностику save/load в Menu.cpp::commitSave() и WebUI.cpp::actionCfgSave() (см. пункт 3).
+После этого вы сразу увидите,что происходит:
+save=false → проблема записи I2C (но у вас AT24C128,и save с verify обычно ловит)
+save=true/load=true,но после перезагрузки “старое” → кто-то на старте затирает (в вашем случае это был auto-save defaults)
+Если пришлёте TimeSyncPlanner.cpp,я сделаю приоритет GPS → INTERNET1 → INTERNET2 → GSM “под ключ” (кодом,не словами).
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+
+Ниже — обновлённые WebUI.h / WebUI.cpp целиком. Изменения:
+
+BasicAuth + user/pass оставлены как есть (хранение в EEPROM тоже).
+В интерфейсе переименовано на понятное людям:«Доступ к WEB‑интерфейсу (логин/пароль)»,поля «Логин»/«Пароль». 
+Термин “BasicAuth” пользователю не показываем.
+В /cfg источники синхронизации теперь можно включать несколько (checkbox),без “выберите один”.
+Добавлены Serial‑логи сохранения SyncSources в actionCfgSave() и actionGsmSave() (чтобы увидеть,пишет ли EEPROM).
+Важно:у вас в setup() всё ещё есть автосохранение дефолтов при load()==false,это может “перезатирать” сохранённые источники. 
+Ниже после файлов напомню,как исправить.
+
+WebUI.h (обновлённый)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Ethernet_Generic.hpp> // только декларации (без реализации)
+
+class WebUI
+{
+public:
+	explicit WebUI(uint16_t port = 80);
+
+	void begin(); // поднимет server + создаст дефолтную auth запись в EEPROM при отсутствии
+	void tick();
+
+	static void htmlEscPrint(EthernetClient& c,const char* s);
+
+private:
+	EthernetServer _srv;
+
+	// ------------ HTTP ------------
+	void handleClient(EthernetClient& c);
+
+	bool readLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs);
+
+	// читает заголовки,вытаскивает BasicAuth(b64) и Content-Length
+	bool readHeaders(EthernetClient& c,
+		char* authB64,size_t authB64N,
+		size_t& contentLength,
+		uint32_t timeoutMs);
+
+	// читает POST body (x-www-form-urlencoded) по Content-Length
+	bool readBody(EthernetClient& c,char* out,size_t outN,size_t contentLength,uint32_t timeoutMs);
+
+	bool checkAuth(const char* authB64) const;
+	void sendUnauthorized(EthernetClient& c);
+
+	static bool startsWithI(const char* s,const char* pref); // case-insensitive
+	static bool startsWith(const char* s,const char* pref);
+
+	static void urlDecodeInPlace(char* s);
+	static const char* findParam(char* query,const char* key);
+	static bool hasParam(char* query,const char* key); // <-- ДОБАВЛЕНО (для checkbox)
+
+	static bool parseBool01(const char* s,bool& out);
+	static bool parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV);
+	static bool parseI8(const char* s,int8_t& out,int8_t minV,int8_t maxV);
+	static bool parseIp4(const char* s,uint8_t out[4]);
+
+	void sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct);
+	void sendRedirect(EthernetClient& c,const char* location);
+
+	// ------------ Pages ------------
+	void pageStatus(EthernetClient& c);
+	void pageCfg(EthernetClient& c);
+	void pageGsm(EthernetClient& c);
+	void pageNotFound(EthernetClient& c);
+
+	// ------------ JSON ------------
+	void apiStatus(EthernetClient& c);
+	void apiConfig(EthernetClient& c);
+
+	// ------------ Actions ------------
+	// params = pointer на буфер с "a=1&b=2" (из query или body)
+	void actionCfgSave(EthernetClient& c,char* params);
+	void actionGsmSave(EthernetClient& c,char* params);
+
+	// ------------ EEPROM auth (0x50 / 0x0190..) ------------
+	// ХРАНИМ как раньше:user/pass для HTTP BasicAuth
+	struct AuthRec {
+		char user[32];
+		char pass[32];
+	};
+
+	bool authLoad(AuthRec& out) const;
+	bool authSave(const AuthRec& in);
+	void authLoadOrDefaults(AuthRec& out,bool& existed) const;
+
+	// ------------ low-level EEPROM I2C helpers ------------
+	static constexpr uint8_t EEPROM_ADDR = 0x50;
+	static constexpr uint8_t EEPROM_PAGE = 64;
+
+	bool eepromRead(uint16_t memAddr,uint8_t* out,size_t len) const;
+	bool eepromWrite(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool eepromWritePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool eepromWaitReady(uint32_t timeoutMs = 50);
+
+	static void trimSpaces(char* s);
+
+	// ------------ Base64 ------------
+	static bool base64Encode(char* out,size_t outN,const uint8_t* in,size_t inN);
+
+	// helpers
+	static void printIpOct(EthernetClient& c,const uint8_t ip[4]);
+};
+WebUI.cpp (обновлённый)
+cpp Копировать
+#include "WebUI.h"
+
+#include <IPAddress.h>
+#include <Wire.h>
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+// проектные заголовки
+#include "LanIfStore.h"
+#include "SyncSourcesStore.h"
+#include "AT24C128Settings.h"
+#include "TimeSyncPlanner.h"
+#include "NetFeed.h"
+#include "Internet2Client.h"
+#include "NtpLanService_Generic.h"
+
+// --- externs из проекта ---
+extern LanIfStore lanStore;
+
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+
+extern AT24C128Settings ee;
+extern AT24C128Settings::Config cfg;
+
+extern TimeSyncPlanner planner;
+
+extern void applyInternet1FromStore();
+extern void applyInternet2FromStore();
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GSM globals
+extern bool gNetRegistered;
+extern int16_t gRssiDbm;
+extern uint8_t gSignalBars;
+
+// GPS globals
+extern uint8_t gGpsSatsUsed;
+extern uint8_t gGpsSatsView;
+extern bool gGpsFix;
+
+// --- списки ---
+static const char* kNtpIpStr[5] = {
+	"162.159.200.123",
+	"162.159.200.1",
+	"129.6.15.28",
+	"132.163.96.1",
+	"216.239.35.0"
+};
+
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// ================== ctor ==================
+WebUI::WebUI(uint16_t port) :_srv(port) {}
+
+// ================== helpers ==================
+bool WebUI::startsWith(const char* s,const char* pref)
+{
+	while (*pref) { if (*s++ != *pref++) return false; }
+	return true;
+}
+
+bool WebUI::startsWithI(const char* s,const char* pref)
+{
+	auto up = [](char c)->char {
+		if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
+		return c;
+	};
+	while (*pref) {
+		if (up(*s++) != up(*pref++)) return false;
+	}
+	return true;
+}
+
+void WebUI::htmlEscPrint(EthernetClient& c,const char* s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '&':c.print(F("&amp;")); break;
+		case '<':c.print(F("&lt;")); break;
+		case '>':c.print(F("&gt;")); break;
+		case '"':c.print(F("&quot;")); break;
+		default:c.write(*s); break;
+		}
+	}
+}
+
+void WebUI::printIpOct(EthernetClient& c,const uint8_t ip[4])
+{
+	c.print(ip[0]); c.print('.');
+	c.print(ip[1]); c.print('.');
+	c.print(ip[2]); c.print('.');
+	c.print(ip[3]);
+}
+
+void WebUI::trimSpaces(char* s)
+{
+	while (*s == ' ' || *s == '\t') memmove(s,s + 1,strlen(s));
+	size_t n = strlen(s);
+	while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) {
+		s[n - 1] = 0;
+		n--;
+	}
+}
+
+// ================== Base64 ==================
+bool WebUI::base64Encode(char* out,size_t outN,const uint8_t* in,size_t inN)
+{
+	static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	size_t need = 4 * ((inN + 2) / 3) + 1;
+	if (outN < need) return false;
+
+	size_t wi = 0;
+	for (size_t i = 0; i < inN; i += 3)
+	{
+		uint32_t v = 0;
+		int rem = (int)(inN - i);
+		if (rem >= 3) {
+			v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | (uint32_t)in[i + 2];
+			out[wi++] = T[(v >> 18) & 63];
+			out[wi++] = T[(v >> 12) & 63];
+			out[wi++] = T[(v >> 6) & 63];
+			out[wi++] = T[v & 63];
+		}
+		else if (rem == 2) {
+			v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8);
+			out[wi++] = T[(v >> 18) & 63];
+			out[wi++] = T[(v >> 12) & 63];
+			out[wi++] = T[(v >> 6) & 63];
+			out[wi++] = '=';
+		}
+		else {
+			v = ((uint32_t)in[i] << 16);
+			out[wi++] = T[(v >> 18) & 63];
+			out[wi++] = T[(v >> 12) & 63];
+			out[wi++] = '=';
+			out[wi++] = '=';
+		}
+	}
+	out[wi] = 0;
+	return true;
+}
+
+// ================== EEPROM low level (0x50) ==================
+bool WebUI::eepromWaitReady(uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs) {
+		Wire.beginTransmission(EEPROM_ADDR);
+		if (Wire.endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool WebUI::eepromRead(uint16_t memAddr,uint8_t* out,size_t len) const
+{
+	Wire.beginTransmission(EEPROM_ADDR);
+	Wire.write((uint8_t)(memAddr >> 8));
+	Wire.write((uint8_t)(memAddr & 0xFF));
+	if (Wire.endTransmission(false) != 0) return false;
+
+	size_t got = Wire.requestFrom((int)EEPROM_ADDR,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++) {
+		int v = Wire.read();
+		if (v < 0) return false;
+		out[i] = (uint8_t)v;
+	}
+	return true;
+}
+
+bool WebUI::eepromWritePage(uint16_t memAddr,const uint8_t* data,size_t len)
+{
+	Wire.beginTransmission(EEPROM_ADDR);
+	Wire.write((uint8_t)(memAddr >> 8));
+	Wire.write((uint8_t)(memAddr & 0xFF));
+	for (size_t i = 0; i < len; i++) Wire.write(data[i]);
+	return (Wire.endTransmission() == 0);
+}
+
+bool WebUI::eepromWrite(uint16_t memAddr,const uint8_t* data,size_t len)
+{
+	size_t off = 0;
+	while (off < len)
+	{
+		uint16_t a = (uint16_t)(memAddr + off);
+		uint8_t pageOff = (uint8_t)(a % EEPROM_PAGE);
+		size_t chunk = min((size_t)(EEPROM_PAGE - pageOff),len - off);
+
+		if (!eepromWritePage(a,data + off,chunk)) return false;
+		if (!eepromWaitReady(50)) return false;
+
+		off += chunk;
+	}
+	return true;
+}
+
+// ================== Auth store (0x0190..) ==================
+// ХРАНИМ как раньше:user/pass для BasicAuth.
+// UI просто называем "логин/пароль".
+static constexpr uint16_t AUTH_BASE = 0x0190;
+static constexpr uint16_t AUTH_MAGIC_ADDR = AUTH_BASE + 0; // u16
+static constexpr uint16_t AUTH_VER_ADDR = AUTH_BASE + 2; // u8
+static constexpr uint16_t AUTH_DATA_ADDR = AUTH_BASE + 4; // user[32],pass[32]
+static constexpr uint16_t AUTH_MAGIC = 0x4157; // 'W''A'
+static constexpr uint8_t AUTH_VER = 1;
+
+bool WebUI::authLoad(AuthRec& out) const
+{
+	uint8_t b[2];
+	if (!eepromRead(AUTH_MAGIC_ADDR,b,2)) return false;
+	uint16_t mg = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+	if (mg != AUTH_MAGIC) return false;
+
+	uint8_t ver = 0;
+	if (!eepromRead(AUTH_VER_ADDR,&ver,1)) return false;
+	if (ver != AUTH_VER) return false;
+
+	uint8_t raw[64];
+	if (!eepromRead(AUTH_DATA_ADDR,raw,sizeof(raw))) return false;
+
+	memcpy(out.user,raw + 0,32);
+	memcpy(out.pass,raw + 32,32);
+	out.user[31] = 0;
+	out.pass[31] = 0;
+	trimSpaces(out.user);
+	trimSpaces(out.pass);
+	return true;
+}
+
+bool WebUI::authSave(const AuthRec& in)
+{
+	AuthRec w = in;
+	w.user[31] = 0;
+	w.pass[31] = 0;
+
+	// commit-порядок:data -> ver -> magic
+	uint8_t raw[64];
+	memset(raw,0,sizeof(raw));
+	strncpy((char*)raw,w.user,31);
+	strncpy((char*)raw + 32,w.pass,31);
+
+	if (!eepromWrite(AUTH_DATA_ADDR,raw,sizeof(raw))) return false;
+
+	uint8_t ver = AUTH_VER;
+	if (!eepromWrite(AUTH_VER_ADDR,&ver,1)) return false;
+
+	uint8_t mg[2] = { (uint8_t)(AUTH_MAGIC & 0xFF),(uint8_t)(AUTH_MAGIC >> 8) };
+	if (!eepromWrite(AUTH_MAGIC_ADDR,mg,2)) return false;
+
+	return true;
+}
+
+void WebUI::authLoadOrDefaults(AuthRec& out,bool& existed) const
+{
+	existed = authLoad(out);
+	if (existed) return;
+
+	memset(&out,0,sizeof(out));
+	strncpy(out.user,"admin",sizeof(out.user) - 1);
+	strncpy(out.pass,"admin",sizeof(out.pass) - 1);
+}
+
+// ================== BasicAuth check ==================
+bool WebUI::checkAuth(const char* authB64) const
+{
+	AuthRec a;
+	bool existed = false;
+	authLoadOrDefaults(a,existed);
+
+	char up[70];
+	snprintf(up,sizeof(up),"%s:%s",a.user,a.pass);
+
+	char b64[120];
+	if (!base64Encode(b64,sizeof(b64),(const uint8_t*)up,strlen(up))) return false;
+
+	return (authB64 && strcmp(authB64,b64) == 0);
+}
+
+void WebUI::sendUnauthorized(EthernetClient& c)
+{
+	c.print(F("HTTP/1.1 401 Unauthorized\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("WWW-Authenticate:Basic realm=\"IVCH\"\r\n"));
+	c.print(F("Content-Type:text/plain; charset=utf-8\r\n\r\n"));
+	c.print(F("Требуется логин/пароль для доступа к WEB-интерфейсу"));
+}
+
+// ================== HTTP parsing ==================
+bool WebUI::readLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	size_t n = 0;
+
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\r') continue;
+			if (ch == '\n') { out[n] = 0; return true; }
+			if (n + 1 < outN) out[n++] = ch;
+		}
+	}
+	out[0] = 0;
+	return false;
+}
+
+bool WebUI::readHeaders(EthernetClient& c,
+	char* authB64,size_t authB64N,
+	size_t& contentLength,
+	uint32_t timeoutMs)
+{
+	if (authB64 && authB64N) authB64[0] = 0;
+	contentLength = 0;
+
+	char line[192];
+	while (true)
+	{
+		if (!readLine(c,line,sizeof(line),timeoutMs)) return false;
+		if (line[0] == 0) return true;
+
+		if (startsWithI(line,"Authorization:"))
+		{
+			const char* p = line + strlen("Authorization:");
+			while (*p == ' ' || *p == '\t') p++;
+
+			if (startsWithI(p,"Basic"))
+			{
+				p += 5;
+				while (*p == ' ' || *p == '\t') p++;
+
+				if (authB64 && authB64N)
+				{
+					strncpy(authB64,p,authB64N - 1);
+					authB64[authB64N - 1] = 0;
+					trimSpaces(authB64);
+				}
+			}
+		}
+		else if (startsWithI(line,"Content-Length:"))
+		{
+			const char* p = line + strlen("Content-Length:");
+			while (*p == ' ' || *p == '\t') p++;
+			long v = strtol(p,nullptr,10);
+			if (v > 0) contentLength = (size_t)v;
+		}
+	}
+}
+
+bool WebUI::readBody(EthernetClient& c,char* out,size_t outN,size_t contentLength,uint32_t timeoutMs)
+{
+	if (!out || outN == 0) return false;
+	if (contentLength == 0) { out[0] = 0; return true; }
+
+	if (contentLength + 1 > outN) return false;
+
+	uint32_t t0 = millis();
+	size_t n = 0;
+	while (n < contentLength && (millis() - t0) < timeoutMs)
+	{
+		while (c.available() && n < contentLength)
+		{
+			out[n++] = (char)c.read();
+		}
+	}
+	if (n != contentLength) return false;
+
+	out[n] = 0;
+	urlDecodeInPlace(out);
+	return true;
+}
+
+// ================== common send helpers ==================
+void WebUI::sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct)
+{
+	if (code == 200) c.print(F("HTTP/1.1 200 OK\r\n"));
+	else if (code == 303) c.print(F("HTTP/1.1 303 See Other\r\n"));
+	else c.print(F("HTTP/1.1 404 Not Found\r\n"));
+
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Content-Type:"));
+	c.print(ct);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendRedirect(EthernetClient& c,const char* location)
+{
+	c.print(F("HTTP/1.1 303 See Other\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Location:"));
+	c.print(location);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::urlDecodeInPlace(char* s)
+{
+	auto hex = [](char c)->int {
+		if (c >= '0' && c <= '9') return c - '0';
+		if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+		if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+		return -1;
+	};
+
+	char* w = s;
+	for (char* r = s; *r; r++) {
+		if (*r == '+') { *w++ = ' '; continue; }
+		if (*r == '%' && r[1] && r[2]) {
+			int hi = hex(r[1]),lo = hex(r[2]);
+			if (hi >= 0 && lo >= 0) {
+				*w++ = (char)((hi << 4) | lo);
+				r += 2;
+				continue;
+			}
+		}
+		*w++ = *r;
+	}
+	*w = 0;
+}
+
+const char* WebUI::findParam(char* query,const char* key)
+{
+	if (!query || !key) return nullptr;
+
+	size_t klen = strlen(key);
+	char* p = query;
+
+	while (p && *p) {
+		char* amp = strchr(p,'&');
+		if (amp) *amp = 0;
+
+		char* eq = strchr(p,'=');
+		if (eq) {
+			*eq = 0;
+			if (strlen(p) == klen && strcmp(p,key) == 0) {
+				char* val = eq + 1;
+				if (amp) *amp = '&';
+				*eq = '=';
+				return val;
+			}
+			*eq = '=';
+		}
+
+		if (amp) {
+			*amp = '&';
+			p = amp + 1;
+		}
+		else break;
+	}
+	return nullptr;
+}
+
+bool WebUI::hasParam(char* query,const char* key)
+{
+	return (findParam(query,key) != nullptr);
+}
+
+bool WebUI::parseBool01(const char* s,bool& out)
+{
+	if (!s) return false;
+	if (strcmp(s,"0") == 0) { out = false; return true; }
+	if (strcmp(s,"1") == 0) { out = true; return true; }
+	return false;
+}
+
+bool WebUI::parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV)
+{
+	if (!s) return false;
+	long v = strtol(s,nullptr,10);
+	if (v < minV || v > maxV) return false;
+	out = (uint8_t)v;
+	return true;
+}
+
+bool WebUI::parseI8(const char* s,int8_t& out,int8_t minV,int8_t maxV)
+{
+	if (!s) return false;
+	long v = strtol(s,nullptr,10);
+	if (v < minV || v > maxV) return false;
+	out = (int8_t)v;
+	return true;
+}
+
+bool WebUI::parseIp4(const char* s,uint8_t out[4])
+{
+	if (!s) return false;
+	int a,b,c,d;
+	if (sscanf(s,"%d.%d.%d.%d",&a,&b,&c,&d) != 4) return false;
+	if ((unsigned)a > 255 || (unsigned)b > 255 || (unsigned)c > 255 || (unsigned)d > 255) return false;
+	out[0] = (uint8_t)a; out[1] = (uint8_t)b; out[2] = (uint8_t)c; out[3] = (uint8_t)d;
+	return true;
+}
+
+// ================== lifecycle ==================
+void WebUI::begin()
+{
+	AuthRec a;
+	bool existed = false;
+	authLoadOrDefaults(a,existed);
+	if (!existed) (void)authSave(a);
+
+	_srv.begin();
+}
+
+void WebUI::tick()
+{
+	EthernetClient c = _srv.available();
+	if (!c) return;
+	handleClient(c);
+}
+
+// ================== routing ==================
+void WebUI::handleClient(EthernetClient& c)
+{
+	char req[192];
+	if (!readLine(c,req,sizeof(req),1500)) { c.stop(); return; }
+
+	bool isGet = startsWith(req,"GET ");
+	bool isPost = startsWith(req,"POST ");
+	if (!isGet && !isPost) { sendHeader(c,404,F("text/plain; charset=utf-8")); c.print(F("Неверный метод")); c.stop(); return; }
+
+	const char* p = isGet ? (req + 4) :(req + 5);
+	char path[160];
+	size_t i = 0;
+	while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+	path[i] = 0;
+
+	// Headers
+	char authB64[140];
+	size_t contentLen = 0;
+	if (!readHeaders(c,authB64,sizeof(authB64),contentLen,1500)) { c.stop(); return; }
+
+	// Auth
+	if (!checkAuth(authB64))
+	{
+		sendUnauthorized(c);
+		c.stop();
+		return;
+	}
+
+	// Query from URL (GET) or Body (POST)
+	char* q = strchr(path,'?');
+	char* params = nullptr;
+
+	static char bodyBuf[700];
+	bodyBuf[0] = 0;
+
+	if (q) { *q = 0; params = q + 1; urlDecodeInPlace(params); }
+
+	if (isPost)
+	{
+		if (contentLen > 0)
+		{
+			if (!readBody(c,bodyBuf,sizeof(bodyBuf),contentLen,2000))
+			{
+				sendHeader(c,200,F("text/plain; charset=utf-8"));
+				c.print(F("Ошибка чтения POST данных (слишком длинно или таймаут)"));
+				c.stop();
+				return;
+			}
+			params = bodyBuf;
+		}
+	}
+
+	// Routes
+	if (isGet && strcmp(path,"/") == 0) pageStatus(c);
+	else if (isGet && strcmp(path,"/cfg") == 0) pageCfg(c);
+	else if (isGet && strcmp(path,"/gsm") == 0) pageGsm(c);
+
+	else if (isGet && strcmp(path,"/api/status") == 0) apiStatus(c);
+	else if (isGet && strcmp(path,"/api/config") == 0) apiConfig(c);
+
+	else if (isPost && strcmp(path,"/cfg/save") == 0) actionCfgSave(c,params);
+	else if (isPost && strcmp(path,"/gsm/save") == 0) actionGsmSave(c,params);
+
+	else pageNotFound(c);
+
+	c.stop();
+}
+
+// ================== HTML header/footer ==================
+static void htmlHeader(EthernetClient& c,const __FlashStringHelper* title)
+{
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"));
+	c.print(F("<title>")); c.print(title); c.print(F("</title>"));
+
+	c.print(F("<style>"
+		"body{font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.25;margin:10px;}"
+		"h2{font-size:16px;margin:8px 0;}"
+		"h3{font-size:14px;margin:10px 0 6px;}"
+		"code{background:#eee;padding:1px 3px;}"
+		"input,select,button{font-size:12px;padding:2px 4px;}"
+		".pw{font-size:18px;padding:4px 6px;}"
+		".nav a{margin-right:10px;}"
+		".box{border:1px solid #ddd;padding:8px;margin:8px 0;}"
+		"</style>"));
+
+	c.print(F("</head><body>"));
+	c.print(F("<div class='nav'>"
+		"<a href='/'>СТАТУС</a>"
+		"<a href='/cfg'>НАСТРОЙКИ</a>"
+		"<a href='/gsm'>GSM</a>"
+		"</div><hr>"));
+}
+
+static void htmlFooter(EthernetClient& c)
+{
+	c.print(F("</body></html>"));
+}
+
+// ================== Pages ==================
+void WebUI::pageStatus(EthernetClient& c)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+	htmlHeader(c,F("СТАТУС"));
+
+	// ИНТЕРНЕТ1
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 1</h3>"));
+	c.print(F("IP:<code>")); c.print(ntpLan.localIP()); c.print(F("</code><br>"));
+	c.print(F("Линк:<code>")); c.print(Ethernet.linkReport()); c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	// ИНТЕРНЕТ2
+	Internet2Client::Status st{};
+	bool ok2 = internet2.readStatus(st);
+
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 2</h3>"));
+	c.print(F("Статус чтения:<code>")); c.print(ok2 ? "OK" :"ОШИБКА"); c.print(F("</code><br>"));
+	c.print(F("IP:<code>")); c.print(ok2 ? st.ip :IPAddress(0,0,0,0)); c.print(F("</code><br>"));
+	c.print(F("Последняя синхронизация:<code>")); c.print((ok2 && st.lastSyncOk) ? "УСПЕХ" :"НЕТ"); c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	// Источники (теперь может быть несколько)
+	c.print(F("<div class='box'><h3>СИНХРОНИЗАЦИЯ</h3>"));
+	c.print(F("<p>Приоритет:<code>GPS → INTERNET1 → INTERNET2 → GSM</code></p>"));
+	c.print(F("<p>Включено:<code>"));
+	bool any = false;
+	if (syncData.gpsEnable) { c.print("GPS "); any = true; }
+	if (syncData.netEnable) { c.print("INTERNET1 "); any = true; }
+	if (syncData.net2Enable) { c.print("INTERNET2 "); any = true; }
+	if (syncData.gsmEnable) { c.print("GSM "); any = true; }
+	if (!any) c.print("НИЧЕГО");
+	c.print(F("</code></p>"));
+	c.print(F("<p>Часовой пояс:<code>UTC"));
+	c.print((int)cfg.tzTargetHours >= 0 ? "+" :"");
+	c.print((int)cfg.tzTargetHours);
+	c.print(F("</code></p>"));
+	c.print(F("</div>"));
+
+	// GSM
+	c.print(F("<div class='box'><h3>GSM</h3>"));
+	c.print(F("Регистрация в сети:<code>")); c.print(gNetRegistered ? "ДА" :"НЕТ"); c.print(F("</code><br>"));
+	c.print(F("RSSI:<code>")); c.print((int)gRssiDbm); c.print(F(" dBm</code><br>"));
+	c.print(F("Уровень:<code>")); c.print((int)gSignalBars); c.print(F("/5</code>"));
+	c.print(F("</div>"));
+
+	// GPS
+	c.print(F("<div class='box'><h3>GPS</h3>"));
+	c.print(F("Fix:<code>")); c.print(gGpsFix ? "ДА" :"НЕТ"); c.print(F("</code><br>"));
+	c.print(F("Спутники (исп/вид):<code>"));
+	c.print((int)gGpsSatsUsed); c.print('/'); c.print((int)gGpsSatsView);
+	c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	htmlFooter(c);
+}
+
+static void printIpInput(EthernetClient& c,const char* name,uint8_t ip[4])
+{
+	c.print(F("<input name='"));
+	c.print(name);
+	c.print(F("' value='"));
+	c.print(ip[0]); c.print('.'); c.print(ip[1]); c.print('.'); c.print(ip[2]); c.print('.'); c.print(ip[3]);
+	c.print(F("'>"));
+}
+
+static void printSelectU8(EthernetClient& c,const char* name,uint8_t cur,uint8_t count,const char* const* labels)
+{
+	c.print(F("<select name='")); c.print(name); c.print(F("'>"));
+	for (uint8_t i = 0; i < count; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if (i == cur) c.print(F(" selected"));
+		c.print(F(">"));
+		WebUI::htmlEscPrint(c,labels[i]);
+		c.print(F("</option>"));
+	}
+	c.print(F("</select>"));
+}
+
+void WebUI::pageCfg(EthernetClient& c)
+{
+	// STRICT load + defaults если не инициализировано
+	LanIfStore::IfConfig if1{},if2{};
+	bool okIf1 = lanStore.load(LanIfStore::IF1,if1,true);
+	if (!okIf1) LanIfStore::defaults(LanIfStore::IF1,if1);
+	bool okIf2 = lanStore.load(LanIfStore::IF2,if2,true);
+	if (!okIf2) LanIfStore::defaults(LanIfStore::IF2,if2);
+
+	AuthRec a;
+	bool existed = false;
+	authLoadOrDefaults(a,existed);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+	htmlHeader(c,F("НАСТРОЙКИ"));
+
+	Internet2Client::Status st{};
+	bool ok2 = internet2.readStatus(st);
+
+	c.print(F("<div class='box'><h3>ТЕКУЩИЕ ПАРАМЕТРЫ (реальные)</h3>"));
+	c.print(F("ИНТЕРНЕТ 1 IP:<code>")); c.print(ntpLan.localIP()); c.print(F("</code> / Линк:<code>"));
+	c.print(Ethernet.linkReport()); c.print(F("</code><br>"));
+	c.print(F("ИНТЕРНЕТ 2 IP:<code>")); c.print(ok2 ? st.ip :IPAddress(0,0,0,0)); c.print(F("</code>"));
+	c.print(F("</div>"));
+
+	c.print(F("<form method='post' action='/cfg/save'>"));
+
+	// TZ
+	c.print(F("<div class='box'><h3>Часовые пояса</h3>"));
+	c.print(F("<p>Часовой пояс (-12..14):<input name='tzTarget' value='"));
+	c.print((int)cfg.tzTargetHours);
+	c.print(F("'></p>"));
+	c.print(F("<p>Часовой пояс NTP (-12..14):<input name='tzNtp' value='"));
+	c.print((int)cfg.tzNtpHours);
+	c.print(F("'></p>"));
+	c.print(F("</div>"));
+
+	// SOURCES:теперь можно несколько
+	c.print(F("<div class='box'><h3>Источники синхронизации (можно несколько)</h3>"));
+	c.print(F("<p><small>Приоритет:GPS → INTERNET1 → INTERNET2 → GSM</small></p>"));
+	c.print(F("<p>"));
+	auto cb = [&](const char* name,const char* label,bool checked) {
+		c.print(F("<label><input type='checkbox' name='"));
+		c.print(name);
+		c.print(F("' value='1'"));
+		if (checked) c.print(F(" checked"));
+		c.print(F("> "));
+		c.print(label);
+		c.print(F("</label> "));
+	};
+	cb("src_gps","GPS",syncData.gpsEnable != 0);
+	cb("src_net1","ИНТЕРНЕТ 1",syncData.netEnable != 0);
+	cb("src_net2","ИНТЕРНЕТ 2",syncData.net2Enable != 0);
+	cb("src_gsm","GSM",syncData.gsmEnable != 0);
+	c.print(F("</p></div>"));
+
+	// INTERNET1 store
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 1 (настройки из EEPROM)</h3>"));
+	c.print(F("<p>DHCP:<select name='if1_dhcp'>"));
+	c.print(F("<option value='1'")); if (if1.dhcp) c.print(F(" selected")); c.print(F(">ВКЛ</option>"));
+	c.print(F("<option value='0'")); if (!if1.dhcp) c.print(F(" selected")); c.print(F(">ВЫКЛ</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>NTP-сервер:"));
+	printSelectU8(c,"if1_ntpIdx",if1.ntpIdx % 5,5,kNtpIpStr);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период синхронизации:"));
+	printSelectU8(c,"if1_perIdx",if1.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"if1_ip",if1.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"if1_mask",if1.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"if1_gw",if1.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"if1_dns",if1.dns); c.print(F("</p>"));
+	c.print(F("</div>"));
+
+	// INTERNET2 store
+	c.print(F("<div class='box'><h3>ИНТЕРНЕТ 2 (настройки из EEPROM)</h3>"));
+	c.print(F("<p>DHCP:<select name='if2_dhcp'>"));
+	c.print(F("<option value='1'")); if (if2.dhcp) c.print(F(" selected")); c.print(F(">ВКЛ</option>"));
+	c.print(F("<option value='0'")); if (!if2.dhcp) c.print(F(" selected")); c.print(F(">ВЫКЛ</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>NTP-сервер:"));
+	printSelectU8(c,"if2_ntpIdx",if2.ntpIdx % 5,5,kNtpIpStr);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период синхронизации:"));
+	printSelectU8(c,"if2_perIdx",if2.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"if2_ip",if2.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"if2_mask",if2.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"if2_gw",if2.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"if2_dns",if2.dns); c.print(F("</p>"));
+	c.print(F("</div>"));
+
+	// WEB auth (только переименование в UI)
+	c.print(F("<div class='box'><h3>Доступ к WEB-интерфейсу (логин/пароль)</h3>"));
+	c.print(F("<p>Текущий логин:<code>")); c.print(a.user); c.print(F("</code></p>"));
+	c.print(F("<p>Новый логин:<input class='pw' name='web_user' value=''></p>"));
+	c.print(F("<p>Новый пароль:<input class='pw' type='password' name='web_pass' value=''></p>"));
+	c.print(F("<p><small>Введите оба поля,чтобы изменить логин/пароль.</small></p>"));
+	c.print(F("</div>"));
+
+	c.print(F("<p><button type='submit'>СОХРАНИТЬ + ПРИМЕНИТЬ</button></p>"));
+	c.print(F("</form>"));
+
+	htmlFooter(c);
+}
+
+void WebUI::pageGsm(EthernetClient& c)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+	htmlHeader(c,F("НАСТРОЙКИ GSM"));
+
+	static const char* kGsmProviders[5] = { "МТС","МЕГАФОН","БИЛАЙН","YOTA","ТЕЛЕ 2" };
+	static const char* kPeriodsRu[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+	c.print(F("<div class='box'><h3>Статус GSM</h3>"));
+	c.print(F("Регистрация в сети:<code>")); c.print(gNetRegistered ? "ДА" :"НЕТ"); c.print(F("</code><br>"));
+	c.print(F("RSSI:<code>")); c.print((int)gRssiDbm); c.print(F(" dBm</code><br>"));
+	c.print(F("Уровень:<code>")); c.print((int)gSignalBars); c.print(F("/5</code>"));
+	c.print(F("</div>"));
+
+	c.print(F("<div class='box'><h3>Параметры GSM</h3>"));
+	c.print(F("<form method='post' action='/gsm/save'>"));
+
+	c.print(F("<p>Включить GSM:<select name='gsm_en'>"));
+	c.print(F("<option value='1'")); if (syncData.gsmEnable) c.print(F(" selected")); c.print(F(">ВКЛ</option>"));
+	c.print(F("<option value='0'")); if (!syncData.gsmEnable) c.print(F(" selected")); c.print(F(">ВЫКЛ</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>Оператор:<select name='gsm_op'>"));
+	for (uint8_t i = 0; i < 5; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if ((syncData.gsmProviderIdx % 5) == i) c.print(F(" selected"));
+		c.print(F(">"));
+		htmlEscPrint(c,kGsmProviders[i]);
+		c.print(F("</option>"));
+	}
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>Период синхронизации:<select name='gsm_per'>"));
+	for (uint8_t i = 0; i < 6; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if ((syncData.gsmPeriodIdx % 6) == i) c.print(F(" selected"));
+		c.print(F(">"));
+		htmlEscPrint(c,kPeriodsRu[i]);
+		c.print(F("</option>"));
+	}
+	c.print(F("</select></p>"));
+
+	c.print(F("<p><button type='submit'>СОХРАНИТЬ</button></p>"));
+	c.print(F("</form></div>"));
+
+	htmlFooter(c);
+}
+
+void WebUI::pageNotFound(EthernetClient& c)
+{
+	sendHeader(c,404,F("text/plain; charset=utf-8"));
+	c.print(F("404 Не найдено"));
+}
+
+// ================== JSON ==================
+static void jsonStr(EthernetClient& c,const char* s)
+{
+	c.print('"');
+	for (; *s; s++) {
+		if (*s == '"' || *s == '\\') { c.print('\\'); c.print(*s); }
+		else if (*s == '\n') c.print(F("\\n"));
+		else if (*s == '\r') c.print(F("\\r"));
+		else c.print(*s);
+	}
+	c.print('"');
+}
+
+void WebUI::apiStatus(EthernetClient& c)
+{
+	sendHeader(c,200,F("application/json; charset=utf-8"));
+
+	Internet2Client::Status st{};
+	bool ok2 = internet2.readStatus(st);
+
+	String ip1s = ntpLan.localIP().toString();
+	String ip2s = (ok2 ? st.ip :IPAddress(0,0,0,0)).toString();
+
+	c.print(F("{"));
+	c.print(F("\"ip1\":")); jsonStr(c,ip1s.c_str()); c.print(F(","));
+	c.print(F("\"link1\":")); jsonStr(c,Ethernet.linkReport()); c.print(F(","));
+	c.print(F("\"internet2_ok\":")); c.print(ok2 ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"ip2\":")); jsonStr(c,ip2s.c_str()); c.print(F(","));
+	c.print(F("\"tz_target\":")); c.print((int)cfg.tzTargetHours); c.print(F(","));
+	c.print(F("\"gps_en\":")); c.print(syncData.gpsEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"net1_en\":")); c.print(syncData.netEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"net2_en\":")); c.print(syncData.net2Enable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"gsm_en\":")); c.print(syncData.gsmEnable ? F("true") :F("false"));
+	c.print(F("}"));
+}
+
+void WebUI::apiConfig(EthernetClient& c)
+{
+	LanIfStore::IfConfig if1{},if2{};
+	bool okIf1 = lanStore.load(LanIfStore::IF1,if1,true);
+	if (!okIf1) LanIfStore::defaults(LanIfStore::IF1,if1);
+	bool okIf2 = lanStore.load(LanIfStore::IF2,if2,true);
+	if (!okIf2) LanIfStore::defaults(LanIfStore::IF2,if2);
+
+	sendHeader(c,200,F("application/json; charset=utf-8"));
+
+	c.print(F("{"));
+	c.print(F("\"tz_target\":")); c.print((int)cfg.tzTargetHours); c.print(F(","));
+	c.print(F("\"tz_ntp\":")); c.print((int)cfg.tzNtpHours); c.print(F(","));
+	c.print(F("\"sources\":{"));
+	c.print(F("\"gps\":")); c.print(syncData.gpsEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"internet1\":")); c.print(syncData.netEnable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"internet2\":")); c.print(syncData.net2Enable ? F("true") :F("false")); c.print(F(","));
+	c.print(F("\"gsm\":")); c.print(syncData.gsmEnable ? F("true") :F("false"));
+	c.print(F("}"));
+	c.print(F("}"));
+}
+
+// ================== Actions ==================
+void WebUI::actionCfgSave(EthernetClient& c,char* params)
+{
+	if (!params) { sendRedirect(c,"/cfg"); return; }
+
+	// TZ
+	int8_t tzT,tzN;
+	if (parseI8(findParam(params,"tzTarget"),tzT,-12,14)) {
+		cfg.tzTargetHours = tzT;
+		ee.writeTzTargetHours(cfg.tzTargetHours);
+	}
+	if (parseI8(findParam(params,"tzNtp"),tzN,-12,14)) {
+		cfg.tzNtpHours = tzN;
+		ee.writeTzNtpHours(cfg.tzNtpHours);
+	}
+
+	// Sources:теперь можно несколько (checkbox => param present)
+	syncData.gpsEnable = hasParam(params,"src_gps") ? 1 :0;
+	syncData.netEnable = hasParam(params,"src_net1") ? 1 :0;
+	syncData.net2Enable = hasParam(params,"src_net2") ? 1 :0;
+	syncData.gsmEnable = hasParam(params,"src_gsm") ? 1 :0;
+
+	bool okS = syncStore.save(syncData);
+	Serial.print(F("Web:syncStore.save=")); Serial.println(okS ? F("OK") :F("FAIL"));
+
+	SyncSourcesStore::Data rd;
+	bool okL = syncStore.load(rd);
+	Serial.print(F("Web:syncStore.load=")); Serial.println(okL ? F("OK") :F("FAIL"));
+	Serial.print(F("Web:rd gps=")); Serial.print(rd.gpsEnable);
+	Serial.print(F(" net1=")); Serial.print(rd.netEnable);
+	Serial.print(F(" net2=")); Serial.print(rd.net2Enable);
+	Serial.print(F(" gsm=")); Serial.println(rd.gsmEnable);
+
+	// INTERNET1/2 store
+	LanIfStore::IfConfig if1{},if2{};
+	lanStore.load(LanIfStore::IF1,if1,false);
+	lanStore.load(LanIfStore::IF2,if2,false);
+
+	bool b;
+	uint8_t u8;
+	uint8_t ip[4];
+
+	if (parseBool01(findParam(params,"if1_dhcp"),b)) if1.dhcp = b ? 1 :0;
+	if (parseU8(findParam(params,"if1_ntpIdx"),u8,0,4)) if1.ntpIdx = u8;
+	if (parseU8(findParam(params,"if1_perIdx"),u8,0,5)) if1.periodIdx = u8;
+	if (parseIp4(findParam(params,"if1_ip"),ip)) memcpy(if1.ip,ip,4);
+	if (parseIp4(findParam(params,"if1_mask"),ip)) memcpy(if1.mask,ip,4);
+	if (parseIp4(findParam(params,"if1_gw"),ip)) memcpy(if1.gw,ip,4);
+	if (parseIp4(findParam(params,"if1_dns"),ip)) memcpy(if1.dns,ip,4);
+
+	if (parseBool01(findParam(params,"if2_dhcp"),b)) if2.dhcp = b ? 1 :0;
+	if (parseU8(findParam(params,"if2_ntpIdx"),u8,0,4)) if2.ntpIdx = u8;
+	if (parseU8(findParam(params,"if2_perIdx"),u8,0,5)) if2.periodIdx = u8;
+	if (parseIp4(findParam(params,"if2_ip"),ip)) memcpy(if2.ip,ip,4);
+	if (parseIp4(findParam(params,"if2_mask"),ip)) memcpy(if2.mask,ip,4);
+	if (parseIp4(findParam(params,"if2_gw"),ip)) memcpy(if2.gw,ip,4);
+	if (parseIp4(findParam(params,"if2_dns"),ip)) memcpy(if2.dns,ip,4);
+
+	lanStore.save(LanIfStore::IF1,if1,true);
+	lanStore.save(LanIfStore::IF2,if2,true);
+
+	applyInternet1FromStore();
+	applyInternet2FromStore();
+
+	// WEB login/pass change (only if provided)
+	const char* nu = findParam(params,"web_user");
+	const char* np = findParam(params,"web_pass");
+	if (nu && np && nu[0] && np[0])
+	{
+		AuthRec aa;
+		memset(&aa,0,sizeof(aa));
+		strncpy(aa.user,nu,sizeof(aa.user) - 1);
+		strncpy(aa.pass,np,sizeof(aa.pass) - 1);
+		trimSpaces(aa.user);
+		trimSpaces(aa.pass);
+		if (aa.user[0] && aa.pass[0]) (void)authSave(aa);
+	}
+
+	planner.onSettingsChanged();
+	sendRedirect(c,"/cfg");
+}
+
+void WebUI::actionGsmSave(EthernetClient& c,char* params)
+{
+	if (!params) { sendRedirect(c,"/gsm"); return; }
+
+	bool en;
+	uint8_t u8;
+
+	if (parseBool01(findParam(params,"gsm_en"),en)) syncData.gsmEnable = en ? 1 :0;
+	if (parseU8(findParam(params,"gsm_op"),u8,0,4)) syncData.gsmProviderIdx = u8;
+	if (parseU8(findParam(params,"gsm_per"),u8,0,5)) syncData.gsmPeriodIdx = u8;
+
+	bool okS = syncStore.save(syncData);
+	Serial.print(F("Web:gsm syncStore.save=")); Serial.println(okS ? F("OK") :F("FAIL"));
+
+	planner.onSettingsChanged();
+	sendRedirect(c,"/gsm");
+}
+Критично для “не сохраняется” (ваш setup)
+У вас всё ещё стоит автосохранение дефолтов:
+
+cpp Копировать
+if (!syncStore.load(syncData)) {
+ ...
+ (void)syncStore.save(syncData); // <-- УБРАТЬ
+}
+Уберите эту строку,иначе при любом сбое чтения на старте вы будете затирать сохранённое дефолтами.
+
+Правильно так:
+
+cpp Копировать
+syncStore.defaults(syncData);
+if (syncStore.begin()) {
+ bool ok = syncStore.load(syncData);
+ Serial.print("SyncSourcesStore.load="); Serial.println(ok);
+}
+Если хотите — следующим шагом я внесу правку в TimeSyncPlanner.cpp под ваш приоритет GPS → INTERNET1 → INTERNET2 → GSM 
+(сейчас у вас GPS → NET2 → NET(sim) → GSM). Скажите только:что именно означает “INTERNET1” в планировщике 
+у вас — это _src.netEnable (SIM800 NTP) или LAN‑NTP (ntpLan)?
+
+//*************************************************************************************
+
+Ниже — обновлённый TimeSyncPlanner.cpp целиком под ваши определения:
+
+INTERNET1 = W5500 на этом STM32 (Ethernet) → синхронизация по NTP через EthernetUDP
+INTERNET2 = внешний модуль по I2C → как у вас было (Internet2Client)
+Приоритет теперь GPS → INTERNET1 → INTERNET2 → GSM
+tryStartNet() переопределён по смыслу:теперь это INTERNET1 NTP over W5500,а не SIM800 NTP
+netProviderIdx используется как индекс NTP IP (0..4) (список тот же,что в меню/вебе)
+Сделан аккуратный retry при провале NTP (через 1 минуту),чтобы не ждать часами
+TimeSyncPlanner.h менять не нужно.
+
+TimeSyncPlanner.cpp (обновлённый)
+cpp Копировать
+#include "TimeSyncPlanner.h"
+
+#include <IPAddress.h>
+#include <Ethernet_Generic.hpp>
+#include <EthernetUdp.h>
+
+// ---------- NTP over Ethernet (INTERNET1 / W5500 local) ----------
+static const IPAddress kNtpServers[5] = {
+	IPAddress(162,159,200,123),
+	IPAddress(162,159,200,1),
+	IPAddress(129,6,15,28),
+	IPAddress(132,163,96,1),
+	IPAddress(216,239,35,0)
+};
+
+static bool isZeroIP(const IPAddress& ip) {
+	return (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+}
+
+// Блокирующий NTP-запрос (редко вызывается,по расписанию),таймаут ~250мс.
+static bool ntpQueryUnixUtc(uint8_t ntpIdx,uint32_t& outUnixUtc,uint16_t localPort = 8888,uint32_t timeoutMs = 250)
+{
+	if (ntpIdx >= 5) ntpIdx %= 5;
+	const IPAddress server = kNtpServers[ntpIdx];
+
+	// Если Ethernet ещё не поднят — даже не пробуем
+	IPAddress lip = Ethernet.localIP();
+	if (isZeroIP(lip)) return false;
+
+	static EthernetUDP udp;
+	static bool udpBegun = false;
+	if (!udpBegun) {
+		udpBegun = udp.begin(localPort);
+		if (!udpBegun) return false;
+	}
+
+	uint8_t pkt[48];
+	memset(pkt,0,sizeof(pkt));
+	// LI=3 (unknown),VN=4,Mode=3 (client) => 0xE3 (типовой)
+	pkt[0] = 0xE3;
+	pkt[1] = 0; // stratum
+	pkt[2] = 6; // poll
+	pkt[3] = 0xEC; // precision
+
+	// отправка
+	if (udp.beginPacket(server,123) != 1) return false;
+	udp.write(pkt,sizeof(pkt));
+	if (udp.endPacket() != 1) return false;
+
+	// ожидание ответа
+	const uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs)
+	{
+		int psize = udp.parsePacket();
+		if (psize >= 48) {
+			uint8_t r[48];
+			int n = udp.read(r,48);
+			if (n < 48) return false;
+
+			// Transmit Timestamp (seconds since 1900) at byte 40..43
+			uint32_t secs1900 =
+				((uint32_t)r[40] << 24) |
+				((uint32_t)r[41] << 16) |
+				((uint32_t)r[42] << 8) |
+				((uint32_t)r[43]);
+
+			// 1900->1970 offset
+			if (secs1900 < 2208988800UL) return false;
+			outUnixUtc = secs1900 - 2208988800UL;
+			return true;
+		}
+		delay(2);
+	}
+	return false;
+}
+
+// ================== ctor ==================
+TimeSyncPlanner::TimeSyncPlanner(SIM800TimeAsync& sim,
+	GPSNmeaParser& gps,
+	RealtimeClock& rtc,
+	AT24C128Settings::Config& cfg,
+	SyncSourcesStore::Data& src,
+	Internet2Client* internet2)
+	:_sim(sim),_gps(gps),_rtc(rtc),_cfg(cfg),_src(src),_internet2(internet2)
+{}
+
+uint32_t TimeSyncPlanner::periodMsFromIdx(uint8_t idx) {
+	static const uint32_t kPeriodsMs[6] = {
+		60000UL,600000UL,1800000UL,3600000UL,21600000UL,43200000UL
+	};
+	return kPeriodsMs[idx % 6];
+}
+
+uint32_t TimeSyncPlanner::catchUpNext(uint32_t now,uint32_t next,uint32_t period) {
+	if (period == 0) return now + 60000UL;
+	if ((int32_t)(now - next) < 0) return next;
+	uint32_t diff = now - next;
+	uint32_t steps = diff / period + 1;
+	return next + steps * period;
+}
+
+void TimeSyncPlanner::begin() {
+	uint32_t now = millis();
+	_nextGpsMs = now + periodMsFromIdx(_src.gpsPeriodIdx);
+
+	// INTERNET1 (local W5500 NTP)
+	_nextNetMs = now + periodMsFromIdx(_src.netPeriodIdx);
+
+	// GSM CCLK
+	_nextGsmMs = now + periodMsFromIdx(_src.gsmPeriodIdx);
+
+	// INTERNET2 (I2C module)
+	_nextNet2Ms = now + periodMsFromIdx(_src.net2PeriodIdx);
+
+	_nextPushNet2Ms = now + 2000;
+}
+
+void TimeSyncPlanner::onSettingsChanged() {
+	uint32_t now = millis();
+	_nextGpsMs = catchUpNext(now,_nextGpsMs,periodMsFromIdx(_src.gpsPeriodIdx));
+	_nextNetMs = catchUpNext(now,_nextNetMs,periodMsFromIdx(_src.netPeriodIdx));
+	_nextGsmMs = catchUpNext(now,_nextGsmMs,periodMsFromIdx(_src.gsmPeriodIdx));
+	_nextNet2Ms = catchUpNext(now,_nextNet2Ms,periodMsFromIdx(_src.net2PeriodIdx));
+}
+
+void TimeSyncPlanner::onTimeUpdated() {
+	_nextPushNet2Ms = millis();
+}
+
+void TimeSyncPlanner::triggerImmediate() { _immediatePending = true; }
+
+// ---------- main tick ----------
+void TimeSyncPlanner::tick() {
+	uint32_t now = millis();
+
+	// push DS3231 time to Internet2 every 2s
+	tickPushTimeToInternet2(now);
+
+	// Если ждём результат Internet2 — опрашиваем статус
+	if (_internet2 && _net2Pending) {
+		Internet2Client::Status st;
+		if (_internet2->readStatus(st)) {
+			if (st.lastSyncOk && st.lastNtpUtc != 0 && st.lastNtpUtc != _net2LastSeenNtpUtc) {
+				_net2LastSeenNtpUtc = st.lastNtpUtc;
+				setRtcFromUnixUtc(st.lastNtpUtc);
+				_net2Pending = false;
+				onTimeUpdated();
+				return;
+			}
+		}
+		if (now - _net2ReqStartedMs > 3000) {
+			_net2Pending = false;
+		}
+	}
+
+	// Немедленный запуск (один раз) по приоритету:
+	// GPS -> INTERNET1(W5500) -> INTERNET2(I2C) -> GSM
+	if (_immediatePending) {
+		if (tryStartGps(now,true) || tryStartNet(now,true) || tryStartNet2(now,true) || tryStartGsm(now,true)) {
+			_immediatePending = false;
+		}
+		return;
+	}
+
+	// Обычное расписание (тот же приоритет):
+	(void)tryStartGps(now,false);
+	if (tryStartNet(now,false)) return; // INTERNET1 (W5500 local)
+	if (tryStartNet2(now,false)) return; // INTERNET2 (I2C)
+	(void)tryStartGsm(now,false); // GSM CCLK
+}
+
+// ---------- GPS ----------
+bool TimeSyncPlanner::tryStartGps(uint32_t now,bool immediate) {
+	if (!_src.gpsEnable) return false;
+
+	uint32_t period = periodMsFromIdx(_src.gpsPeriodIdx);
+	if (!immediate && (int32_t)(now - _nextGpsMs) < 0) return false;
+
+	_nextGpsMs = immediate ? (now + period) :catchUpNext(now,_nextGpsMs,period);
+
+	int y,mo,d,h,mi,s;
+	if (!_gps.getUtc(y,mo,d,h,mi,s)) return false;
+	if (!_gps.hasFix()) return false;
+
+	int tzq_target = (int)_cfg.tzTargetHours * 4;
+	utcToLocal(y,mo,d,h,mi,s,tzq_target);
+
+	uint8_t dsDow = ds3231DowFromDow0(dow0_sun(y,mo,d));
+	_rtc.setTime((uint8_t)s,(uint8_t)mi,(uint8_t)h,dsDow,(uint8_t)d,(uint8_t)mo,(uint16_t)y);
+
+	return true;
+}
+
+// ---------- INTERNET1 (W5500 local NTP) ----------
+// ВНИМАНИЕ:функция называется tryStartNet() по историческим причинам,
+// но теперь это INTERNET1,а не SIM800 NTP.
+bool TimeSyncPlanner::tryStartNet(uint32_t now,bool immediate) {
+	if (!_src.netEnable) return false;
+
+	uint32_t period = periodMsFromIdx(_src.netPeriodIdx);
+	if (!immediate && (int32_t)(now - _nextNetMs) < 0) return false;
+
+	// заранее сдвигаем расписание,чтобы не долбить в каждом tick
+	_nextNetMs = immediate ? (now + period) :catchUpNext(now,_nextNetMs,period);
+
+	uint32_t unixUtc = 0;
+	bool ok = ntpQueryUnixUtc(_src.netProviderIdx,unixUtc,8888,250);
+	if (!ok || unixUtc == 0) {
+		// быстрый повтор через минуту (иначе при period=1 час ждать очень долго)
+		_nextNetMs = now + 60000UL;
+		return false;
+	}
+
+	setRtcFromUnixUtc(unixUtc);
+	onTimeUpdated();
+	return true;
+}
+
+// ---------- GSM (SIM800 CCLK) ----------
+bool TimeSyncPlanner::tryStartGsm(uint32_t now,bool immediate) {
+	if (!_src.gsmEnable) return false;
+	if (_sim.isBusy()) return false;
+
+	uint32_t period = periodMsFromIdx(_src.gsmPeriodIdx);
+	if (!immediate && (int32_t)(now - _nextGsmMs) < 0) return false;
+
+	_nextGsmMs = immediate ? (now + period) :catchUpNext(now,_nextGsmMs,period);
+
+	_sim.requestTimeNow();
+	return true;
+}
+
+// ---------- INTERNET2 (I2C module) ----------
+bool TimeSyncPlanner::tryStartNet2(uint32_t now,bool immediate) {
+	if (!_internet2) return false;
+	if (!_src.net2Enable) return false;
+
+	if (_net2Pending) return false;
+
+	uint32_t period = periodMsFromIdx(_src.net2PeriodIdx);
+	if (!immediate && (int32_t)(now - _nextNet2Ms) < 0) return false;
+
+	_nextNet2Ms = immediate ? (now + period) :catchUpNext(now,_nextNet2Ms,period);
+
+	_internet2->requestSyncNow();
+
+	Internet2Client::Status st;
+	if (_internet2->readStatus(st)) _net2LastSeenNtpUtc = st.lastNtpUtc;
+
+	_net2Pending = true;
+	_net2ReqStartedMs = now;
+	return true;
+}
+
+// ---------- DS3231(local) <-> unix UTC ----------
+uint32_t TimeSyncPlanner::rtcLocalToUnixUtc(const RTCTime& t) const {
+	int64_t local = toEpochSeconds((int)t.year,(int)t.month,(int)t.dayOfMonth,(int)t.hour,(int)t.minute,(int)t.second);
+	int64_t utc = local - (int64_t)_cfg.tzTargetHours * 3600LL;
+	if (utc < 0) utc = 0;
+	return (uint32_t)utc;
+}
+
+void TimeSyncPlanner::setRtcFromUnixUtc(uint32_t unixUtc) {
+	int64_t local = (int64_t)unixUtc + (int64_t)_cfg.tzTargetHours * 3600LL;
+
+	int y,mo,d,h,mi,s;
+	fromEpochSeconds(local,y,mo,d,h,mi,s);
+
+	uint8_t dsDow = ds3231DowFromDow0(dow0_sun(y,mo,d));
+	_rtc.setTime((uint8_t)s,(uint8_t)mi,(uint8_t)h,dsDow,(uint8_t)d,(uint8_t)mo,(uint16_t)y);
+}
+
+void TimeSyncPlanner::tickPushTimeToInternet2(uint32_t now) {
+	if (!_internet2) return;
+
+	if ((int32_t)(now - _nextPushNet2Ms) < 0) return;
+	_nextPushNet2Ms = now + 2000;
+
+	RTCTime tLocal = _rtc.getTime();
+	uint32_t unixUtc = rtcLocalToUnixUtc(tLocal);
+
+	_internet2->setTimeUnixUtc(unixUtc,0);
+}
+
+// ---- date/time helpers ----
+uint8_t TimeSyncPlanner::dow0_sun(int y,int m,int d) {
+	static int t[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+	if (m < 3) y -= 1;
+	return (uint8_t)((y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7);
+}
+uint8_t TimeSyncPlanner::ds3231DowFromDow0(uint8_t dow0) { return (dow0 == 0) ? 7 :dow0; }
+
+int64_t TimeSyncPlanner::toEpochSeconds(int y,int mo,int d,int h,int mi,int s) {
+	auto daysFromCivil = [](int y,int m,int d)->int32_t {
+		y -= (m <= 2);
+		const int era = (y >= 0 ? y :y - 399) / 400;
+		const unsigned yoe = (unsigned)(y - era * 400);
+		const unsigned doy = (153 * (m + (m > 2 ? -3 :9)) + 2) / 5 + (unsigned)d - 1;
+		const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+		return (int32_t)(era * 146097 + (int)doe - 719468);
+	};
+	int32_t days = daysFromCivil(y,mo,d);
+	return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+void TimeSyncPlanner::fromEpochSeconds(int64_t t,int& y,int& mo,int& d,int& h,int& mi,int& s) {
+	auto civilFromDays = [](int32_t z,int& y,int& m,int& d) {
+		z += 719468;
+		const int era = (z >= 0 ? z :z - 146096) / 146097;
+		const unsigned doe = (unsigned)(z - era * 146097);
+		const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+		y = (int)yoe + era * 400;
+		const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+		const unsigned mp = (5 * doy + 2) / 153;
+		d = (int)(doy - (153 * mp + 2) / 5 + 1);
+		m = (int)(mp + (mp < 10 ? 3 :-9));
+		y += (m <= 2);
+	};
+	int64_t days = t / 86400LL;
+	int64_t rem = t % 86400LL;
+	if (rem < 0) { rem += 86400LL; days -= 1; }
+	civilFromDays((int32_t)days,y,mo,d);
+	h = (int)(rem / 3600LL); rem %= 3600LL;
+	mi = (int)(rem / 60LL);
+	s = (int)(rem % 60LL);
+}
+
+void TimeSyncPlanner::utcToLocal(int& y,int& mo,int& d,int& h,int& mi,int& s,int tzQuarterHours) {
+	const int offsetMin = tzQuarterHours * 15;
+	int64_t epochUTC = toEpochSeconds(y,mo,d,h,mi,s);
+	int64_t epochLocal = epochUTC + (int64_t)offsetMin * 60LL;
+	fromEpochSeconds(epochLocal,y,mo,d,h,mi,s);
+}
+Что важно проверить после этой правки
+В вашем проекте должен быть доступен EthernetUDP через EthernetUdp.h. Если компилятор ругнётся на include — скажите,
+какой именно файл UDP в вашей библиотеке Ethernet_Generic 
+(иногда это EthernetUdp.h,иногда EthernetUdp.hpp),я подгоню include.
+
+Теперь syncData.netEnable/netProviderIdx/netPeriodIdx относятся к INTERNET1(W5500 local). 
+SIM800 NTP больше не используется (остался только GSM CCLK через requestTimeNow()).
+
+Если хотите полностью убрать “SIM NTP” из UI — в меню/вебе можно переименовать NTP/INTERNET в INTERNET1 (у вас это уже так визуально).
+
+Если хотите,я также внесу маленькую правку в setup() (вы уже видели):убрать автосохранение дефолтов 
+syncStore.save(syncData) при load()==false,чтобы сохранение источников не “слетало” при редких сбоях чтения на старте.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+

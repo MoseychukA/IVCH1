@@ -1,0 +1,3339 @@
+Микроконтроллер STM32F103VGT6 Arduino IDE
+Написать WEB интерфейс для установки параметров устройства.
+
+На первом этапе устанавливаем настройку параметров INTERNET1, INTERNET2 и GSM
+Также вывести всю информацию о текущих настройках устройства
+В следующем задании будут определены иные настройки устройства.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — рабочий “скелет” WEB‑интерфейса для STM32F103 + W5500 (Ethernet_Generic),который:
+
+показывает текущие настройки устройства (INTERNET1/INTERNET2/GSM + статусы),
+позволяет из браузера изменить параметры INTERNET1 и INTERNET2 (DHCP/IP/MASK/GW/DNS + NTP IP idx + период),
+позволяет включить/выключить и настроить GSM (минимально:Enable/оператор/период; APN/логин/пароль можно добавить следующим этапом),
+после сохранения вызывает ваши функции:
+applyInternet1FromStore();
+applyInternet2FromStore();
+(для GSM) planner.onSettingsChanged(); или вашу функцию применения.
+Код написан максимально “по‑Arduino”:EthernetServer + простые HTML формы,без JS.
+
+Важно:я использую ваши уже существующие хранилища lanStore (IF1/IF2) и syncStore/syncData (GSM). 
+Если у вас имена/структуры отличаются — скажите,я подгоню.
+
+1) Файл WebUI.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Ethernet_Generic.h>
+
+class WebUI
+{
+public:
+ explicit WebUI(uint16_t port = 80) :_srv(port) {}
+
+ void begin();
+ void tick();
+
+private:
+ EthernetServer _srv;
+
+ // --- HTTP helpers ---
+ void handleClient(EthernetClient& c);
+ bool readRequestLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs);
+ void drainHeaders(EthernetClient& c,uint32_t timeoutMs);
+
+ static bool startsWith(const char* s,const char* pref);
+ static void urlDecodeInPlace(char* s);
+
+ // query parse:key=value&key2=value2 (внутри одного буфера)
+ static const char* findParam(char* query,const char* key);
+
+ // parse helpers
+ static bool parseBool01(const char* s,bool& out);
+ static bool parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV);
+ static bool parseIp4(const char* s,uint8_t out[4]);
+
+ // response helpers
+ void sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct);
+ void sendRedirect(EthernetClient& c,const char* location);
+
+ // pages
+ void pageHome(EthernetClient& c);
+ void pageInternet1(EthernetClient& c);
+ void pageInternet2(EthernetClient& c);
+ void pageGsm(EthernetClient& c);
+ void pageNotFound(EthernetClient& c);
+
+ // actions (POST)
+ void actionInternet1Save(EthernetClient& c,char* query);
+ void actionInternet2Save(EthernetClient& c,char* query);
+ void actionGsmSave(EthernetClient& c,char* query);
+
+ // HTML pieces
+ static void htmlEscPrint(EthernetClient& c,const char* s);
+};
+2) Файл WebUI.cpp
+cpp Копировать
+#include "WebUI.h"
+
+#include <EthernetUdp.h>
+#include <IPAddress.h>
+
+// ваши проектные заголовки
+#include "LanIfStore.h"
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+#include "NetFeed.h"
+#include "Internet2Client.h"
+#include "NtpLanService_Generic.h"
+
+// --- externs из проекта ---
+extern LanIfStore lanStore;
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+extern TimeSyncPlanner planner;
+
+extern void applyInternet1FromStore();
+extern void applyInternet2FromStore();
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GSM globals (по вашему menu.cpp)
+extern bool gNetRegistered;
+extern int16_t gRssiDbm;
+extern uint8_t gSignalBars;
+
+// NTP upstream list (как в menu.cpp)
+static const char* kNtpIpStr[5] = {
+ "162.159.200.123",
+ "162.159.200.1",
+ "129.6.15.28",
+ "132.163.96.1",
+ "216.239.35.0"
+};
+
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+static uint32_t periodMsFromIdx(uint8_t idx)
+{
+ switch (idx % 6) {
+ case 0:return 60UL * 1000UL;
+ case 1:return 10UL * 60UL * 1000UL;
+ case 2:return 30UL * 60UL * 1000UL;
+ case 3:return 60UL * 60UL * 1000UL;
+ case 4:return 6UL * 60UL * 60UL * 1000UL;
+ default:return 12UL * 60UL * 60UL * 1000UL;
+ }
+}
+
+// ---------------- WebUI ----------------
+
+void WebUI::begin()
+{
+ _srv.begin();
+}
+
+void WebUI::tick()
+{
+ EthernetClient c = _srv.available();
+ if (!c) return;
+ handleClient(c);
+}
+
+// ---------------- HTTP core ----------------
+
+bool WebUI::startsWith(const char* s,const char* pref)
+{
+ while (*pref) {
+ if (*s++ != *pref++) return false;
+ }
+ return true;
+}
+
+bool WebUI::readRequestLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs)
+{
+ uint32_t t0 = millis();
+ size_t n = 0;
+
+ while ((millis() - t0) < timeoutMs) {
+ while (c.available()) {
+ char ch = (char)c.read();
+ if (ch == '\r') continue;
+ if (ch == '\n') {
+ out[n] = 0;
+ return (n > 0);
+ }
+ if (n + 1 < outN) out[n++] = ch;
+ }
+ }
+ out[0] = 0;
+ return false;
+}
+
+void WebUI::drainHeaders(EthernetClient& c,uint32_t timeoutMs)
+{
+ uint32_t t0 = millis();
+ int crlfCount = 0;
+ while ((millis() - t0) < timeoutMs) {
+ while (c.available()) {
+ char ch = (char)c.read();
+ // ждём пустую строку \r\n\r\n (мы уже игнорим \r при чтении line,но здесь проще по \n\n)
+ if (ch == '\n') {
+ crlfCount++;
+ if (crlfCount >= 2) return;
+ } else if (ch != '\r') {
+ crlfCount = 0;
+ }
+ }
+ }
+}
+
+void WebUI::urlDecodeInPlace(char* s)
+{
+ auto hex = [](char c)->int {
+ if (c >= '0' && c <= '9') return c - '0';
+ if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+ if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+ return -1;
+ };
+
+ char* w = s;
+ for (char* r = s; *r; r++) {
+ if (*r == '+') { *w++ = ' '; continue; }
+ if (*r == '%' && r[1] && r[2]) {
+ int hi = hex(r[1]),lo = hex(r[2]);
+ if (hi >= 0 && lo >= 0) {
+ *w++ = (char)((hi << 4) | lo);
+ r += 2;
+ continue;
+ }
+ }
+ *w++ = *r;
+ }
+ *w = 0;
+}
+
+const char* WebUI::findParam(char* query,const char* key)
+{
+ // query:"a=1&b=2"
+ // вернём указатель на value внутри query или nullptr
+ size_t klen = strlen(key);
+ char* p = query;
+
+ while (p && *p) {
+ char* amp = strchr(p,'&');
+ if (amp) *amp = 0;
+
+ char* eq = strchr(p,'=');
+ if (eq) {
+ *eq = 0;
+ if (strlen(p) == klen && strcmp(p,key) == 0) {
+ char* val = eq + 1;
+ if (amp) *amp = '&';
+ *eq = '=';
+ return val;
+ }
+ *eq = '=';
+ }
+
+ if (amp) {
+ *amp = '&';
+ p = amp + 1;
+ } else break;
+ }
+ return nullptr;
+}
+
+bool WebUI::parseBool01(const char* s,bool& out)
+{
+ if (!s) return false;
+ if (strcmp(s,"0") == 0) { out = false; return true; }
+ if (strcmp(s,"1") == 0) { out = true; return true; }
+ return false;
+}
+
+bool WebUI::parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV)
+{
+ if (!s) return false;
+ long v = strtol(s,nullptr,10);
+ if (v < minV || v > maxV) return false;
+ out = (uint8_t)v;
+ return true;
+}
+
+bool WebUI::parseIp4(const char* s,uint8_t out[4])
+{
+ if (!s) return false;
+ int a,b,c,d;
+ if (sscanf(s,"%d.%d.%d.%d",&a,&b,&c,&d) != 4) return false;
+ if ((unsigned)a>255 || (unsigned)b>255 || (unsigned)c>255 || (unsigned)d>255) return false;
+ out[0]=(uint8_t)a; out[1]=(uint8_t)b; out[2]=(uint8_t)c; out[3]=(uint8_t)d;
+ return true;
+}
+
+void WebUI::sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct)
+{
+ if (code == 200) c.print(F("HTTP/1.1 200 OK\r\n"));
+ else if (code == 303) c.print(F("HTTP/1.1 303 See Other\r\n"));
+ else c.print(F("HTTP/1.1 404 Not Found\r\n"));
+
+ c.print(F("Connection:close\r\n"));
+ c.print(F("Cache-Control:no-store\r\n"));
+ c.print(F("Content-Type:"));
+ c.print(ct);
+ c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendRedirect(EthernetClient& c,const char* location)
+{
+ c.print(F("HTTP/1.1 303 See Other\r\n"));
+ c.print(F("Connection:close\r\n"));
+ c.print(F("Location:"));
+ c.print(location);
+ c.print(F("\r\n\r\n"));
+}
+
+void WebUI::htmlEscPrint(EthernetClient& c,const char* s)
+{
+ for (; *s; s++) {
+ switch (*s) {
+ case '&':c.print(F("&amp;")); break;
+ case '<':c.print(F("&lt;")); break;
+ case '>':c.print(F("&gt;")); break;
+ case '"':c.print(F("&quot;")); break;
+ default:c.write(*s); break;
+ }
+ }
+}
+
+void WebUI::handleClient(EthernetClient& c)
+{
+ char line[192];
+ if (!readRequestLine(c,line,sizeof(line),1500)) { c.stop(); return; }
+
+ // Пример:
+ // GET /internet1 HTTP/1.1
+ // POST /internet1/save HTTP/1.1
+ drainHeaders(c,1500);
+
+ bool isGet = startsWith(line,"GET ");
+ bool isPost = startsWith(line,"POST ");
+ if (!isGet && !isPost) { sendHeader(c,404,F("text/plain")); c.print(F("Bad method")); c.stop(); return; }
+
+ // вытащим path (до пробела)
+ const char* p = isGet ? (line + 4) :(line + 5);
+ char path[128];
+ size_t i = 0;
+ while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+ path[i] = 0;
+
+ // query (для простоты:в POST будем принимать параметры через URL query,т.е. /internet1/save?....)
+ char* q = strchr(path,'?');
+ char* query = nullptr;
+ if (q) { *q = 0; query = q + 1; urlDecodeInPlace(query); }
+
+ // routes
+ if (isGet && strcmp(path,"/") == 0) { pageHome(c); }
+ else if (isGet && strcmp(path,"/internet1") == 0) { pageInternet1(c); }
+ else if (isGet && strcmp(path,"/internet2") == 0) { pageInternet2(c); }
+ else if (isGet && strcmp(path,"/gsm") == 0) { pageGsm(c); }
+ else if (isPost && strcmp(path,"/internet1/save") == 0) { actionInternet1Save(c,query); }
+ else if (isPost && strcmp(path,"/internet2/save") == 0) { actionInternet2Save(c,query); }
+ else if (isPost && strcmp(path,"/gsm/save") == 0) { actionGsmSave(c,query); }
+ else { pageNotFound(c); }
+
+ c.stop();
+}
+
+// ---------------- Pages ----------------
+
+void WebUI::pageHome(EthernetClient& c)
+{
+ sendHeader(c,200,F("text/html; charset=utf-8"));
+
+ c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+ "<title>IVCH Settings</title>"
+ "<style>body{font-family:sans-serif} code{background:#eee;padding:2px 4px}</style>"
+ "</head><body>"));
+
+ c.print(F("<h2>Устройство:настройки и статус</h2>"));
+
+ // INTERNET1 (локальный Ethernet модуля 1)
+ IPAddress ip1 = ntpLan.localIP();
+ c.print(F("<h3>INTERNET1 (W5500)</h3><ul>"));
+ c.print(F("<li>IP:<code>")); c.print(ip1); c.print(F("</code></li>"));
+ c.print(F("<li>Link:<code>")); c.print(Ethernet.linkReport()); c.print(F("</code></li>"));
+ c.print(F("</ul>"));
+
+ // INTERNET2 status по I2C
+ c.print(F("<h3>INTERNET2 (I2C)</h3><ul>"));
+ Internet2Client::Status st{};
+ bool ok = internet2.readStatus(st);
+ c.print(F("<li>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></li>"));
+ c.print(F("<li>IP:<code>")); c.print(ok ? st.ip :IPAddress(0,0,0,0)); c.print(F("</code></li>"));
+ c.print(F("<li>Last sync ok:<code>")); c.print(ok && st.lastSyncOk ? "YES" :"NO"); c.print(F("</code></li>"));
+ c.print(F("</ul>"));
+
+ // GSM
+ c.print(F("<h3>GSM</h3><ul>"));
+ c.print(F("<li>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></li>"));
+ c.print(F("<li>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></li>"));
+ c.print(F("<li>Bars:<code>")); c.print((int)gSignalBars); c.print(F("</code></li>"));
+ c.print(F("</ul>"));
+
+ c.print(F("<h3>Разделы</h3><ul>"
+ "<li><a href='/internet1'>Настройки INTERNET1</a></li>"
+ "<li><a href='/internet2'>Настройки INTERNET2</a></li>"
+ "<li><a href='/gsm'>Настройки GSM</a></li>"
+ "</ul>"));
+
+ c.print(F("</body></html>"));
+}
+
+static void printIpInput(EthernetClient& c,const char* name,const uint8_t ip[4])
+{
+ c.print(F("<input name='"));
+ c.print(name);
+ c.print(F("' value='"));
+ c.print(ip[0]); c.print('.'); c.print(ip[1]); c.print('.'); c.print(ip[2]); c.print('.'); c.print(ip[3]);
+ c.print(F("'>"));
+}
+
+static void printSelectU8(EthernetClient& c,const char* name,uint8_t cur,uint8_t count,const char* const* labels)
+{
+ c.print(F("<select name='")); c.print(name); c.print(F("'>"));
+ for (uint8_t i = 0; i < count; i++) {
+ c.print(F("<option value='")); c.print(i); c.print(F("'"));
+ if (i == cur) c.print(F(" selected"));
+ c.print(F(">"));
+ WebUI::htmlEscPrint(c,labels[i]);
+ c.print(F("</option>"));
+ }
+ c.print(F("</select>"));
+}
+
+void WebUI::pageInternet1(EthernetClient& c)
+{
+ LanIfStore::IfConfig cfg{};
+ lanStore.load(LanIfStore::IF1,cfg,false);
+
+ sendHeader(c,200,F("text/html; charset=utf-8"));
+
+ c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+ "<title>INTERNET1</title></head><body>"));
+ c.print(F("<h2>INTERNET1</h2>"));
+
+ // текущий IP (реальный)
+ c.print(F("<p>Текущий IP (реальный):<code>"));
+ c.print(ntpLan.localIP());
+ c.print(F("</code></p>"));
+
+ c.print(F("<form method='post' action='/internet1/save?'>"));
+
+ c.print(F("<p>DHCP:"));
+ c.print(F("<select name='dhcp'>"));
+ c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+ c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+ c.print(F("</select></p>"));
+
+ c.print(F("<p>NTP upstream:"));
+ // 5 значений
+ const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+ printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+ c.print(F("</p>"));
+
+ c.print(F("<p>Период:"));
+ printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+ c.print(F("</p>"));
+
+ c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+ c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+ c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+ c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+ c.print(F("<p><button type='submit'>SAVE + APPLY</button> "));
+ c.print(F("<a href='/'>Назад</a></p>"));
+
+ c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageInternet2(EthernetClient& c)
+{
+ LanIfStore::IfConfig cfg{};
+ lanStore.load(LanIfStore::IF2,cfg,false);
+
+ sendHeader(c,200,F("text/html; charset=utf-8"));
+
+ c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+ "<title>INTERNET2</title></head><body>"));
+ c.print(F("<h2>INTERNET2</h2>"));
+
+ Internet2Client::Status st{};
+ bool ok = internet2.readStatus(st);
+
+ c.print(F("<p>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></p>"));
+ c.print(F("<p>Текущий IP (реальный,I2C):<code>"));
+ c.print(ok ? st.ip :IPAddress(0,0,0,0));
+ c.print(F("</code></p>"));
+
+ c.print(F("<form method='post' action='/internet2/save?'>"));
+
+ c.print(F("<p>DHCP:"));
+ c.print(F("<select name='dhcp'>"));
+ c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+ c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+ c.print(F("</select></p>"));
+
+ const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+ c.print(F("<p>NTP upstream:"));
+ printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+ c.print(F("</p>"));
+
+ c.print(F("<p>Период:"));
+ printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+ c.print(F("</p>"));
+
+ c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+ c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+ c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+ c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+ c.print(F("<p><button type='submit'>SAVE + APPLY (I2C)</button> "));
+ c.print(F("<a href='/'>Назад</a></p>"));
+
+ c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageGsm(EthernetClient& c)
+{
+ // берём из syncData (как у вас в menu.cpp)
+ SyncSourcesStore::Data tmp = syncData;
+
+ sendHeader(c,200,F("text/html; charset=utf-8"));
+
+ c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+ "<title>GSM</title></head><body>"));
+ c.print(F("<h2>GSM</h2>"));
+
+ c.print(F("<p>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></p>"));
+ c.print(F("<p>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></p>"));
+
+ c.print(F("<form method='post' action='/gsm/save?'>"));
+
+ c.print(F("<p>Enable:"));
+ c.print(F("<select name='en'>"));
+ c.print(F("<option value='1'")); if (tmp.gsmEnable) c.print(F(" selected")); c.print(F(">ON</option>"));
+ c.print(F("<option value='0'")); if (!tmp.gsmEnable) c.print(F(" selected")); c.print(F(">OFF</option>"));
+ c.print(F("</select></p>"));
+
+ // operator idx 0..4
+ c.print(F("<p>Operator idx (0..4):<input name='op' value='"));
+ c.print(tmp.gsmProviderIdx);
+ c.print(F("'></p>"));
+
+ c.print(F("<p>Period idx (0..5):<input name='per' value='"));
+ c.print(tmp.gsmPeriodIdx);
+ c.print(F("'></p>"));
+
+ c.print(F("<p><button type='submit'>SAVE</button> "));
+ c.print(F("<a href='/'>Назад</a></p>"));
+
+ c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageNotFound(EthernetClient& c)
+{
+ sendHeader(c,404,F("text/plain; charset=utf-8"));
+ c.print(F("404 Not Found"));
+}
+
+// ---------------- Actions ----------------
+// Параметры принимаем из query в URL (быстро и просто).
+// Пример:POST /internet1/save?dhcp=1&ntpIdx=0&perIdx=3&ip=... HTTP/1.1
+
+void WebUI::actionInternet1Save(EthernetClient& c,char* query)
+{
+ if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+ LanIfStore::IfConfig cfg{};
+ lanStore.load(LanIfStore::IF1,cfg,false);
+
+ // parse
+ bool dhcp;
+ uint8_t ntpIdx,perIdx;
+ uint8_t ip[4],mask[4],gw[4],dns[4];
+
+ if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+ if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+ if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+ const char* sip = findParam(query,"ip");
+ const char* smask = findParam(query,"mask");
+ const char* sgw = findParam(query,"gw");
+ const char* sdns = findParam(query,"dns");
+
+ if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+ if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+ if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+ if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+ lanStore.save(LanIfStore::IF1,cfg,true);
+ applyInternet1FromStore();
+
+ sendRedirect(c,"/internet1");
+}
+
+void WebUI::actionInternet2Save(EthernetClient& c,char* query)
+{
+ if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+ LanIfStore::IfConfig cfg{};
+ lanStore.load(LanIfStore::IF2,cfg,false);
+
+ bool dhcp;
+ uint8_t ntpIdx,perIdx;
+ uint8_t ip[4],mask[4],gw[4],dns[4];
+
+ if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+ if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+ if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+ const char* sip = findParam(query,"ip");
+ const char* smask = findParam(query,"mask");
+ const char* sgw = findParam(query,"gw");
+ const char* sdns = findParam(query,"dns");
+
+ if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+ if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+ if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+ if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+ lanStore.save(LanIfStore::IF2,cfg,true);
+
+ // ВАЖНО:ваша applyInternet2FromStore() должна при DHCP=1 отправлять 0.0.0.0 в ip/mask/gw/dns
+ // (мы это обсуждали). Если не сделали — сделайте,иначе будут "левые" IP во втором модуле.
+ applyInternet2FromStore();
+
+ sendRedirect(c,"/internet2");
+}
+
+void WebUI::actionGsmSave(EthernetClient& c,char* query)
+{
+ if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+ SyncSourcesStore::Data tmp = syncData;
+
+ bool en;
+ uint8_t op,per;
+
+ if (parseBool01(findParam(query,"en"),en)) tmp.gsmEnable = en ? 1 :0;
+ if (parseU8(findParam(query,"op"),op,0,4)) tmp.gsmProviderIdx = op;
+ if (parseU8(findParam(query,"per"),per,0,5)) tmp.gsmPeriodIdx = per;
+
+ syncData = tmp;
+ syncStore.save(syncData);
+
+ planner.onSettingsChanged();
+
+ sendRedirect(c,"/gsm");
+}
+3) Подключение в вашем проекте (.ino)
+cpp Копировать
+#include "WebUI.h"
+
+WebUI web(80);
+
+void setup()
+{
+ Serial.begin(115200);
+
+ // ... ваша инициализация Ethernet (NtpLanService_Generic begin и т.п.)
+ // Важно:к моменту web.begin() Ethernet уже должен быть поднят.
+
+ web.begin();
+}
+
+void loop()
+{
+ // ... ваши tick’и
+ web.tick();
+}
+4) Что точно нужно сделать у вас,чтобы INTERNET2 по DHCP не “получал неправильный IP”
+Вы уже показывали applyInternet2FromStore(). В нём при c.dhcp==1 нужно отправлять 0.0.0.0 
+для ip/mask/gw/dns (или гарантировать,что прошивка INTERNET2 игнорирует эти поля при DHCP=1).
+ Иначе второй модуль может применять присланный статический IP.
+
+5) Следующий шаг (когда вы скажете “в следующем задании”)
+На следующем этапе обычно добавляют:
+
+TZ target / TZ NTP,
+выбор источников синхронизации (GPS/NET/NET2/GSM),
+настройки I2C адреса/скорости,
+пароли/авторизацию на WEB (хотя бы простую Basic),
+JSON API для внешнего мониторинга.
+Скажите,как вы хотите организовать WEB:одна страница или три страницы как сейчас,и нужен ли REST/JSON.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ошибка из‑за C++ доступа:функция printSelectU8() — вне класса,а WebUI::htmlEscPrint() объявлена у вас 
+как private,поэтому из внешней функции её вызывать нельзя.
+
+Есть 2 простых решения.
+
+Вариант 1 (самый простой):сделать htmlEscPrint public
+В WebUI.h перенесите htmlEscPrint из private в public.
+
+WebUI.h (исправление):
+
+cpp Копировать
+class WebUI
+{
+public:
+ explicit WebUI(uint16_t port = 80) :_srv(port) {}
+
+ void begin();
+ void tick();
+
+ // чтобы можно было вызывать из helper-функций вне класса
+ static void htmlEscPrint(EthernetClient& c,const char* s);
+
+private:
+ EthernetServer _srv;
+
+ ...
+};
+И в WebUI.cpp оставьте реализацию как есть (без изменений).
+
+Вариант 2 (ещё лучше):не вызывать private из внешней функции
+Оставьте htmlEscPrint private,а printSelectU8 сделайте методом класса (private) или 
+просто уберите escaping (если метки у вас фиксированные и безопасные).
+
+Минимальная правка без переделок:в printSelectU8() заменить строку:
+
+cpp Копировать
+WebUI::htmlEscPrint(c,labels[i]);
+на:
+
+cpp Копировать
+c.print(labels[i]);
+Это будет работать,потому что labels[i] — ваши константы (kPeriodsName,kNtpIpStr),там нет <>&".
+
+Рекомендация
+Для быстрого запуска берите Вариант 2 (заменить на c.print(labels[i])). Если дальше планируете печатать 
+пользовательские строки (APN и т.п.) — лучше Вариант 1 (сделать htmlEscPrint public).
+
+Скажите,какой вариант выбрали — и я подскажу точную правку строками “было/стало” для вашего текущего WebUI.h/.cpp.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Вносим правки по Варианту 1:делаем htmlEscPrint() публичной,чтобы её можно было вызывать из внешних helper-функций (printSelectU8).
+
+Ниже — полностью обновлённые файлы WebUI.h и WebUI.cpp (исправлено только то,что нужно; остальная логика сохранена).
+
+WebUI.h (полный файл)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Ethernet_Generic.h>
+
+class WebUI
+{
+public:
+	explicit WebUI(uint16_t port = 80) :_srv(port) {}
+
+	void begin();
+	void tick();
+
+	// Сделали public:нужно для helper-функций вне класса (printSelectU8 и т.п.)
+	static void htmlEscPrint(EthernetClient& c,const char* s);
+
+private:
+	EthernetServer _srv;
+
+	// --- HTTP helpers ---
+	void handleClient(EthernetClient& c);
+	bool readRequestLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs);
+	void drainHeaders(EthernetClient& c,uint32_t timeoutMs);
+
+	static bool startsWith(const char* s,const char* pref);
+	static void urlDecodeInPlace(char* s);
+
+	// query parse:key=value&key2=value2 (внутри одного буфера)
+	static const char* findParam(char* query,const char* key);
+
+	// parse helpers
+	static bool parseBool01(const char* s,bool& out);
+	static bool parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV);
+	static bool parseIp4(const char* s,uint8_t out[4]);
+
+	// response helpers
+	void sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct);
+	void sendRedirect(EthernetClient& c,const char* location);
+
+	// pages
+	void pageHome(EthernetClient& c);
+	void pageInternet1(EthernetClient& c);
+	void pageInternet2(EthernetClient& c);
+	void pageGsm(EthernetClient& c);
+	void pageNotFound(EthernetClient& c);
+
+	// actions (POST)
+	void actionInternet1Save(EthernetClient& c,char* query);
+	void actionInternet2Save(EthernetClient& c,char* query);
+	void actionGsmSave(EthernetClient& c,char* query);
+};
+WebUI.cpp (полный файл)
+cpp Копировать
+#include "WebUI.h"
+
+#include <EthernetUdp.h>
+#include <IPAddress.h>
+
+// ваши проектные заголовки
+#include "LanIfStore.h"
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+#include "NetFeed.h"
+#include "Internet2Client.h"
+#include "NtpLanService_Generic.h"
+
+// --- externs из проекта ---
+extern LanIfStore lanStore;
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+extern TimeSyncPlanner planner;
+
+extern void applyInternet1FromStore();
+extern void applyInternet2FromStore();
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GSM globals (по вашему menu.cpp)
+extern bool gNetRegistered;
+extern int16_t gRssiDbm;
+extern uint8_t gSignalBars;
+
+// NTP upstream list (как в menu.cpp)
+static const char* kNtpIpStr[5] = {
+	"162.159.200.123",
+	"162.159.200.1",
+	"129.6.15.28",
+	"132.163.96.1",
+	"216.239.35.0"
+};
+
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// ---------------- WebUI (public static) ----------------
+
+void WebUI::htmlEscPrint(EthernetClient& c,const char* s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '&':c.print(F("&amp;")); break;
+		case '<':c.print(F("&lt;")); break;
+		case '>':c.print(F("&gt;")); break;
+		case '"':c.print(F("&quot;")); break;
+		default:c.write(*s); break;
+		}
+	}
+}
+
+// ---------------- WebUI ----------------
+
+void WebUI::begin()
+{
+	_srv.begin();
+}
+
+void WebUI::tick()
+{
+	EthernetClient c = _srv.available();
+	if (!c) return;
+	handleClient(c);
+}
+
+// ---------------- HTTP core ----------------
+
+bool WebUI::startsWith(const char* s,const char* pref)
+{
+	while (*pref) {
+		if (*s++ != *pref++) return false;
+	}
+	return true;
+}
+
+bool WebUI::readRequestLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	size_t n = 0;
+
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\r') continue;
+			if (ch == '\n') {
+				out[n] = 0;
+				return (n > 0);
+			}
+			if (n + 1 < outN) out[n++] = ch;
+		}
+	}
+	out[0] = 0;
+	return false;
+}
+
+void WebUI::drainHeaders(EthernetClient& c,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	int crlfCount = 0;
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\n') {
+				crlfCount++;
+				if (crlfCount >= 2) return;
+			}
+			else if (ch != '\r') {
+				crlfCount = 0;
+			}
+		}
+	}
+}
+
+void WebUI::urlDecodeInPlace(char* s)
+{
+	auto hex = [](char c)->int {
+		if (c >= '0' && c <= '9') return c - '0';
+		if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+		if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+		return -1;
+	};
+
+	char* w = s;
+	for (char* r = s; *r; r++) {
+		if (*r == '+') { *w++ = ' '; continue; }
+		if (*r == '%' && r[1] && r[2]) {
+			int hi = hex(r[1]),lo = hex(r[2]);
+			if (hi >= 0 && lo >= 0) {
+				*w++ = (char)((hi << 4) | lo);
+				r += 2;
+				continue;
+			}
+		}
+		*w++ = *r;
+	}
+	*w = 0;
+}
+
+const char* WebUI::findParam(char* query,const char* key)
+{
+	size_t klen = strlen(key);
+	char* p = query;
+
+	while (p && *p) {
+		char* amp = strchr(p,'&');
+		if (amp) *amp = 0;
+
+		char* eq = strchr(p,'=');
+		if (eq) {
+			*eq = 0;
+			if (strlen(p) == klen && strcmp(p,key) == 0) {
+				char* val = eq + 1;
+				if (amp) *amp = '&';
+				*eq = '=';
+				return val;
+			}
+			*eq = '=';
+		}
+
+		if (amp) {
+			*amp = '&';
+			p = amp + 1;
+		}
+		else break;
+	}
+	return nullptr;
+}
+
+bool WebUI::parseBool01(const char* s,bool& out)
+{
+	if (!s) return false;
+	if (strcmp(s,"0") == 0) { out = false; return true; }
+	if (strcmp(s,"1") == 0) { out = true; return true; }
+	return false;
+}
+
+bool WebUI::parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV)
+{
+	if (!s) return false;
+	long v = strtol(s,nullptr,10);
+	if (v < minV || v > maxV) return false;
+	out = (uint8_t)v;
+	return true;
+}
+
+bool WebUI::parseIp4(const char* s,uint8_t out[4])
+{
+	if (!s) return false;
+	int a,b,c,d;
+	if (sscanf(s,"%d.%d.%d.%d",&a,&b,&c,&d) != 4) return false;
+	if ((unsigned)a>255 || (unsigned)b>255 || (unsigned)c>255 || (unsigned)d>255) return false;
+	out[0]=(uint8_t)a; out[1]=(uint8_t)b; out[2]=(uint8_t)c; out[3]=(uint8_t)d;
+	return true;
+}
+
+void WebUI::sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct)
+{
+	if (code == 200) c.print(F("HTTP/1.1 200 OK\r\n"));
+	else if (code == 303) c.print(F("HTTP/1.1 303 See Other\r\n"));
+	else c.print(F("HTTP/1.1 404 Not Found\r\n"));
+
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Content-Type:"));
+	c.print(ct);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendRedirect(EthernetClient& c,const char* location)
+{
+	c.print(F("HTTP/1.1 303 See Other\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Location:"));
+	c.print(location);
+	c.print(F("\r\n\r\n"));
+}
+
+static void printIpInput(EthernetClient& c,const char* name,const uint8_t ip[4])
+{
+	c.print(F("<input name='"));
+	c.print(name);
+	c.print(F("' value='"));
+	c.print(ip[0]); c.print('.'); c.print(ip[1]); c.print('.'); c.print(ip[2]); c.print('.'); c.print(ip[3]);
+	c.print(F("'>"));
+}
+
+static void printSelectU8(EthernetClient& c,const char* name,uint8_t cur,uint8_t count,const char* const* labels)
+{
+	c.print(F("<select name='")); c.print(name); c.print(F("'>"));
+	for (uint8_t i = 0; i < count; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if (i == cur) c.print(F(" selected"));
+		c.print(F(">"));
+		WebUI::htmlEscPrint(c,labels[i]); // теперь доступно (public)
+		c.print(F("</option>"));
+	}
+	c.print(F("</select>"));
+}
+
+void WebUI::handleClient(EthernetClient& c)
+{
+	char line[192];
+	if (!readRequestLine(c,line,sizeof(line),1500)) { c.stop(); return; }
+
+	drainHeaders(c,1500);
+
+	bool isGet = startsWith(line,"GET ");
+	bool isPost = startsWith(line,"POST ");
+	if (!isGet && !isPost) { sendHeader(c,404,F("text/plain")); c.print(F("Bad method")); c.stop(); return; }
+
+	const char* p = isGet ? (line + 4) :(line + 5);
+	char path[128];
+	size_t i = 0;
+	while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+	path[i] = 0;
+
+	char* q = strchr(path,'?');
+	char* query = nullptr;
+	if (q) { *q = 0; query = q + 1; urlDecodeInPlace(query); }
+
+	if (isGet && strcmp(path,"/") == 0) { pageHome(c); }
+	else if (isGet && strcmp(path,"/internet1") == 0) { pageInternet1(c); }
+	else if (isGet && strcmp(path,"/internet2") == 0) { pageInternet2(c); }
+	else if (isGet && strcmp(path,"/gsm") == 0) { pageGsm(c); }
+	else if (isPost && strcmp(path,"/internet1/save") == 0) { actionInternet1Save(c,query); }
+	else if (isPost && strcmp(path,"/internet2/save") == 0) { actionInternet2Save(c,query); }
+	else if (isPost && strcmp(path,"/gsm/save") == 0) { actionGsmSave(c,query); }
+	else { pageNotFound(c); }
+
+	c.stop();
+}
+
+// ---------------- Pages ----------------
+
+void WebUI::pageHome(EthernetClient& c)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>IVCH Settings</title>"
+		"<style>body{font-family:sans-serif} code{background:#eee;padding:2px 4px}</style>"
+		"</head><body>"));
+
+	c.print(F("<h2>Устройство:настройки и статус</h2>"));
+
+	IPAddress ip1 = ntpLan.localIP();
+	c.print(F("<h3>INTERNET1 (W5500)</h3><ul>"));
+	c.print(F("<li>IP:<code>")); c.print(ip1); c.print(F("</code></li>"));
+	c.print(F("<li>Link:<code>")); c.print(Ethernet.linkReport()); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>INTERNET2 (I2C)</h3><ul>"));
+	Internet2Client::Status st{};
+	bool ok = internet2.readStatus(st);
+	c.print(F("<li>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></li>"));
+	c.print(F("<li>IP:<code>")); c.print(ok ? st.ip :IPAddress(0,0,0,0)); c.print(F("</code></li>"));
+	c.print(F("<li>Last sync ok:<code>")); c.print(ok && st.lastSyncOk ? "YES" :"NO"); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>GSM</h3><ul>"));
+	c.print(F("<li>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></li>"));
+	c.print(F("<li>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></li>"));
+	c.print(F("<li>Bars:<code>")); c.print((int)gSignalBars); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>Разделы</h3><ul>"
+		"<li><a href='/internet1'>Настройки INTERNET1</a></li>"
+		"<li><a href='/internet2'>Настройки INTERNET2</a></li>"
+		"<li><a href='/gsm'>Настройки GSM</a></li>"
+		"</ul>"));
+
+	c.print(F("</body></html>"));
+}
+
+void WebUI::pageInternet1(EthernetClient& c)
+{
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF1,cfg,false);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>INTERNET1</title></head><body>"));
+	c.print(F("<h2>INTERNET1</h2>"));
+
+	c.print(F("<p>Текущий IP (реальный):<code>"));
+	c.print(ntpLan.localIP());
+	c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/internet1/save?'>"));
+
+	c.print(F("<p>DHCP:"));
+	c.print(F("<select name='dhcp'>"));
+	c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>NTP upstream:"));
+	const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+	printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период:"));
+	printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+	c.print(F("<p><button type='submit'>SAVE + APPLY</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageInternet2(EthernetClient& c)
+{
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF2,cfg,false);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>INTERNET2</title></head><body>"));
+	c.print(F("<h2>INTERNET2</h2>"));
+
+	Internet2Client::Status st{};
+	bool ok = internet2.readStatus(st);
+
+	c.print(F("<p>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></p>"));
+	c.print(F("<p>Текущий IP (реальный,I2C):<code>"));
+	c.print(ok ? st.ip :IPAddress(0,0,0,0));
+	c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/internet2/save?'>"));
+
+	c.print(F("<p>DHCP:"));
+	c.print(F("<select name='dhcp'>"));
+	c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+	c.print(F("<p>NTP upstream:"));
+	printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период:"));
+	printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+	c.print(F("<p><button type='submit'>SAVE + APPLY (I2C)</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageGsm(EthernetClient& c)
+{
+	SyncSourcesStore::Data tmp = syncData;
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>GSM</title></head><body>"));
+	c.print(F("<h2>GSM</h2>"));
+
+	c.print(F("<p>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></p>"));
+	c.print(F("<p>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/gsm/save?'>"));
+
+	c.print(F("<p>Enable:"));
+	c.print(F("<select name='en'>"));
+	c.print(F("<option value='1'")); if (tmp.gsmEnable) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!tmp.gsmEnable) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>Operator idx (0..4):<input name='op' value='"));
+	c.print(tmp.gsmProviderIdx);
+	c.print(F("'></p>"));
+
+	c.print(F("<p>Period idx (0..5):<input name='per' value='"));
+	c.print(tmp.gsmPeriodIdx);
+	c.print(F("'></p>"));
+
+	c.print(F("<p><button type='submit'>SAVE</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageNotFound(EthernetClient& c)
+{
+	sendHeader(c,404,F("text/plain; charset=utf-8"));
+	c.print(F("404 Not Found"));
+}
+
+// ---------------- Actions ----------------
+
+void WebUI::actionInternet1Save(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF1,cfg,false);
+
+	bool dhcp;
+	uint8_t ntpIdx,perIdx;
+	uint8_t ip[4],mask[4],gw[4],dns[4];
+
+	if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+	if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+	if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+	const char* sip = findParam(query,"ip");
+	const char* smask = findParam(query,"mask");
+	const char* sgw = findParam(query,"gw");
+	const char* sdns = findParam(query,"dns");
+
+	if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+	if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+	if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+	if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+	lanStore.save(LanIfStore::IF1,cfg,true);
+	applyInternet1FromStore();
+
+	sendRedirect(c,"/internet1");
+}
+
+void WebUI::actionInternet2Save(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF2,cfg,false);
+
+	bool dhcp;
+	uint8_t ntpIdx,perIdx;
+	uint8_t ip[4],mask[4],gw[4],dns[4];
+
+	if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+	if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+	if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+	const char* sip = findParam(query,"ip");
+	const char* smask = findParam(query,"mask");
+	const char* sgw = findParam(query,"gw");
+	const char* sdns = findParam(query,"dns");
+
+	if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+	if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+	if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+	if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+	lanStore.save(LanIfStore::IF2,cfg,true);
+
+	// ВАЖНО:applyInternet2FromStore() должен при DHCP=1 отправлять 0.0.0.0 в ip/mask/gw/dns
+	applyInternet2FromStore();
+
+	sendRedirect(c,"/internet2");
+}
+
+void WebUI::actionGsmSave(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	SyncSourcesStore::Data tmp = syncData;
+
+	bool en;
+	uint8_t op,per;
+
+	if (parseBool01(findParam(query,"en"),en)) tmp.gsmEnable = en ? 1 :0;
+	if (parseU8(findParam(query,"op"),op,0,4)) tmp.gsmProviderIdx = op;
+	if (parseU8(findParam(query,"per"),per,0,5)) tmp.gsmPeriodIdx = per;
+
+	syncData = tmp;
+	syncStore.save(syncData);
+
+	planner.onSettingsChanged();
+
+	sendRedirect(c,"/gsm");
+}
+Что ещё важно
+Сейчас “POST” параметры читаются из URL (/save?...). Это простая схема.
+ Если захотите “честный POST body” — добавим парсер Content-Length и чтение тела.
+Убедитесь,что web.tick() вызывается часто (каждый loop).
+Если у вас Ethernet.linkReport() иногда “NOT SUPPORTED” на главной — значит вы открыли WEB раньше,
+чем прошёл первый Ethernet.begin() (как мы уже обсуждали).
+Если компиляция пройдёт — напишите,какие поля GSM вы хотите на первом этапе (только enable/operator/period или ещё APN/login/pass).
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+У вас классическая проблема h-only библиотеки Ethernet_Generic:вы подключили “implementation” заголовки
+ в нескольких единицах трансляции (.ino,NtpLanService_Generic.cpp,WebUI.cpp),из‑за этого линкер видит
+ дубликаты Ethernet,W5100,pCUR_SPI,DhcpClass,vtable и т.д.
+
+По логу видно,что первое определение идёт из Ver.IVCH_26_01_23_01.cpp.o (т.е. ваш .ino),а вторые — из NtpLanService_Generic.cpp.o и WebUI.cpp.o.
+
+Нужно сделать так:
+
+<Ethernet_Generic.h> и <EthernetUdp.h> подключать только в одном .cpp во всём проекте (как вы и писали ранее “ТОЛЬКО здесь”).
+Во всех остальных файлах использовать только декларации (обычно это Ethernet_Generic.hpp),а не “.h” с реализацией.
+Ниже — конкретные правки.
+
+1) Что удалить из .ino (обязательно)
+В вашем Ver.IVCH_26_01_23_01.ino не должно быть:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+и любых других заголовков Ethernet_Generic,которые тянут реализацию.
+
+Оставьте в .ino только ваши обёртки:
+
+cpp Копировать
+#include "NtpLanService_Generic.h"
+#include "WebUI.h"
+Если в .ino есть код,который напрямую использует EthernetUDP,EthernetServer,EthernetClient,
+Ethernet — его надо либо перенести в тот единственный .cpp,где подключён <Ethernet_Generic.h>,либо переписать через ваши классы.
+
+2) Исправить WebUI:не подключать <Ethernet_Generic.h> в header
+WebUI.h (полный файл,исправленный)
+Главное изменение:Ethernet_Generic.hpp вместо Ethernet_Generic.h.
+
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Ethernet_Generic.hpp> // <-- ВАЖНО:только декларации,без реализации
+
+class WebUI
+{
+public:
+	explicit WebUI(uint16_t port = 80);
+
+	void begin();
+	void tick();
+
+	// public (как вы выбрали вариант 1)
+	static void htmlEscPrint(EthernetClient& c,const char* s);
+
+private:
+	EthernetServer _srv;
+
+	void handleClient(EthernetClient& c);
+	bool readRequestLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs);
+	void drainHeaders(EthernetClient& c,uint32_t timeoutMs);
+
+	static bool startsWith(const char* s,const char* pref);
+	static void urlDecodeInPlace(char* s);
+	static const char* findParam(char* query,const char* key);
+
+	static bool parseBool01(const char* s,bool& out);
+	static bool parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV);
+	static bool parseIp4(const char* s,uint8_t out[4]);
+
+	void sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct);
+	void sendRedirect(EthernetClient& c,const char* location);
+
+	void pageHome(EthernetClient& c);
+	void pageInternet1(EthernetClient& c);
+	void pageInternet2(EthernetClient& c);
+	void pageGsm(EthernetClient& c);
+	void pageNotFound(EthernetClient& c);
+
+	void actionInternet1Save(EthernetClient& c,char* query);
+	void actionInternet2Save(EthernetClient& c,char* query);
+	void actionGsmSave(EthernetClient& c,char* query);
+};
+WebUI.cpp (критичная правка)
+Уберите из WebUI.cpp любые #include <Ethernet_Generic.h> и #include <EthernetUdp.h> (UDP вам тут не нужен).
+
+В начале оставьте так:
+
+cpp Копировать
+#include "WebUI.h"
+#include <IPAddress.h>
+И добавьте конструктор (потому что в .h теперь только объявление):
+
+cpp Копировать
+WebUI::WebUI(uint16_t port) :_srv(port) {}
+Остальной код можно оставить как у вас (с теми изменениями,что я давал ранее).
+
+3) Где теперь должен быть “единственный” include реализации Ethernet_Generic
+Оставьте только в одном месте. Самый логичный вариант у вас уже был:
+
+NtpLanService_Generic.cpp:
+cpp Копировать
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+И нигде больше.
+
+4) Про “FLASH overflowed by 116972 bytes”
+Эта ошибка у вас сейчас почти наверняка усилилась из‑за многократного включения Ethernet‑кода (дубли).
+ После устранения “multiple definition” размер сильно уменьшится.
+
+Если после исправления дубликатов всё равно будет overflow — значит в Arduino IDE выбрана плата/память 
+как у BluePill (64/128K),а у STM32F103VGT6 флэш 1MB. Тогда надо в меню платы выбрать правильный “Board part number / Flash size”.
+
+Напишите,какие пункты у вас доступны в Tools → Board part number / Flash size,и я скажу,что именно выбрать под VGT6.
+
+Короткая проверка после правок
+В проекте сделайте поиск:
+Ethernet_Generic.h
+EthernetUdp.h
+Должно быть ровно 1 вхождение каждого (в одном .cpp).
+
+Пересоберите проект. Ошибки multiple definition должны исчезнуть.
+Если хотите — пришлите первые 30 строк вашего .ino (include-блок),я точно укажу,что надо убрать/оставить.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — полный WebUI.cpp с внесёнными правками,чтобы убрать дубли/ошибки линковки от Ethernet_Generic:
+
+удалён #include <EthernetUdp.h> (он вам здесь не нужен и может подтягивать лишнее),
+не добавлено ничего из Ethernet_Generic.h (реализация должна быть подключена ровно в одном .cpp — у вас это NtpLanService_Generic.cpp),
+добавлены стандартные заголовки string.h/stdlib.h/stdio.h для strlen/strchr/sscanf/strtol (на STM32/Arduino обычно и так тянется,но так надёжнее).
+Важно:это сработает только если в WebUI.h подключён #include <Ethernet_Generic.hpp> (а не .h) и если в .ino нет #include <Ethernet_Generic.h> / #include <EthernetUdp.h>.
+
+WebUI.cpp (полный файл)
+cpp Копировать
+#include "WebUI.h"
+
+#include <IPAddress.h>
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+// ваши проектные заголовки
+#include "LanIfStore.h"
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+#include "NetFeed.h"
+#include "Internet2Client.h"
+#include "NtpLanService_Generic.h"
+
+// --- externs из проекта ---
+extern LanIfStore lanStore;
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+extern TimeSyncPlanner planner;
+
+extern void applyInternet1FromStore();
+extern void applyInternet2FromStore();
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GSM globals (по вашему menu.cpp)
+extern bool gNetRegistered;
+extern int16_t gRssiDbm;
+extern uint8_t gSignalBars;
+
+// NTP upstream list (как в menu.cpp)
+static const char* kNtpIpStr[5] = {
+	"162.159.200.123",
+	"162.159.200.1",
+	"129.6.15.28",
+	"132.163.96.1",
+	"216.239.35.0"
+};
+
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// ---------------- WebUI (public static) ----------------
+
+void WebUI::htmlEscPrint(EthernetClient& c,const char* s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '&':c.print(F("&amp;")); break;
+		case '<':c.print(F("&lt;")); break;
+		case '>':c.print(F("&gt;")); break;
+		case '"':c.print(F("&quot;")); break;
+		default:c.write(*s); break;
+		}
+	}
+}
+
+// ---------------- WebUI ----------------
+
+void WebUI::begin()
+{
+	_srv.begin();
+}
+
+void WebUI::tick()
+{
+	EthernetClient c = _srv.available();
+	if (!c) return;
+	handleClient(c);
+}
+
+// ---------------- HTTP core ----------------
+
+bool WebUI::startsWith(const char* s,const char* pref)
+{
+	while (*pref) {
+		if (*s++ != *pref++) return false;
+	}
+	return true;
+}
+
+bool WebUI::readRequestLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	size_t n = 0;
+
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\r') continue;
+			if (ch == '\n') {
+				out[n] = 0;
+				return (n > 0);
+			}
+			if (n + 1 < outN) out[n++] = ch;
+		}
+	}
+	out[0] = 0;
+	return false;
+}
+
+void WebUI::drainHeaders(EthernetClient& c,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	int crlfCount = 0;
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\n') {
+				crlfCount++;
+				if (crlfCount >= 2) return;
+			}
+			else if (ch != '\r') {
+				crlfCount = 0;
+			}
+		}
+	}
+}
+
+void WebUI::urlDecodeInPlace(char* s)
+{
+	auto hex = [](char c)->int {
+		if (c >= '0' && c <= '9') return c - '0';
+		if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+		if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+		return -1;
+	};
+
+	char* w = s;
+	for (char* r = s; *r; r++) {
+		if (*r == '+') { *w++ = ' '; continue; }
+		if (*r == '%' && r[1] && r[2]) {
+			int hi = hex(r[1]),lo = hex(r[2]);
+			if (hi >= 0 && lo >= 0) {
+				*w++ = (char)((hi << 4) | lo);
+				r += 2;
+				continue;
+			}
+		}
+		*w++ = *r;
+	}
+	*w = 0;
+}
+
+const char* WebUI::findParam(char* query,const char* key)
+{
+	size_t klen = strlen(key);
+	char* p = query;
+
+	while (p && *p) {
+		char* amp = strchr(p,'&');
+		if (amp) *amp = 0;
+
+		char* eq = strchr(p,'=');
+		if (eq) {
+			*eq = 0;
+			if (strlen(p) == klen && strcmp(p,key) == 0) {
+				char* val = eq + 1;
+				if (amp) *amp = '&';
+				*eq = '=';
+				return val;
+			}
+			*eq = '=';
+		}
+
+		if (amp) {
+			*amp = '&';
+			p = amp + 1;
+		}
+		else break;
+	}
+	return nullptr;
+}
+
+bool WebUI::parseBool01(const char* s,bool& out)
+{
+	if (!s) return false;
+	if (strcmp(s,"0") == 0) { out = false; return true; }
+	if (strcmp(s,"1") == 0) { out = true; return true; }
+	return false;
+}
+
+bool WebUI::parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV)
+{
+	if (!s) return false;
+	long v = strtol(s,nullptr,10);
+	if (v < minV || v > maxV) return false;
+	out = (uint8_t)v;
+	return true;
+}
+
+bool WebUI::parseIp4(const char* s,uint8_t out[4])
+{
+	if (!s) return false;
+	int a,b,c,d;
+	if (sscanf(s,"%d.%d.%d.%d",&a,&b,&c,&d) != 4) return false;
+	if ((unsigned)a > 255 || (unsigned)b > 255 || (unsigned)c > 255 || (unsigned)d > 255) return false;
+	out[0] = (uint8_t)a; out[1] = (uint8_t)b; out[2] = (uint8_t)c; out[3] = (uint8_t)d;
+	return true;
+}
+
+void WebUI::sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct)
+{
+	if (code == 200) c.print(F("HTTP/1.1 200 OK\r\n"));
+	else if (code == 303) c.print(F("HTTP/1.1 303 See Other\r\n"));
+	else c.print(F("HTTP/1.1 404 Not Found\r\n"));
+
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Content-Type:"));
+	c.print(ct);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendRedirect(EthernetClient& c,const char* location)
+{
+	c.print(F("HTTP/1.1 303 See Other\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Location:"));
+	c.print(location);
+	c.print(F("\r\n\r\n"));
+}
+
+static void printIpInput(EthernetClient& c,const char* name,const uint8_t ip[4])
+{
+	c.print(F("<input name='"));
+	c.print(name);
+	c.print(F("' value='"));
+	c.print(ip[0]); c.print('.'); c.print(ip[1]); c.print('.'); c.print(ip[2]); c.print('.'); c.print(ip[3]);
+	c.print(F("'>"));
+}
+
+static void printSelectU8(EthernetClient& c,const char* name,uint8_t cur,uint8_t count,const char* const* labels)
+{
+	c.print(F("<select name='")); c.print(name); c.print(F("'>"));
+	for (uint8_t i = 0; i < count; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if (i == cur) c.print(F(" selected"));
+		c.print(F(">"));
+		WebUI::htmlEscPrint(c,labels[i]);
+		c.print(F("</option>"));
+	}
+	c.print(F("</select>"));
+}
+
+void WebUI::handleClient(EthernetClient& c)
+{
+	char line[192];
+	if (!readRequestLine(c,line,sizeof(line),1500)) { c.stop(); return; }
+
+	drainHeaders(c,1500);
+
+	bool isGet = startsWith(line,"GET ");
+	bool isPost = startsWith(line,"POST ");
+	if (!isGet && !isPost) { sendHeader(c,404,F("text/plain")); c.print(F("Bad method")); c.stop(); return; }
+
+	const char* p = isGet ? (line + 4) :(line + 5);
+	char path[128];
+	size_t i = 0;
+	while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+	path[i] = 0;
+
+	char* q = strchr(path,'?');
+	char* query = nullptr;
+	if (q) { *q = 0; query = q + 1; urlDecodeInPlace(query); }
+
+	if (isGet && strcmp(path,"/") == 0) { pageHome(c); }
+	else if (isGet && strcmp(path,"/internet1") == 0) { pageInternet1(c); }
+	else if (isGet && strcmp(path,"/internet2") == 0) { pageInternet2(c); }
+	else if (isGet && strcmp(path,"/gsm") == 0) { pageGsm(c); }
+	else if (isPost && strcmp(path,"/internet1/save") == 0) { actionInternet1Save(c,query); }
+	else if (isPost && strcmp(path,"/internet2/save") == 0) { actionInternet2Save(c,query); }
+	else if (isPost && strcmp(path,"/gsm/save") == 0) { actionGsmSave(c,query); }
+	else { pageNotFound(c); }
+
+	c.stop();
+}
+
+// ---------------- Pages ----------------
+
+void WebUI::pageHome(EthernetClient& c)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>IVCH Settings</title>"
+		"<style>body{font-family:sans-serif} code{background:#eee;padding:2px 4px}</style>"
+		"</head><body>"));
+
+	c.print(F("<h2>Устройство:настройки и статус</h2>"));
+
+	IPAddress ip1 = ntpLan.localIP();
+	c.print(F("<h3>INTERNET1 (W5500)</h3><ul>"));
+	c.print(F("<li>IP:<code>")); c.print(ip1); c.print(F("</code></li>"));
+	c.print(F("<li>Link:<code>")); c.print(Ethernet.linkReport()); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>INTERNET2 (I2C)</h3><ul>"));
+	Internet2Client::Status st{};
+	bool ok = internet2.readStatus(st);
+	c.print(F("<li>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></li>"));
+	c.print(F("<li>IP:<code>")); c.print(ok ? st.ip :IPAddress(0,0,0,0)); c.print(F("</code></li>"));
+	c.print(F("<li>Last sync ok:<code>")); c.print(ok && st.lastSyncOk ? "YES" :"NO"); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>GSM</h3><ul>"));
+	c.print(F("<li>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></li>"));
+	c.print(F("<li>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></li>"));
+	c.print(F("<li>Bars:<code>")); c.print((int)gSignalBars); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>Разделы</h3><ul>"
+		"<li><a href='/internet1'>Настройки INTERNET1</a></li>"
+		"<li><a href='/internet2'>Настройки INTERNET2</a></li>"
+		"<li><a href='/gsm'>Настройки GSM</a></li>"
+		"</ul>"));
+
+	c.print(F("</body></html>"));
+}
+
+void WebUI::pageInternet1(EthernetClient& c)
+{
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF1,cfg,false);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>INTERNET1</title></head><body>"));
+	c.print(F("<h2>INTERNET1</h2>"));
+
+	c.print(F("<p>Текущий IP (реальный):<code>"));
+	c.print(ntpLan.localIP());
+	c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/internet1/save?'>"));
+
+	c.print(F("<p>DHCP:"));
+	c.print(F("<select name='dhcp'>"));
+	c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>NTP upstream:"));
+	const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+	printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период:"));
+	printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+	c.print(F("<p><button type='submit'>SAVE + APPLY</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageInternet2(EthernetClient& c)
+{
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF2,cfg,false);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>INTERNET2</title></head><body>"));
+	c.print(F("<h2>INTERNET2</h2>"));
+
+	Internet2Client::Status st{};
+	bool ok = internet2.readStatus(st);
+
+	c.print(F("<p>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></p>"));
+	c.print(F("<p>Текущий IP (реальный,I2C):<code>"));
+	c.print(ok ? st.ip :IPAddress(0,0,0,0));
+	c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/internet2/save?'>"));
+
+	c.print(F("<p>DHCP:"));
+	c.print(F("<select name='dhcp'>"));
+	c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+	c.print(F("<p>NTP upstream:"));
+	printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период:"));
+	printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+	c.print(F("<p><button type='submit'>SAVE + APPLY (I2C)</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageGsm(EthernetClient& c)
+{
+	SyncSourcesStore::Data tmp = syncData;
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>GSM</title></head><body>"));
+	c.print(F("<h2>GSM</h2>"));
+
+	c.print(F("<p>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></p>"));
+	c.print(F("<p>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/gsm/save?'>"));
+
+	c.print(F("<p>Enable:"));
+	c.print(F("<select name='en'>"));
+	c.print(F("<option value='1'")); if (tmp.gsmEnable) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!tmp.gsmEnable) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>Operator idx (0..4):<input name='op' value='"));
+	c.print(tmp.gsmProviderIdx);
+	c.print(F("'></p>"));
+
+	c.print(F("<p>Period idx (0..5):<input name='per' value='"));
+	c.print(tmp.gsmPeriodIdx);
+	c.print(F("'></p>"));
+
+	c.print(F("<p><button type='submit'>SAVE</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageNotFound(EthernetClient& c)
+{
+	sendHeader(c,404,F("text/plain; charset=utf-8"));
+	c.print(F("404 Not Found"));
+}
+
+// ---------------- Actions ----------------
+
+void WebUI::actionInternet1Save(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF1,cfg,false);
+
+	bool dhcp;
+	uint8_t ntpIdx,perIdx;
+	uint8_t ip[4],mask[4],gw[4],dns[4];
+
+	if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+	if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+	if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+	const char* sip = findParam(query,"ip");
+	const char* smask = findParam(query,"mask");
+	const char* sgw = findParam(query,"gw");
+	const char* sdns = findParam(query,"dns");
+
+	if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+	if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+	if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+	if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+	lanStore.save(LanIfStore::IF1,cfg,true);
+	applyInternet1FromStore();
+
+	sendRedirect(c,"/internet1");
+}
+
+void WebUI::actionInternet2Save(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF2,cfg,false);
+
+	bool dhcp;
+	uint8_t ntpIdx,perIdx;
+	uint8_t ip[4],mask[4],gw[4],dns[4];
+
+	if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+	if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+	if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+	const char* sip = findParam(query,"ip");
+	const char* smask = findParam(query,"mask");
+	const char* sgw = findParam(query,"gw");
+	const char* sdns = findParam(query,"dns");
+
+	if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+	if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+	if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+	if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+	lanStore.save(LanIfStore::IF2,cfg,true);
+
+	// ВАЖНО:applyInternet2FromStore() должен при DHCP=1 отправлять 0.0.0.0 в ip/mask/gw/dns
+	applyInternet2FromStore();
+
+	sendRedirect(c,"/internet2");
+}
+
+void WebUI::actionGsmSave(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	SyncSourcesStore::Data tmp = syncData;
+
+	bool en;
+	uint8_t op,per;
+
+	if (parseBool01(findParam(query,"en"),en)) tmp.gsmEnable = en ? 1 :0;
+	if (parseU8(findParam(query,"op"),op,0,4)) tmp.gsmProviderIdx = op;
+	if (parseU8(findParam(query,"per"),per,0,5)) tmp.gsmPeriodIdx = per;
+
+	syncData = tmp;
+	syncStore.save(syncData);
+
+	planner.onSettingsChanged();
+
+	sendRedirect(c,"/gsm");
+}
+Что ещё обязательно сделать (иначе линковка всё равно будет падать)
+В WebUI.h должно быть:
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+а не <Ethernet_Generic.h>.
+
+В вашем .ino убрать:
+cpp Копировать
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+Оставить <Ethernet_Generic.h> / <EthernetUdp.h> только в одном месте (например в NtpLanService_Generic.cpp,как у вас).
+Если хотите — пришлите ваш текущий WebUI.h и include-блок из .ino (первые ~30 строк),я точно скажу,что убрать/заменить,чтобы “multiple definition” исчез окончательно.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+У вас WebUI.h уже правильный (Ethernet_Generic.hpp). В .ino прямых Ethernet_Generic.h / EthernetUdp.h нет — это тоже правильно.
+
+Но ваш текущий WebUI.cpp (который вы показали) всё ещё подключает <EthernetUdp.h> — из‑за этого снова подтягивается реализация Ethernet в ещё одну единицу трансляции и возвращаются multiple definition.
+
+Ещё момент:в WebUI.h конструктор объявлен,значит в WebUI.cpp он должен быть определён.
+
+Ниже — полный исправленный WebUI.cpp:
+
+без EthernetUdp.h,
+с WebUI::WebUI(uint16_t port) :_srv(port) {},
+остальной код — как у вас.
+WebUI.cpp (полный файл,исправленный)
+cpp Копировать
+#include "WebUI.h"
+
+#include <IPAddress.h>
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+// ваши проектные заголовки
+#include "LanIfStore.h"
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+#include "NetFeed.h"
+#include "Internet2Client.h"
+#include "NtpLanService_Generic.h"
+
+// --- externs из проекта ---
+extern LanIfStore lanStore;
+extern SyncSourcesStore syncStore;
+extern SyncSourcesStore::Data syncData;
+extern TimeSyncPlanner planner;
+
+extern void applyInternet1FromStore();
+extern void applyInternet2FromStore();
+
+extern NtpLanService_Generic ntpLan; // INTERNET1
+extern Internet2Client internet2; // INTERNET2 (I2C)
+
+// GSM globals (по вашему menu.cpp)
+extern bool gNetRegistered;
+extern int16_t gRssiDbm;
+extern uint8_t gSignalBars;
+
+// NTP upstream list (как в menu.cpp)
+static const char* kNtpIpStr[5] = {
+	"162.159.200.123",
+	"162.159.200.1",
+	"129.6.15.28",
+	"132.163.96.1",
+	"216.239.35.0"
+};
+
+static const char* kPeriodsName[6] = { "1 мин","10 мин","30 мин","1 час","6 часов","12 часов" };
+
+// ---------------- WebUI ctor ----------------
+
+WebUI::WebUI(uint16_t port)
+	:_srv(port)
+{}
+
+// ---------------- WebUI (public static) ----------------
+
+void WebUI::htmlEscPrint(EthernetClient& c,const char* s)
+{
+	for (; *s; s++) {
+		switch (*s) {
+		case '&':c.print(F("&amp;")); break;
+		case '<':c.print(F("&lt;")); break;
+		case '>':c.print(F("&gt;")); break;
+		case '"':c.print(F("&quot;")); break;
+		default:c.write(*s); break;
+		}
+	}
+}
+
+// ---------------- WebUI ----------------
+
+void WebUI::begin()
+{
+	_srv.begin();
+}
+
+void WebUI::tick()
+{
+	EthernetClient c = _srv.available();
+	if (!c) return;
+	handleClient(c);
+}
+
+// ---------------- HTTP core ----------------
+
+bool WebUI::startsWith(const char* s,const char* pref)
+{
+	while (*pref) {
+		if (*s++ != *pref++) return false;
+	}
+	return true;
+}
+
+bool WebUI::readRequestLine(EthernetClient& c,char* out,size_t outN,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	size_t n = 0;
+
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\r') continue;
+			if (ch == '\n') {
+				out[n] = 0;
+				return (n > 0);
+			}
+			if (n + 1 < outN) out[n++] = ch;
+		}
+	}
+	out[0] = 0;
+	return false;
+}
+
+void WebUI::drainHeaders(EthernetClient& c,uint32_t timeoutMs)
+{
+	uint32_t t0 = millis();
+	int crlfCount = 0;
+	while ((millis() - t0) < timeoutMs) {
+		while (c.available()) {
+			char ch = (char)c.read();
+			if (ch == '\n') {
+				crlfCount++;
+				if (crlfCount >= 2) return;
+			}
+			else if (ch != '\r') {
+				crlfCount = 0;
+			}
+		}
+	}
+}
+
+void WebUI::urlDecodeInPlace(char* s)
+{
+	auto hex = [](char c)->int {
+		if (c >= '0' && c <= '9') return c - '0';
+		if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+		if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+		return -1;
+	};
+
+	char* w = s;
+	for (char* r = s; *r; r++) {
+		if (*r == '+') { *w++ = ' '; continue; }
+		if (*r == '%' && r[1] && r[2]) {
+			int hi = hex(r[1]),lo = hex(r[2]);
+			if (hi >= 0 && lo >= 0) {
+				*w++ = (char)((hi << 4) | lo);
+				r += 2;
+				continue;
+			}
+		}
+		*w++ = *r;
+	}
+	*w = 0;
+}
+
+const char* WebUI::findParam(char* query,const char* key)
+{
+	size_t klen = strlen(key);
+	char* p = query;
+
+	while (p && *p) {
+		char* amp = strchr(p,'&');
+		if (amp) *amp = 0;
+
+		char* eq = strchr(p,'=');
+		if (eq) {
+			*eq = 0;
+			if (strlen(p) == klen && strcmp(p,key) == 0) {
+				char* val = eq + 1;
+				if (amp) *amp = '&';
+				*eq = '=';
+				return val;
+			}
+			*eq = '=';
+		}
+
+		if (amp) {
+			*amp = '&';
+			p = amp + 1;
+		}
+		else break;
+	}
+	return nullptr;
+}
+
+bool WebUI::parseBool01(const char* s,bool& out)
+{
+	if (!s) return false;
+	if (strcmp(s,"0") == 0) { out = false; return true; }
+	if (strcmp(s,"1") == 0) { out = true; return true; }
+	return false;
+}
+
+bool WebUI::parseU8(const char* s,uint8_t& out,uint8_t minV,uint8_t maxV)
+{
+	if (!s) return false;
+	long v = strtol(s,nullptr,10);
+	if (v < minV || v > maxV) return false;
+	out = (uint8_t)v;
+	return true;
+}
+
+bool WebUI::parseIp4(const char* s,uint8_t out[4])
+{
+	if (!s) return false;
+	int a,b,c,d;
+	if (sscanf(s,"%d.%d.%d.%d",&a,&b,&c,&d) != 4) return false;
+	if ((unsigned)a > 255 || (unsigned)b > 255 || (unsigned)c > 255 || (unsigned)d > 255) return false;
+	out[0] = (uint8_t)a; out[1] = (uint8_t)b; out[2] = (uint8_t)c; out[3] = (uint8_t)d;
+	return true;
+}
+
+void WebUI::sendHeader(EthernetClient& c,int code,const __FlashStringHelper* ct)
+{
+	if (code == 200) c.print(F("HTTP/1.1 200 OK\r\n"));
+	else if (code == 303) c.print(F("HTTP/1.1 303 See Other\r\n"));
+	else c.print(F("HTTP/1.1 404 Not Found\r\n"));
+
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Cache-Control:no-store\r\n"));
+	c.print(F("Content-Type:"));
+	c.print(ct);
+	c.print(F("\r\n\r\n"));
+}
+
+void WebUI::sendRedirect(EthernetClient& c,const char* location)
+{
+	c.print(F("HTTP/1.1 303 See Other\r\n"));
+	c.print(F("Connection:close\r\n"));
+	c.print(F("Location:"));
+	c.print(location);
+	c.print(F("\r\n\r\n"));
+}
+
+static void printIpInput(EthernetClient& c,const char* name,const uint8_t ip[4])
+{
+	c.print(F("<input name='"));
+	c.print(name);
+	c.print(F("' value='"));
+	c.print(ip[0]); c.print('.'); c.print(ip[1]); c.print('.'); c.print(ip[2]); c.print('.'); c.print(ip[3]);
+	c.print(F("'>"));
+}
+
+static void printSelectU8(EthernetClient& c,const char* name,uint8_t cur,uint8_t count,const char* const* labels)
+{
+	c.print(F("<select name='")); c.print(name); c.print(F("'>"));
+	for (uint8_t i = 0; i < count; i++) {
+		c.print(F("<option value='")); c.print(i); c.print(F("'"));
+		if (i == cur) c.print(F(" selected"));
+		c.print(F(">"));
+		WebUI::htmlEscPrint(c,labels[i]);
+		c.print(F("</option>"));
+	}
+	c.print(F("</select>"));
+}
+
+void WebUI::handleClient(EthernetClient& c)
+{
+	char line[192];
+	if (!readRequestLine(c,line,sizeof(line),1500)) { c.stop(); return; }
+
+	drainHeaders(c,1500);
+
+	bool isGet = startsWith(line,"GET ");
+	bool isPost = startsWith(line,"POST ");
+	if (!isGet && !isPost) { sendHeader(c,404,F("text/plain")); c.print(F("Bad method")); c.stop(); return; }
+
+	const char* p = isGet ? (line + 4) :(line + 5);
+	char path[128];
+	size_t i = 0;
+	while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+	path[i] = 0;
+
+	char* q = strchr(path,'?');
+	char* query = nullptr;
+	if (q) { *q = 0; query = q + 1; urlDecodeInPlace(query); }
+
+	if (isGet && strcmp(path,"/") == 0) { pageHome(c); }
+	else if (isGet && strcmp(path,"/internet1") == 0) { pageInternet1(c); }
+	else if (isGet && strcmp(path,"/internet2") == 0) { pageInternet2(c); }
+	else if (isGet && strcmp(path,"/gsm") == 0) { pageGsm(c); }
+	else if (isPost && strcmp(path,"/internet1/save") == 0) { actionInternet1Save(c,query); }
+	else if (isPost && strcmp(path,"/internet2/save") == 0) { actionInternet2Save(c,query); }
+	else if (isPost && strcmp(path,"/gsm/save") == 0) { actionGsmSave(c,query); }
+	else { pageNotFound(c); }
+
+	c.stop();
+}
+
+// ---------------- Pages ----------------
+
+void WebUI::pageHome(EthernetClient& c)
+{
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>IVCH Settings</title>"
+		"<style>body{font-family:sans-serif} code{background:#eee;padding:2px 4px}</style>"
+		"</head><body>"));
+
+	c.print(F("<h2>Устройство:настройки и статус</h2>"));
+
+	IPAddress ip1 = ntpLan.localIP();
+	c.print(F("<h3>INTERNET1 (W5500)</h3><ul>"));
+	c.print(F("<li>IP:<code>")); c.print(ip1); c.print(F("</code></li>"));
+	c.print(F("<li>Link:<code>")); c.print(Ethernet.linkReport()); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>INTERNET2 (I2C)</h3><ul>"));
+	Internet2Client::Status st{};
+	bool ok = internet2.readStatus(st);
+	c.print(F("<li>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></li>"));
+	c.print(F("<li>IP:<code>")); c.print(ok ? st.ip :IPAddress(0,0,0,0)); c.print(F("</code></li>"));
+	c.print(F("<li>Last sync ok:<code>")); c.print(ok && st.lastSyncOk ? "YES" :"NO"); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>GSM</h3><ul>"));
+	c.print(F("<li>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></li>"));
+	c.print(F("<li>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></li>"));
+	c.print(F("<li>Bars:<code>")); c.print((int)gSignalBars); c.print(F("</code></li>"));
+	c.print(F("</ul>"));
+
+	c.print(F("<h3>Разделы</h3><ul>"
+		"<li><a href='/internet1'>Настройки INTERNET1</a></li>"
+		"<li><a href='/internet2'>Настройки INTERNET2</a></li>"
+		"<li><a href='/gsm'>Настройки GSM</a></li>"
+		"</ul>"));
+
+	c.print(F("</body></html>"));
+}
+
+void WebUI::pageInternet1(EthernetClient& c)
+{
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF1,cfg,false);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>INTERNET1</title></head><body>"));
+	c.print(F("<h2>INTERNET1</h2>"));
+
+	c.print(F("<p>Текущий IP (реальный):<code>"));
+	c.print(ntpLan.localIP());
+	c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/internet1/save?'>"));
+
+	c.print(F("<p>DHCP:"));
+	c.print(F("<select name='dhcp'>"));
+	c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>NTP upstream:"));
+	const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+	printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период:"));
+	printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+	c.print(F("<p><button type='submit'>SAVE + APPLY</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageInternet2(EthernetClient& c)
+{
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF2,cfg,false);
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>INTERNET2</title></head><body>"));
+	c.print(F("<h2>INTERNET2</h2>"));
+
+	Internet2Client::Status st{};
+	bool ok = internet2.readStatus(st);
+
+	c.print(F("<p>Status read:<code>")); c.print(ok ? "OK" :"FAIL"); c.print(F("</code></p>"));
+	c.print(F("<p>Текущий IP (реальный,I2C):<code>"));
+	c.print(ok ? st.ip :IPAddress(0,0,0,0));
+	c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/internet2/save?'>"));
+
+	c.print(F("<p>DHCP:"));
+	c.print(F("<select name='dhcp'>"));
+	c.print(F("<option value='1'")); if (cfg.dhcp) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!cfg.dhcp) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	const char* ntpLabels[5] = { kNtpIpStr[0],kNtpIpStr[1],kNtpIpStr[2],kNtpIpStr[3],kNtpIpStr[4] };
+	c.print(F("<p>NTP upstream:"));
+	printSelectU8(c,"ntpIdx",cfg.ntpIdx % 5,5,ntpLabels);
+	c.print(F("</p>"));
+
+	c.print(F("<p>Период:"));
+	printSelectU8(c,"perIdx",cfg.periodIdx % 6,6,kPeriodsName);
+	c.print(F("</p>"));
+
+	c.print(F("<p>IP:")); printIpInput(c,"ip",cfg.ip); c.print(F("</p>"));
+	c.print(F("<p>MASK:")); printIpInput(c,"mask",cfg.mask); c.print(F("</p>"));
+	c.print(F("<p>GW:")); printIpInput(c,"gw",cfg.gw); c.print(F("</p>"));
+	c.print(F("<p>DNS:")); printIpInput(c,"dns",cfg.dns); c.print(F("</p>"));
+
+	c.print(F("<p><button type='submit'>SAVE + APPLY (I2C)</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageGsm(EthernetClient& c)
+{
+	SyncSourcesStore::Data tmp = syncData;
+
+	sendHeader(c,200,F("text/html; charset=utf-8"));
+
+	c.print(F("<!doctype html><html><head><meta charset='utf-8'>"
+		"<title>GSM</title></head><body>"));
+	c.print(F("<h2>GSM</h2>"));
+
+	c.print(F("<p>Registered:<code>")); c.print(gNetRegistered ? "YES" :"NO"); c.print(F("</code></p>"));
+	c.print(F("<p>RSSI dBm:<code>")); c.print((int)gRssiDbm); c.print(F("</code></p>"));
+
+	c.print(F("<form method='post' action='/gsm/save?'>"));
+
+	c.print(F("<p>Enable:"));
+	c.print(F("<select name='en'>"));
+	c.print(F("<option value='1'")); if (tmp.gsmEnable) c.print(F(" selected")); c.print(F(">ON</option>"));
+	c.print(F("<option value='0'")); if (!tmp.gsmEnable) c.print(F(" selected")); c.print(F(">OFF</option>"));
+	c.print(F("</select></p>"));
+
+	c.print(F("<p>Operator idx (0..4):<input name='op' value='"));
+	c.print(tmp.gsmProviderIdx);
+	c.print(F("'></p>"));
+
+	c.print(F("<p>Period idx (0..5):<input name='per' value='"));
+	c.print(tmp.gsmPeriodIdx);
+	c.print(F("'></p>"));
+
+	c.print(F("<p><button type='submit'>SAVE</button> "));
+	c.print(F("<a href='/'>Назад</a></p>"));
+
+	c.print(F("</form></body></html>"));
+}
+
+void WebUI::pageNotFound(EthernetClient& c)
+{
+	sendHeader(c,404,F("text/plain; charset=utf-8"));
+	c.print(F("404 Not Found"));
+}
+
+// ---------------- Actions ----------------
+
+void WebUI::actionInternet1Save(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF1,cfg,false);
+
+	bool dhcp;
+	uint8_t ntpIdx,perIdx;
+	uint8_t ip[4],mask[4],gw[4],dns[4];
+
+	if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+	if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+	if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+	const char* sip = findParam(query,"ip");
+	const char* smask = findParam(query,"mask");
+	const char* sgw = findParam(query,"gw");
+	const char* sdns = findParam(query,"dns");
+
+	if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+	if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+	if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+	if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+	lanStore.save(LanIfStore::IF1,cfg,true);
+	applyInternet1FromStore();
+
+	sendRedirect(c,"/internet1");
+}
+
+void WebUI::actionInternet2Save(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	LanIfStore::IfConfig cfg{};
+	lanStore.load(LanIfStore::IF2,cfg,false);
+
+	bool dhcp;
+	uint8_t ntpIdx,perIdx;
+	uint8_t ip[4],mask[4],gw[4],dns[4];
+
+	if (parseBool01(findParam(query,"dhcp"),dhcp)) cfg.dhcp = dhcp ? 1 :0;
+	if (parseU8(findParam(query,"ntpIdx"),ntpIdx,0,4)) cfg.ntpIdx = ntpIdx;
+	if (parseU8(findParam(query,"perIdx"),perIdx,0,5)) cfg.periodIdx = perIdx;
+
+	const char* sip = findParam(query,"ip");
+	const char* smask = findParam(query,"mask");
+	const char* sgw = findParam(query,"gw");
+	const char* sdns = findParam(query,"dns");
+
+	if (sip && parseIp4(sip,ip)) memcpy(cfg.ip,ip,4);
+	if (smask && parseIp4(smask,mask)) memcpy(cfg.mask,mask,4);
+	if (sgw && parseIp4(sgw,gw)) memcpy(cfg.gw,gw,4);
+	if (sdns && parseIp4(sdns,dns)) memcpy(cfg.dns,dns,4);
+
+	lanStore.save(LanIfStore::IF2,cfg,true);
+
+	// ВАЖНО:applyInternet2FromStore() должен при DHCP=1 отправлять 0.0.0.0 в ip/mask/gw/dns
+	applyInternet2FromStore();
+
+	sendRedirect(c,"/internet2");
+}
+
+void WebUI::actionGsmSave(EthernetClient& c,char* query)
+{
+	if (!query) { sendHeader(c,404,F("text/plain")); c.print(F("No query")); return; }
+
+	SyncSourcesStore::Data tmp = syncData;
+
+	bool en;
+	uint8_t op,per;
+
+	if (parseBool01(findParam(query,"en"),en)) tmp.gsmEnable = en ? 1 :0;
+	if (parseU8(findParam(query,"op"),op,0,4)) tmp.gsmProviderIdx = op;
+	if (parseU8(findParam(query,"per"),per,0,5)) tmp.gsmPeriodIdx = per;
+
+	syncData = tmp;
+	syncStore.save(syncData);
+
+	planner.onSettingsChanged();
+
+	sendRedirect(c,"/gsm");
+}
+Если после этого всё ещё будут “multiple definition”
+Тогда где‑то ещё (в любом .h,который попадает в .ino) всё ещё подключается реализация Ethernet.
+
+Сделайте поиск по проекту (включая библиотеки в libraries/):
+
+#include <Ethernet_Generic.h
+#include <EthernetUdp.h
+Должно остаться ровно одно место:в вашем NtpLanService_Generic.cpp.
+
+И отдельно про “FLASH overflowed …”
+Даже после исправления дублей может остаться overflow,если в Arduino IDE выбран размер флеша
+ как 64/128К. Для STM32F103VGT6 нужен 1MB Flash. Скажите,какие у вас пункты в Tools → Flash size / 
+Board part number,и я подскажу точную настройку под VGT6.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+ST‑LINK показывает,что микроконтроллер STM32F103VGT6 (XL‑density) с Flash = 1 MByte. Значит ошибка вида:
+
+section .rodata will not fit in region FLASH
+region FLASH overflowed ...
+возникает не из‑за “реально не хватает памяти”,а потому что Arduino IDE/STM32 core собирает проект 
+с линкер‑скриптом на 64/128/256К,т.е. выбран не тот размер Flash (или не тот “Board part number”).
+
+Ниже что сделать.
+
+1) Проверьте настройки платы в Arduino IDE (STM32duino)
+Вы выбрали: Generic STM32F1 series (STMicroelectronics_GenF1) — это нормально,но внутри важно правильно выбрать вариант чипа/Flash.
+
+Откройте Tools и выставьте:
+
+Board part number:STM32F103VG / STM32F103VGT6 / F103VG (1MB) (название зависит от версии core)
+Flash size:1MB (1024K) (если есть отдельный пункт)
+Optimize:Smallest (-Os) (если есть)
+LTO:Enabled (если есть)
+Debug symbols:None (если есть)
+Если пунктов Flash size / Board part number нет или там максимум 128/256К — значит у вас либо
+ старая версия STM32 core,либо выбрана “не та” плата.
+
+Что должно быть по сути
+Линкер должен взять скрипт типа:
+
+.../ldscript/stm32f103xg.ld (xG = 1MB) а не .../stm32f103xb.ld (128K) и не .../stm32f103xc.ld (256K).
+2) Обновите STM32 core,если нет выбора 1MB
+В Arduino IDE откройте:
+
+Tools → Board → Boards Manager… Найдите “STM32 MCU based boards” (STMicroelectronics) и обновите до актуальной версии.
+
+После обновления заново проверьте пункты Board part number / Flash size.
+
+3) Очистите сборку (важно после ошибки с multiple definition)
+У вас ранее были дубли Ethernet_Generic,что раздувало бинарник. Чтобы убедиться,что Arduino не использует 
+старые промежуточные объекты:
+
+закройте Arduino IDE
+удалите папку сборки (в логе у вас ...Temp\VMBuilds\...)
+откройте IDE и соберите заново
+4) Быстрая диагностика:какой линкер‑скрипт реально используется
+Если вы покажете первые ~30 строк “Verbose output during compilation” 
+(включается в File → Preferences → Show verbose output during compilation),там будет
+ видно путь к .ld. По нему сразу скажу,какой сейчас размер Flash реально задан (xB/xC/xG).
+
+Вопрос (чтобы дать точную настройку “куда кликать” под вашу IDE)
+Скрин/список пунктов из Tools:
+
+Board part number (что там доступно?)
+Flash size (если есть)
+Core version (STM32 MCU based boards,какая версия)
+И покажите 5–10 строк verbose,где упоминается ldscript/.ld. Тогда я точно скажу,какой пункт 
+выбрать именно в вашей конфигурации.
+
+Сейчас у вас осталась только проблема с линкер‑скриптом:сборка идёт как будто Flash не 1MB,поэтому получаете
+
+.rodata will not fit in region FLASH
+FLASH overflowed by 116012 bytes
+Переполнение на ~116К очень похоже на ситуацию,когда проект ~240–260К,а линкер думает,что Flash 128К (а не 1024К).
+
+ST‑LINK показывает 1MB — значит в Arduino IDE выбран не тот “Board part number / Flash size” (или core не использует xG‑скрипт).
+
+1) Включите “Verbose” и найдите какой *.ld используется
+Arduino IDE → File → Preferences:
+
+включите Show verbose output during compilation.
+Соберите ещё раз и найдите в логе строку линковки,где есть -T...something.ld (или путь ldscript/...).
+
+Пришлите сюда 1 строку,где видно:
+
+arm-none-eabi-g++ (или ld) и ключ -T... .ld.
+По имени .ld сразу будет понятно,какой размер Flash сейчас задан (...f103xb... = 128K,...f103xc... = 256K,...f103xg... = 1MB).
+
+2) Что выбрать в меню Tools (для STM32F103VGT6 должно быть xG / 1MB)
+В Arduino IDE → Tools выставьте:
+
+Board part number:STM32F103VG / STM32F103VGT6 / F103VG (1MB) (как называется у вас)
+если есть отдельный пункт Flash size:1MB (1024K)
+(опционально,но полезно) Optimize:Smallest (-Os)
+LTO:Enabled
+Если у вас нет выбора VG/1MB (только C8/CB/… до 128/256K) — значит нужно обновить STM32 core.
+
+3) Обновите пакет плат STM32 (если нет 1MB)
+Arduino IDE → Boards Manager → пакет “STM32 MCU based boards (STMicroelectronics)” → обновить до актуальной версии.
+
+После обновления снова проверьте Tools → Board part number / Flash size.
+
+4) Временная проверка “в лоб”
+Чтобы убедиться,что дело именно в настройке Flash,а не в реальном размере прошивки:
+
+соберите “пустой” проект (минимальный скетч),
+если он тоже компилируется под 128K — будет видно по .ld.
+Что нужно от вас сейчас
+Пришлите:
+
+строку verbose линковки с -T ... .ld
+что у вас видно в Tools → Board part number (список вариантов)
+После этого я скажу точно,какой пункт выбрать,или как принудительно подставить stm32f103xg.ld,если IDE упорно берёт не тот.
+
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+По выводу видно,что WEB‑страницы отдаются как UTF‑8,а русские строки в исходниках у вас 
+сохранены не в UTF‑8 (обычно Windows‑1251). В результате браузер пытается интерпретировать байты CP1251 как UTF‑8 и получаются “ …”.
+
+Есть 2 правильных пути:
+
+Вариант A (рекомендую):оставить UTF‑8 и пересохранить файлы как UTF‑8
+Откройте WebUI.cpp/.h в редакторе (Notepad++/VSCode).
+Выберите Encoding → UTF‑8 (без BOM).
+Сохраните файл.
+В коде оставьте как есть:
+Content-Type:text/html; charset=utf-8
+<meta charset='utf-8'>
+После этого русский текст станет нормальным.
+
+Вариант B (быстро,если не хотите менять кодировку файлов):переключить страницы на Windows‑1251
+Если ваши исходники реально в CP1251,то просто отдавайте страницы как CP1251.
+
+1) В sendHeader() меняем charset
+В WebUI.cpp найдите в sendHeader() строку:
+
+cpp Копировать
+c.print(ct);
+У вас ct передаётся как F("text/html; charset=utf-8"). Замените во всех страницах на:
+
+cpp Копировать
+sendHeader(c,200,F("text/html; charset=windows-1251"));
+и для 404 тоже при желании.
+
+2) Меняем <meta charset>
+Во всех местах,где у вас:
+
+cpp Копировать
+"<meta charset='utf-8'>"
+замените на:
+
+cpp Копировать
+"<meta charset='windows-1251'>"
+Например,в pageHome():
+
+cpp Копировать
+c.print(F("<!doctype html><html><head><meta charset='windows-1251'>"
+ "<title>IVCH Settings</title>..."
+));
+После этого русский текст в браузере станет читабельным без пересохранения файлов.
+
+Что выбрать
+Если вы планируете дальше развивать WEB‑интерфейс — лучше Вариант A (UTF‑8).
+Если нужно “чтобы прямо сейчас заработало” и вы уверены,что файлы в CP1251 — Вариант B.
+Если скажете,в каком редакторе вы редактируете проект (Arduino IDE / VSCode / Keil / Notepad++),я дам точные 
+шаги “куда нажать”,чтобы гарантированно сохранить в UTF‑8.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — как я предлагаю расширить ваш текущий WebUI (3 страницы) так,чтобы появились:
+
+TZ target / TZ NTP
+выбор источников синхронизации (GPS / NET / NET2 / GSM)
+Basic Auth
+JSON API для мониторинга
+GSM:все параметры провайдера (APN/login/pass/PIN/DNS и т.п.)
+При этом JSON API не считаем “страницей” (это просто endpoints /api/...). Страниц остаётся три.
+
+1) Структура WEB (3 страницы + JSON)
+Страницы
+GET / — STATUS (текущие IP/линк/время/источники/последняя синхронизация/сигнал GSM) + ссылки.
+GET /cfg — CONFIG:
+TZ target,TZ NTP
+выбор источника синхронизации (GPS/NET/NET2/GSM)
+INTERNET1 (DHCP + IP/Mask/GW/DNS + NTP upstream + period)
+INTERNET2 (DHCP + IP/Mask/GW/DNS + NTP upstream + period) Кнопка SAVE+APPLY.
+GET /gsm — GSM CONFIG (провайдер):
+enable
+SIM PIN
+APN
+username/password
+auth type (none/PAP/CHAP)
+preferred operator / provider idx (если используете)
+(опционально) DNS1/DNS2 (если ваш стек поддерживает)
+таймауты/ретраи/keepalive (если надо) Кнопка SAVE+APPLY.
+JSON API (для мониторинга извне)
+GET /api/status — текущий статус (IP1/IP2,link,GPS,GSM,last sync,tz)
+GET /api/config — текущая конфигурация (что сохранено в EEPROM)
+(опционально позже) POST /api/config для удалённой конфигурации
+2) Basic Auth (минимально,но правильно)
+Что будет в коде
+В handleClient() читаем заголовки и ищем строку: Authorization:Basic <base64>
+Сравниваем <base64> с заранее ожидаемой строкой.
+Где хранить логин/пароль
+Варианты:
+
+Зашить в прошивку (быстрее).
+Хранить в EEPROM (правильнее). Тогда на странице /cfg добавим поля смены пароля (можно позже).
+Важно по безопасности
+Basic Auth — это без шифрования,только для локальной сети.
+
+3) JSON API (формат,который удобно парсить)
+Пример ответа /api/status:
+
+json Копировать
+{
+ "ip1":"192.168.75.231",
+ "link1":"LINK",
+ "ip2":"192.168.75.184",
+ "internet2_ok":true,
+ "last_sync_ok":false,
+ "tz_target":3,
+ "tz_ntp":0,
+ "source":"NET",
+ "gsm":{
+ "registered":true,
+ "rssi_dbm":-75,
+ "bars":3
+ },
+ "gps":{
+ "fix":false,
+ "sats_used":0,
+ "sats_view":0
+ }
+}
+4) GSM “все параметры провайдера” — что именно нужно от вас
+Я могу сделать WEB‑форму “полностью”,но мне нужно понимать какие параметры реально поддерживает ваш GSM стек (SIM800TimeAsync / ваш клиент).
+
+Минимальный набор,который обычно нужен для провайдера:
+
+gsmEnable (0/1)
+simPin (строка до 8)
+apn (строка до ~32)
+user (строка до ~32)
+pass (строка до ~32)
+auth (0=none,1=PAP,2=CHAP)
+providerIdx (если используете вашу таблицу МТС/Мегафон/…)
+periodIdx (0..5 как у вас)
+Опционально (если у вас в модуле/прошивке это есть):
+
+dns1/dns2
+operator selection (MCC/MNC или “auto/manual”)
+keepAliveSec,retries,attachTimeoutMs
+useNtpOverGsm (если GSM тоже может синхронизировать NTP)
+Нужен ваш текущий storage
+Сейчас SyncSourcesStore::Data у вас содержит только gsmEnable/gsmProviderIdx/gsmPeriodIdx. 
+Для APN/login/pass/PIN нужен новый storage,например:
+
+расширить SyncSourcesStore::Data,или
+добавить отдельный GsmStore (лучше,чтобы не ломать существующее).
+5) Что мне нужно,чтобы я дал готовые полные файлы WebUI.h/WebUI.cpp с этим функционалом
+Пришлите,пожалуйста:
+
+Где сейчас хранятся/должны храниться:
+tzTargetHours и tzNtpHours (я вижу cfg.tzTargetHours/cfg.tzNtpHours + ee.writeTz... — это ок)
+Как в вашем проекте выбирается источник синхронизации:
+какие поля в syncData отвечают за “выбранный источник”
+или как TimeSyncPlanner понимает “source”
+Ваши структуры/функции GSM:
+есть ли уже APN/user/pass/PIN в EEPROM где‑то?
+какие функции применяют GSM‑настройки (аналог applyInternet1FromStore)
+Хотите логин/пароль WEB:
+“зашить в код” (быстро) или “хранить в EEPROM” (правильно)
+После этого я:
+
+добавлю /cfg и /gsm,
+добавлю Basic Auth,
+добавлю /api/status и /api/config,
+и дам полностью обновлённые файлы.
+Примечание по кодировке (чтобы русский не был “кракозябрами”)
+Сохраняйте WebUI.cpp в UTF‑8 без BOM и оставляйте charset=utf-8. 
+Это важно,если хотите русские подписи на страницах.
+
+Напишите,какой вариант авторизации выбираете (в коде или EEPROM)
+ и пришлите текущие поля/структуры для выбора источника и GSM‑настроек — и я подготовлю полный патч.
+ 
+ //+++++++++++++++++++++++++++++++++-----------------------------------*********************
+ 
+ Принято:делаем WEB на 3 страницах + JSON API,добавляем TZ target / TZ NTP,«выбор источника синхронизации»,
+ Basic Auth и GSM‑провайдер (все параметры),и всё это храним в EEPROM.
+
+Но перед внедрением есть критичный момент по карте EEPROM.
+
+0) Критическая ошибка:пересечение адресов EEPROM (нужно исправить!)
+У вас SyncSourcesStore и LanIfStore используют один и тот же I2C addr 0x50 и один и тот же BASE 0x0200:
+
+SyncSourcesStore::BASE = 0x0200
+LanIfStore::BASE_IF1 = 0x0200
+LanIfStore::BASE_IF2 = 0x0240
+Это означает:любая запись SyncSources перезатирает INTERNET1‑настройки,и наоборот. С WEB‑интерфейсом 
+это будет проявляться постоянно («сохранил источник — сломались сети» и т.п.).
+
+Вопрос: у вас реально две разные AT24C128 на одном адресе 0x50 (невозможно на одной шине) или это одна EEPROM?
+
+Если EEPROM одна,нужно срочно развести области. Самый простой вариант:
+
+оставить AT24C128Settings как есть (0x0000..0x018F),
+оставить LanIfStore (0x0200..),
+перенести SyncSourcesStore::BASE с 0x0200 на 0x0280 или 0x0300 (и обновить код миграции).
+Скажите,пожалуйста:у вас одна EEPROM 0x50 или несколько/другая шина? Тогда я дам точный патч по адресам.
+
+1) WEB:3 страницы + JSON endpoints (как вы хотите)
+Страницы
+/ — STATUS (текущее:IP1/Link,IP2 по I2C,GSM,GPS,выбранный источник,TZ)
+/cfg — CONFIG:
+TZ target / TZ NTP (из AT24C128Settings::Config)
+выбор источника синхронизации radio (GPS / NET / NET2 / GSM)
+реализуем так:в EEPROM ставим Enable=1 только у выбранного,остальные Enable=0
+INTERNET1/INTERNET2 настройки (ваш LanIfStore)
+WEB‑логин/пароль (Basic Auth,хранить в EEPROM)
+/gsm — GSM провайдер:
+APN/USER/PASS/SERVER (у вас уже есть в AT24C128Settings::Config)
+доп.поля (SIM PIN,auth type и т.п.) — добавим отдельным маленьким store в EEPROM (см. ниже)
+JSON API (не “страницы”,а endpoints)
+/api/status — текущее состояние (для мониторинга)
+/api/config — текущая конфигурация (что в EEPROM)
+2) Basic Auth с хранением в EEPROM (без изменения AT24C128Settings)
+Чтобы не ломать ваш AT24C128Settings и не трогать его VERSION,предлагаю отдельный маленький класс
+ WebAuthStore,который читает/пишет фиксированные строки по свободным адресам EEPROM.
+
+По вашей карте:
+
+AT24C128Settings занимает до ADDR_SERVER(0x0160)+48 = 0x018F
+значит свободно начиная с 0x0190 до 0x01FF (перед 0x0200)
+Туда можно поместить:
+
+WebAuthStore (логин/пароль)
+GsmExtraStore (SIM PIN / authType)
+3) GSM “все параметры провайдера”
+У вас уже есть в EEPROM (и это отлично):
+
+cfg.apn[32]
+cfg.user[32]
+cfg.pass[32]
+cfg.server[48] (вероятно ваш upstream/сервер)
+Не хватает типичных “операторских” вещей:
+
+SIM PIN
+тип авторизации PDP (none/PAP/CHAP) — если ваш стек это реально использует
+(опционально) DNS1/DNS2 — если поддерживается вашей GSM логикой
+Вопрос по GSM (важно)
+Ваш SIM800‑код реально поддерживает:
+
+SIM PIN (вводится AT-командой AT+CPIN=)?
+PAP/CHAP выбор (какими AT‑командами у вас делается)?
+SERVER — это NTP сервер для SIM800 (AT+CNTP) или что-то другое?
+Если ответите “да/нет” по пунктам — я включу ровно те поля,которые реально применяются вашей логикой.
+
+4) Что я сделаю дальше (после вашего ответа про EEPROM конфликт)
+Я подготовлю полные обновлённые файлы:
+
+WebUI.h / WebUI.cpp (3 страницы + BasicAuth + JSON)
+новый WebAuthStore.h/.cpp
+новый GsmExtraStore.h/.cpp (SIM PIN/authType)
+патч по адресу EEPROM (если подтвердите что EEPROM одна) для устранения конфликта SyncSourcesStore vs LanIfStore
+Нужно от вас 2 коротких ответа
+EEPROM одна на 0x50 (Wire) или разные? (если разные — какие адреса/какие Wire?)
+GSM:нужны поля SIM PIN и auth type PAP/CHAP (поддерживается ли вашим кодом)?
+После этого я дам готовый комплект файлов под вашу архитектуру проекта.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Да,при одной EEPROM 0x50 у вас сейчас реальный конфликт адресов:
+
+LanIfStore::BASE_IF1 = 0x0200
+SyncSourcesStore::BASE = 0x0200
+То есть INTERNET1 и SyncSources пишут в один и тот же участок,и будут взаимно “портить” данные. 
+С появлением WEB это начнёт проявляться постоянно.
+
+Нужно развести области EEPROM.
+
+1) Предлагаемая карта EEPROM (без ломки существующих блоков)
+Оставляем как есть:
+
+AT24C128Settings:0x0000..0x018F
+LanIfStore IF1:0x0200..0x023F
+LanIfStore IF2:0x0240..0x027F
+Переносим:
+
+SyncSourcesStore:с 0x0200 → 0x0280 (новая область 0x0280..0x02BF)
+Свободный “карман” 0x0190..0x01FF оставим под:
+
+WEB BasicAuth (логин/пароль)
+GSM extra (SIM PIN / authType и т.п.)
+2) Полный обновлённый SyncSourcesStore.h (с новым BASE)
+Замените ваш файл на этот:
+
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class SyncSourcesStore {
+public:
+	static constexpr uint8_t I2C_ADDR = 0x50;
+
+	struct Data {
+		uint8_t gpsEnable; // 0/1
+		uint8_t gpsPeriodIdx; // 0..5
+
+		uint8_t netEnable; // 0/1 (SIM800 NTP)
+		uint8_t netProviderIdx; // 0..4 (NTP server index)
+		uint8_t netPeriodIdx; // 0..5
+
+		uint8_t gsmEnable; // 0/1 (SIM800 CCLK)
+		uint8_t gsmProviderIdx; // 0..4 (оператор)
+		uint8_t gsmPeriodIdx; // 0..5
+
+		// Internet2 over I2C/W5500 module
+		uint8_t net2Enable; // 0/1
+		uint8_t net2PeriodIdx; // 0..5
+	};
+
+	explicit SyncSourcesStore(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+	bool begin();
+	void defaults(Data& d);
+
+	// strict (magic/ver must match current VERSION) — читаем ТОЛЬКО из новой области
+	bool load(Data& d);
+
+	// best effort:
+	// - if no magic -> defaults (return false)
+	// - if old location has valid magic -> migrate to new location (return true)
+	// - if old version -> migrate to new (return true)
+	bool loadLoose(Data& d);
+
+	bool save(const Data& d);
+
+	// ===== Новая базовая область (НЕ пересекается с LanIfStore) =====
+	static constexpr uint16_t BASE = 0x0280;
+
+	// Старая область (для миграции),раньше конфликтовала с LanIfStore::IF1
+	static constexpr uint16_t OLD_BASE = 0x0200;
+
+	// фикс. адреса (для внешних программ)
+	static constexpr uint16_t ADDR_MAGIC = BASE + 0; // u16
+	static constexpr uint16_t ADDR_VER = BASE + 2; // u8
+	static constexpr uint16_t ADDR_DATA = BASE + 4; // Data bytes
+
+	// (опционально) фикс адреса отдельных полей внутри Data
+	static constexpr uint16_t ADDR_gpsEnable = ADDR_DATA + 0;
+	static constexpr uint16_t ADDR_gpsPeriodIdx = ADDR_DATA + 1;
+	static constexpr uint16_t ADDR_netEnable = ADDR_DATA + 2;
+	static constexpr uint16_t ADDR_netProviderIdx= ADDR_DATA + 3;
+	static constexpr uint16_t ADDR_netPeriodIdx = ADDR_DATA + 4;
+	static constexpr uint16_t ADDR_gsmEnable = ADDR_DATA + 5;
+	static constexpr uint16_t ADDR_gsmProviderIdx= ADDR_DATA + 6;
+	static constexpr uint16_t ADDR_gsmPeriodIdx = ADDR_DATA + 7;
+	static constexpr uint16_t ADDR_net2Enable = ADDR_DATA + 8;
+	static constexpr uint16_t ADDR_net2PeriodIdx = ADDR_DATA + 9;
+
+private:
+	TwoWire* _w;
+	uint8_t _addr;
+
+	static constexpr uint16_t MAGIC = 0x5359; // 'SY'
+	static constexpr uint8_t VERSION = 2; // формат Data (остался прежним)
+	static constexpr uint8_t PAGE_SIZE = 64;
+
+	// размер старой структуры (VERSION=1) — 8 байт
+	static constexpr uint8_t OLD_SIZE_V1 = 8;
+
+	bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+	bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool waitReady(uint32_t timeoutMs = 50);
+
+	bool readU8(uint16_t memAddr,uint8_t& v);
+	bool writeU8(uint16_t memAddr,uint8_t v);
+	bool readU16(uint16_t memAddr,uint16_t& v);
+	bool writeU16(uint16_t memAddr,uint16_t v);
+
+	// helpers для миграции
+	bool loadFromBase(uint16_t base,Data& d,bool strict);
+	bool saveToBase(uint16_t base,const Data& d,bool writeMagic);
+};
+3) Что нужно поправить в SyncSourcesStore.cpp
+Чтобы устройства с уже записанными настройками могли “поднять” старые данные,в loadLoose() нужно:
+
+Сначала попытаться прочитать из новой области BASE=0x0280
+Если там magic отсутствует — попробовать старую OLD_BASE=0x0200
+Если в старой области magic валиден — прочитать и сразу сохранить в новую (миграция)
+Если нигде нет magic — defaults()
+Я специально добавил в .h методы loadFromBase()/saveToBase(),чтобы это аккуратно реализовать.
+
+Если пришлёте ваш текущий SyncSourcesStore.cpp,я внесу правки и отправлю полный файл с миграцией.
+
+4) Дальше по WEB/BasicAuth/GSM
+Теперь,когда EEPROM‑карта будет корректная,я добавлю:
+
+WebAuthStore в диапазоне 0x0190..0x01BF (логин/пароль)
+GsmExtraStore в 0x01C0..0x01FF (SIM PIN/authType/и т.п.)
+обновлённые WebUI.h/.cpp (3 страницы + BasicAuth + JSON API)
+Пришлите,пожалуйста
+ваш SyncSourcesStore.cpp (текущий)
+подтверждение:можем ли мы использовать EEPROM 0x0190..0x01FF под WEB‑auth и GSM‑extra? 
+(обычно да,но хочу подтверждение,что там у вас ничего не занято)
+После этого дам готовые полные файлы под новый этап.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Подтверждение принято:диапазон 0x0190..0x01FF свободен — отлично,его используем под WEB‑BasicAuth и GSM extra.
+
+Сейчас нужно закрыть самую критичную часть:развести EEPROM области,т.е. исправить SyncSourcesStore так,чтобы он больше не пересекался с LanIfStore.
+
+Вы уже получили обновлённый SyncSourcesStore.h с BASE=0x0280 и OLD_BASE=0x0200. Ниже даю полный SyncSourcesStore.cpp с:
+
+чтением/записью в новую область 0x0280,
+миграцией из старой области 0x0200 (если там лежат валидные magic/ver SyncSources),
+поддержкой старого формата VERSION=1 (8 байт).
+SyncSourcesStore.cpp (полный файл)
+cpp Копировать
+#include "SyncSourcesStore.h"
+
+SyncSourcesStore::SyncSourcesStore(TwoWire& w,uint8_t addr)
+	:_w(&w),_addr(addr)
+{}
+
+bool SyncSourcesStore::begin()
+{
+	// Проверка наличия EEPROM на шине
+	_w->beginTransmission(_addr);
+	return (_w->endTransmission() == 0);
+}
+
+void SyncSourcesStore::defaults(Data& d)
+{
+	memset(&d,0,sizeof(d));
+
+	d.gpsEnable = 0;
+	d.gpsPeriodIdx = 3;
+
+	d.netEnable = 0;
+	d.netProviderIdx = 0;
+	d.netPeriodIdx = 3;
+
+	d.gsmEnable = 0;
+	d.gsmProviderIdx = 0;
+	d.gsmPeriodIdx = 3;
+
+	d.net2Enable = 0;
+	d.net2PeriodIdx = 3;
+}
+
+bool SyncSourcesStore::load(Data& d)
+{
+	// strict load from NEW BASE only
+	return loadFromBase(BASE,d,true);
+}
+
+bool SyncSourcesStore::loadLoose(Data& d)
+{
+	// 1) Пытаемся читать из НОВОЙ области
+	if (loadFromBase(BASE,d,true))
+		return true;
+
+	// 2) Если в новой области пусто/нет magic — пробуем СТАРУЮ (для миграции)
+	Data tmp;
+	if (loadFromBase(OLD_BASE,tmp,true))
+	{
+		// Миграция:сохраняем в новую область
+		(void)saveToBase(BASE,tmp,true);
+		d = tmp;
+		return true;
+	}
+
+	// 3) Ничего валидного — defaults
+	defaults(d);
+	return false;
+}
+
+bool SyncSourcesStore::save(const Data& d)
+{
+	return saveToBase(BASE,d,true);
+}
+
+// ---------------------- low-level helpers ----------------------
+
+bool SyncSourcesStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len)
+{
+	// Типичный протокол AT24:записать адрес (2 байта),затем repeated-start и чтение
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	if (_w->endTransmission(false) != 0) return false;
+
+	size_t got = _w->requestFrom((int)_addr,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		int v = _w->read();
+		if (v < 0) return false;
+		out[i] = (uint8_t)v;
+	}
+	return true;
+}
+
+bool SyncSourcesStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len)
+{
+	// Пишем постранично (PAGE_SIZE=64)
+	size_t off = 0;
+	while (off < len)
+	{
+		const uint16_t curAddr = (uint16_t)(memAddr + off);
+		const uint16_t pageOff = (uint16_t)(curAddr % PAGE_SIZE);
+		const size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+
+		if (!writePage(curAddr,data + off,chunk)) return false;
+		if (!waitReady(50)) return false;
+
+		off += chunk;
+	}
+	return true;
+}
+
+bool SyncSourcesStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len)
+{
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	for (size_t i = 0; i < len; i++) _w->write(data[i]);
+	return (_w->endTransmission() == 0);
+}
+
+bool SyncSourcesStore::waitReady(uint32_t timeoutMs)
+{
+	const uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs)
+	{
+		_w->beginTransmission(_addr);
+		if (_w->endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool SyncSourcesStore::readU8(uint16_t memAddr,uint8_t& v)
+{
+	return readBytes(memAddr,&v,1);
+}
+
+bool SyncSourcesStore::writeU8(uint16_t memAddr,uint8_t v)
+{
+	return writeBytes(memAddr,&v,1);
+}
+
+bool SyncSourcesStore::readU16(uint16_t memAddr,uint16_t& v)
+{
+	uint8_t b[2];
+	if (!readBytes(memAddr,b,2)) return false;
+	v = (uint16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8)); // LE
+	return true;
+}
+
+bool SyncSourcesStore::writeU16(uint16_t memAddr,uint16_t v)
+{
+	uint8_t b[2];
+	b[0] = (uint8_t)(v & 0xFF);
+	b[1] = (uint8_t)(v >> 8);
+	return writeBytes(memAddr,b,2);
+}
+
+// ---------------------- base-aware load/save (migration support) ----------------------
+
+bool SyncSourcesStore::loadFromBase(uint16_t base,Data& d,bool strict)
+{
+	uint16_t mg = 0;
+	uint8_t ver = 0;
+
+	if (!readU16(base + 0,mg)) return false;
+	if (!readU8(base + 2,ver)) return false;
+
+	if (mg != MAGIC)
+	{
+		// если strict — сразу отказ
+		// если loose — тоже отказ (т.к. мы не хотим "угадывать" данные)
+		(void)strict;
+		return false;
+	}
+
+	if (ver == 1)
+	{
+		// old V1:8 bytes (до gsmPeriodIdx включительно)
+		uint8_t b[OLD_SIZE_V1];
+		if (!readBytes(base + 4,b,OLD_SIZE_V1)) return false;
+
+		memset(&d,0,sizeof(d));
+		d.gpsEnable = b[0];
+		d.gpsPeriodIdx = b[1];
+		d.netEnable = b[2];
+		d.netProviderIdx = b[3];
+		d.netPeriodIdx = b[4];
+		d.gsmEnable = b[5];
+		d.gsmProviderIdx = b[6];
+		d.gsmPeriodIdx = b[7];
+
+		// новые поля V2
+		d.net2Enable = 0;
+		d.net2PeriodIdx = 3;
+		return true;
+	}
+	else if (ver == 2)
+	{
+		// V2:полный размер структуры (10 байт)
+		uint8_t b[sizeof(Data)];
+		if (!readBytes(base + 4,b,sizeof(Data))) return false;
+		memcpy(&d,b,sizeof(Data));
+		return true;
+	}
+
+	// неизвестная версия
+	return false;
+}
+
+bool SyncSourcesStore::saveToBase(uint16_t base,const Data& d,bool writeMagic)
+{
+	// MAGIC
+	if (writeMagic)
+	{
+		if (!writeU16(base + 0,MAGIC)) return false;
+	}
+
+	// VERSION
+	if (!writeU8(base + 2,VERSION)) return false;
+
+	// DATA
+	const uint8_t* p = reinterpret_cast<const uint8_t*>(&d);
+	if (!writeBytes(base + 4,p,sizeof(Data))) return false;
+
+	return true;
+}
+Что сделать в setup() (важно для миграции)
+Первый запуск после прошивки с новым BASE:
+
+cpp Копировать
+syncStore.loadLoose(syncData); // миграция со старого 0x0200 -> новый 0x0280 (если там были SY/magic)
+После этого можно сохранять/менять настройки без конфликта с LanIfStore.
+
+Следующий шаг (WEB BasicAuth + GSM extra + выбор источника + TZ + JSON)
+Теперь,когда EEPROM‑адреса разведены и у нас есть свободное окно 0x0190..0x01FF,я могу добавить:
+
+WebAuthStore (логин/пароль) в 0x0190..
+GsmExtraStore (SIM PIN + auth type и т.п.)
+обновлённый WebUI (3 страницы /,/cfg,/gsm + /api/status и /api/config + Basic Auth)
+Перед этим уточните,пожалуйста,по GSM:
+
+Нужен ли SIM PIN (да/нет)?
+Нужен ли выбор auth type (none/PAP/CHAP) (да/нет)?
+Поле cfg.server у вас для GSM — это NTP сервер (AT+CNTP) или что-то другое?
+После вашего ответа дам полный комплект файлов для WEB следующего этапа.

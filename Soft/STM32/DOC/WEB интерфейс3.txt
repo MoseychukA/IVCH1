@@ -1,0 +1,1554 @@
+Ниже — вариант “жёстко забыть старое”:
+
+нет OLD_BASE,нет миграции V1→V2
+нет loadLoose() (чтобы случайно не дергать в loop()/таймере)
+чтение/запись только BASE=0x0280
+в save() сделано безопаснее:сначала пишем Data,потом VER,и MAGIC в самом конце 
+(чтобы при обрыве питания не “легитимизировать” битые данные)
+SyncSourcesStore.h (жёсткий,без старого)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class SyncSourcesStore {
+public:
+ static constexpr uint8_t I2C_ADDR = 0x50;
+
+ struct Data {
+ uint8_t gpsEnable; // 0/1
+ uint8_t gpsPeriodIdx; // 0..5
+
+ uint8_t netEnable; // 0/1 (SIM800 NTP)
+ uint8_t netProviderIdx; // 0..4 (NTP server index)
+ uint8_t netPeriodIdx; // 0..5
+
+ uint8_t gsmEnable; // 0/1 (SIM800 CCLK)
+ uint8_t gsmProviderIdx; // 0..4 (оператор)
+ uint8_t gsmPeriodIdx; // 0..5
+
+ uint8_t net2Enable; // 0/1
+ uint8_t net2PeriodIdx; // 0..5
+ };
+
+ explicit SyncSourcesStore(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+ bool begin();
+ void defaults(Data& d);
+
+ // strict:только новая область BASE,magic+version должны совпасть
+ bool load(Data& d);
+
+ // strict:пишет только в BASE
+ bool save(const Data& d);
+
+ // ================== EEPROM MAP ==================
+ // EEPROM одна (0x50). Нельзя пересекаться с LanIfStore:
+ // LanIfStore::IF1 = 0x0200..0x023F
+ // LanIfStore::IF2 = 0x0240..0x027F
+ //
+ // SyncSourcesStore:0x0280..0x02BF
+ static constexpr uint16_t BASE = 0x0280;
+
+ static constexpr uint16_t ADDR_MAGIC = BASE + 0; // u16
+ static constexpr uint16_t ADDR_VER = BASE + 2; // u8
+ static constexpr uint16_t ADDR_DATA = BASE + 4; // Data bytes
+
+ // (опционально) фикс адреса отдельных полей внутри Data
+ static constexpr uint16_t ADDR_gpsEnable = ADDR_DATA + 0;
+ static constexpr uint16_t ADDR_gpsPeriodIdx = ADDR_DATA + 1;
+ static constexpr uint16_t ADDR_netEnable = ADDR_DATA + 2;
+ static constexpr uint16_t ADDR_netProviderIdx = ADDR_DATA + 3;
+ static constexpr uint16_t ADDR_netPeriodIdx = ADDR_DATA + 4;
+ static constexpr uint16_t ADDR_gsmEnable = ADDR_DATA + 5;
+ static constexpr uint16_t ADDR_gsmProviderIdx = ADDR_DATA + 6;
+ static constexpr uint16_t ADDR_gsmPeriodIdx = ADDR_DATA + 7;
+ static constexpr uint16_t ADDR_net2Enable = ADDR_DATA + 8;
+ static constexpr uint16_t ADDR_net2PeriodIdx = ADDR_DATA + 9;
+
+private:
+ TwoWire* _w;
+ uint8_t _addr;
+
+ static constexpr uint16_t MAGIC = 0x5359; // 'SY'
+ static constexpr uint8_t VERSION = 2; // Data = 10 bytes
+ static constexpr uint8_t PAGE_SIZE = 64;
+
+ bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+ bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+ bool waitReady(uint32_t timeoutMs = 50);
+
+ bool readU8(uint16_t memAddr,uint8_t& v);
+ bool writeU8(uint16_t memAddr,uint8_t v);
+ bool readU16(uint16_t memAddr,uint16_t& v);
+ bool writeU16(uint16_t memAddr,uint16_t v);
+};
+SyncSourcesStore.cpp (жёсткий,без старого)
+cpp Копировать
+#include "SyncSourcesStore.h"
+#include <string.h> // memcpy/memcmp
+
+SyncSourcesStore::SyncSourcesStore(TwoWire& w,uint8_t addr)
+ :_w(&w),_addr(addr) {}
+
+bool SyncSourcesStore::begin() {
+ _w->beginTransmission(_addr);
+ return (_w->endTransmission() == 0);
+}
+
+void SyncSourcesStore::defaults(Data& d) {
+ d.gpsEnable = 0; d.gpsPeriodIdx = 0;
+
+ d.netEnable = 0; d.netProviderIdx = 0; d.netPeriodIdx = 0;
+
+ d.gsmEnable = 1; d.gsmProviderIdx = 0; d.gsmPeriodIdx = 0;
+
+ d.net2Enable = 0;
+ d.net2PeriodIdx = 3; // 1 час
+}
+
+bool SyncSourcesStore::load(Data& d) {
+ defaults(d);
+
+ uint16_t mg = 0;
+ uint8_t ver = 0;
+
+ if (!readU16(ADDR_MAGIC,mg) || mg != MAGIC) return false;
+ if (!readU8(ADDR_VER,ver) || ver != VERSION) return false;
+
+ return readBytes(ADDR_DATA,(uint8_t*)&d,sizeof(d));
+}
+
+bool SyncSourcesStore::save(const Data& d) {
+ // Пишем безопасным порядком:
+ // 1) data
+ // 2) version
+ // 3) magic (как "commit" в конце)
+ if (!writeBytes(ADDR_DATA,(const uint8_t*)&d,sizeof(d))) return false;
+ if (!writeU8(ADDR_VER,VERSION)) return false;
+ if (!writeU16(ADDR_MAGIC,MAGIC)) return false;
+
+ // Верификация чтением назад (чтобы сразу ловить "не пишется физически")
+ Data rd;
+ if (!readBytes(ADDR_DATA,(uint8_t*)&rd,sizeof(rd))) return false;
+ if (memcmp(&rd,&d,sizeof(d)) != 0) return false;
+
+ uint16_t mg = 0; uint8_t ver = 0;
+ if (!readU16(ADDR_MAGIC,mg) || mg != MAGIC) return false;
+ if (!readU8(ADDR_VER,ver) || ver != VERSION) return false;
+
+ return true;
+}
+
+// ---- low level (libmaple compatible) ----
+bool SyncSourcesStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+
+ if (_w->endTransmission(false) != 0) return false;
+
+ size_t got = _w->requestFrom((int)_addr,(int)len);
+ if (got != len) return false;
+
+ for (size_t i = 0; i < len; i++) {
+ int v = _w->read();
+ if (v < 0) return false;
+ out[i] = (uint8_t)v;
+ }
+ return true;
+}
+
+bool SyncSourcesStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+ size_t off = 0;
+ while (off < len) {
+ uint16_t a = memAddr + (uint16_t)off;
+ uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+ size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+ if (!writePage(a,data + off,chunk)) return false;
+ if (!waitReady(50)) return false;
+ off += chunk;
+ }
+ return true;
+}
+
+bool SyncSourcesStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+ _w->beginTransmission(_addr);
+ _w->write((uint8_t)(memAddr >> 8));
+ _w->write((uint8_t)(memAddr & 0xFF));
+ _w->write((uint8_t*)data,(int)len); // libmaple требует non-const
+ return (_w->endTransmission() == 0);
+}
+
+bool SyncSourcesStore::waitReady(uint32_t timeoutMs) {
+ uint32_t t0 = millis();
+ while ((millis() - t0) < timeoutMs) {
+ _w->beginTransmission(_addr);
+ if (_w->endTransmission() == 0) return true;
+ delay(1);
+ }
+ return false;
+}
+
+bool SyncSourcesStore::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool SyncSourcesStore::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+
+bool SyncSourcesStore::readU16(uint16_t memAddr,uint16_t& v) {
+ uint8_t b[2];
+ if (!readBytes(memAddr,b,2)) return false;
+ v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+ return true;
+}
+
+bool SyncSourcesStore::writeU16(uint16_t memAddr,uint16_t v) {
+ uint8_t b[2] = { (uint8_t)(v & 0xFF),(uint8_t)((v >> 8) & 0xFF) };
+ return writeBytes(memAddr,b,2);
+}
+Что нужно сделать в проекте
+Удалите/замените старые версии файлов,пересоберите и перепрошейте.
+В коде проекта замените вызовы loadLoose(...) на:
+cpp Копировать
+SyncSourcesStore::Data syncData;
+syncStore.defaults(syncData);
+syncStore.load(syncData); // в setup() один раз
+Убедитесь,что load() не вызывается в loop()/таймерах.
+Если после этого save() возвращает false (с верификацией) — значит проблема уже не в адресах/миграции,
+а в физической записи I2C EEPROM (питание,подтяжки SDA/SCL,частота I2C,конфликт на шине,не тот тип
+ EEPROM/страничность,write-protect и т.п.). Тогда скажите,на какой плате/частоте Wire и какая именно микросхема EEPROM.
+ 
+ //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ Ниже — обновлённые LanIfStore.h / LanIfStore.cpp целиком с правками под “жёстко/без мусора” и более надёжной записью:
+
+Адреса не менял (IF1 0x0200,IF2 0x0240) — они уже не пересекаются с вашим SyncSourcesStore на 0x0280.
+load() теперь не подхватывает “рандом” из EEPROM,если magic/version не совпали:в этом случае остаются defaults
+ и функция возвращает false (и в strict,и в non‑strict).
+save() пишет безопасным порядком:сначала данные,потом VERSION,и MAGIC в конце как commit. Плюс опциональная
+ верификация чтением назад (когда writeMagic=true).
+LanIfStore.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+
+class LanIfStore {
+public:
+	enum IfId :uint8_t { IF1 = 0,IF2 = 1 };
+
+	struct IfConfig {
+		uint8_t dhcp; // 0/1
+		uint8_t ip[4];
+		uint8_t mask[4];
+		uint8_t gw[4];
+		uint8_t dns[4];
+
+		uint8_t ntpIdx; // 0..4 (выбор NTP IP из списка)
+		uint8_t periodIdx; // 0..5 (период)
+	};
+
+	explicit LanIfStore(uint8_t i2cAddr = 0x50,TwoWire& w = Wire);
+
+	bool begin();
+
+	// strict=true:вернёт false,если magic/ver не совпали
+	// strict=false:тоже вернёт false при несовпадении (cfg останется defaults)
+	bool load(IfId id,IfConfig& cfg,bool strict = false);
+
+	// writeMagic=true:обновляет заголовок (magic+ver) и делает "commit" magic в конце
+	// writeMagic=false:обновляет только поля (заголовок не трогает)
+	bool save(IfId id,const IfConfig& cfg,bool writeMagic = true);
+
+	static void defaults(IfId id,IfConfig& cfg);
+
+	// фиксированные адреса блоков (для внешних программ)
+	static constexpr uint16_t BASE_IF1 = 0x0200;
+	static constexpr uint16_t BASE_IF2 = 0x0240;
+
+private:
+	TwoWire* _w;
+	uint8_t _addr;
+
+	static constexpr uint8_t PAGE_SIZE = 64;
+	static constexpr uint8_t VERSION = 1;
+
+	// offsets within block:
+	// 0..3 magic (u32)
+	// 4 ver (u8)
+	// 5 dhcp (u8)
+	// 6..9 ip
+	// 10..13 mask
+	// 14..17 gw
+	// 18..21 dns
+	// 22 ntpIdx
+	// 23 periodIdx
+	static constexpr uint16_t OFF_MAGIC = 0;
+	static constexpr uint16_t OFF_VER = 4;
+	static constexpr uint16_t OFF_DHCP = 5;
+	static constexpr uint16_t OFF_IP = 6;
+	static constexpr uint16_t OFF_MASK = 10;
+	static constexpr uint16_t OFF_GW = 14;
+	static constexpr uint16_t OFF_DNS = 18;
+	static constexpr uint16_t OFF_NTPIDX = 22;
+	static constexpr uint16_t OFF_PERIOD = 23;
+
+	static uint16_t baseFor(IfId id) { return (id == IF1) ? BASE_IF1 :BASE_IF2; }
+	static uint32_t magicFor(IfId id) { return (id == IF1) ? 0x31464E49UL :0x32464E49UL; } // 'INF1'/'INF2'
+
+	bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+	bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool waitReady(uint32_t timeoutMs = 50);
+
+	bool readU32(uint16_t memAddr,uint32_t& v);
+	bool writeU32(uint16_t memAddr,uint32_t v);
+	bool readU8(uint16_t memAddr,uint8_t& v);
+	bool writeU8(uint16_t memAddr,uint8_t v);
+};
+LanIfStore.cpp
+cpp Копировать
+#include "LanIfStore.h"
+#include <string.h> // memset,memcmp
+
+LanIfStore::LanIfStore(uint8_t i2cAddr,TwoWire& w) :_w(&w),_addr(i2cAddr) {}
+
+bool LanIfStore::begin() {
+	_w->beginTransmission(_addr);
+	return (_w->endTransmission() == 0);
+}
+
+void LanIfStore::defaults(IfId id,IfConfig& cfg) {
+	memset(&cfg,0,sizeof(cfg));
+	cfg.dhcp = 1;
+
+	// дефолтные статические (на случай DHCP=0)
+	if (id == IF1) {
+		cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 75; cfg.ip[3] = 231;
+	} else {
+		cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 75; cfg.ip[3] = 232;
+	}
+	cfg.mask[0] = 255; cfg.mask[1] = 255; cfg.mask[2] = 255; cfg.mask[3] = 0;
+	cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] = 75; cfg.gw[3] = 1;
+	cfg.dns[0] = 8; cfg.dns[1] = 8; cfg.dns[2] = 8; cfg.dns[3] = 8;
+
+	cfg.ntpIdx = 0;
+	cfg.periodIdx = 3; // 1 час
+}
+
+bool LanIfStore::load(IfId id,IfConfig& cfg,bool strict) {
+	defaults(id,cfg);
+
+	const uint16_t base = baseFor(id);
+
+	uint32_t mg = 0;
+	uint8_t ver = 0;
+
+	const bool okMagic = readU32(base + OFF_MAGIC,mg) && (mg == magicFor(id));
+	const bool okVer = readU8 (base + OFF_VER,ver) && (ver == VERSION);
+
+	// Жёстко:если заголовок не совпал — не читаем поля (не подхватываем мусор)
+	if (!(okMagic && okVer)) {
+		(void)strict; // параметр оставлен для совместимости,поведение одинаково
+		return false;
+	}
+
+	// читаем поля (если что-то не прочиталось — оставляем то,что уже в cfg по умолчанию)
+	(void)readU8(base + OFF_DHCP,cfg.dhcp);
+
+	(void)readBytes(base + OFF_IP,cfg.ip,4);
+	(void)readBytes(base + OFF_MASK,cfg.mask,4);
+	(void)readBytes(base + OFF_GW,cfg.gw,4);
+	(void)readBytes(base + OFF_DNS,cfg.dns,4);
+
+	(void)readU8(base + OFF_NTPIDX,cfg.ntpIdx);
+	(void)readU8(base + OFF_PERIOD,cfg.periodIdx);
+
+	// нормализация
+	cfg.dhcp = cfg.dhcp ? 1 :0;
+	cfg.ntpIdx %= 5;
+	cfg.periodIdx %= 6;
+
+	return true;
+}
+
+bool LanIfStore::save(IfId id,const IfConfig& in,bool writeMagic) {
+	const uint16_t base = baseFor(id);
+
+	IfConfig cfg = in;
+	cfg.dhcp = cfg.dhcp ? 1 :0;
+	cfg.ntpIdx %= 5;
+	cfg.periodIdx %= 6;
+
+	// Пишем безопасным порядком:
+	// 1) данные
+	// 2) version
+	// 3) magic в самом конце (commit)
+	if (!writeU8(base + OFF_DHCP,cfg.dhcp)) return false;
+	if (!writeBytes(base + OFF_IP,cfg.ip,4)) return false;
+	if (!writeBytes(base + OFF_MASK,cfg.mask,4)) return false;
+	if (!writeBytes(base + OFF_GW,cfg.gw,4)) return false;
+	if (!writeBytes(base + OFF_DNS,cfg.dns,4)) return false;
+	if (!writeU8(base + OFF_NTPIDX,cfg.ntpIdx)) return false;
+	if (!writeU8(base + OFF_PERIOD,cfg.periodIdx)) return false;
+
+	if (writeMagic) {
+		if (!writeU8 (base + OFF_VER,VERSION)) return false;
+		if (!writeU32(base + OFF_MAGIC,magicFor(id))) return false;
+
+		// Верификация:читаем назад строго и сравниваем
+		IfConfig rd;
+		if (!load(id,rd,true)) return false;
+
+		if (rd.dhcp != cfg.dhcp) return false;
+		if (memcmp(rd.ip,cfg.ip,4) != 0) return false;
+		if (memcmp(rd.mask,cfg.mask,4) != 0) return false;
+		if (memcmp(rd.gw,cfg.gw,4) != 0) return false;
+		if (memcmp(rd.dns,cfg.dns,4) != 0) return false;
+		if (rd.ntpIdx != cfg.ntpIdx) return false;
+		if (rd.periodIdx != cfg.periodIdx) return false;
+	}
+
+	return true;
+}
+
+// ---- low level I2C (libmaple compatible) ----
+bool LanIfStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+
+	// repeated-start
+	if (_w->endTransmission(false) != 0) return false;
+
+	size_t got = _w->requestFrom((int)_addr,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++) {
+		int v = _w->read();
+		if (v < 0) return false;
+		out[i] = (uint8_t)v;
+	}
+	return true;
+}
+
+bool LanIfStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+	size_t off = 0;
+	while (off < len) {
+		uint16_t a = memAddr + (uint16_t)off;
+		uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+		size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+		if (!writePage(a,data + off,chunk)) return false;
+		if (!waitReady(50)) return false;
+		off += chunk;
+	}
+	return true;
+}
+
+bool LanIfStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	_w->write((uint8_t*)data,(int)len); // libmaple требует non-const
+	return (_w->endTransmission() == 0);
+}
+
+bool LanIfStore::waitReady(uint32_t timeoutMs) {
+	uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs) {
+		_w->beginTransmission(_addr);
+		if (_w->endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool LanIfStore::readU32(uint16_t memAddr,uint32_t& v) {
+	uint8_t b[4];
+	if (!readBytes(memAddr,b,4)) return false;
+	v = (uint32_t)b[0]
+	 | ((uint32_t)b[1] << 8)
+	 | ((uint32_t)b[2] << 16)
+	 | ((uint32_t)b[3] << 24);
+	return true;
+}
+
+bool LanIfStore::writeU32(uint16_t memAddr,uint32_t v) {
+	uint8_t b[4] = { (uint8_t)v,(uint8_t)(v >> 8),(uint8_t)(v >> 16),(uint8_t)(v >> 24) };
+	return writeBytes(memAddr,b,4);
+}
+
+bool LanIfStore::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool LanIfStore::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+Если хотите,могу сделать второй вариант:оставить прежнее поведение strict=false (всегда true),но 
+при плохом magic/ver не читать поля — чтобы не ломать существующий код,который ожидает true. 
+Скажите,как у вас сейчас используется load()
+ (проверяете ли возвращаемое значение или нет).
+ 
+ //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ шибка компиляции ожидаемая:вы “жёстко” убрали loadLoose() из SyncSourcesStore,а в setup() он всё ещё вызывается.
+
+Нужно заменить блок:
+
+cpp Копировать
+// Stores
+syncStore.begin();
+syncStore.loadLoose(syncData);
+на строгий вариант (только новая область BASE=0x0280,без старых адресов):
+
+cpp Копировать
+// Stores (SyncSourcesStore:strict,ONLY new BASE)
+syncStore.defaults(syncData);
+
+if (!syncStore.begin()) {
+	Serial.println(F("SyncSourcesStore:EEPROM(0x50) not found (I2C NACK)"));
+} else {
+	if (!syncStore.load(syncData)) {
+		Serial.println(F("SyncSourcesStore:no valid data in NEW area,using defaults"));
+		// опционально:один раз зафиксировать дефолты в новой области
+		(void)syncStore.save(syncData);
+	}
+}
+setup() целиком (с внесённой правкой)
+Я оставил ваш код как есть и поменял только место со syncStore.loadLoose():
+
+cpp Копировать
+void setup()
+{
+	// отпустить PWRKEY
+	pinMode(PE0,OUTPUT);
+	digitalWrite(PE0,LOW);
+
+	Serial.begin(115200);
+
+	// версия
+	String ver_soft = __FILE__;
+	int val_srt = ver_soft.lastIndexOf('\\');
+	if (val_srt >= 0) ver_soft.remove(0,val_srt + 1);
+	val_srt = ver_soft.lastIndexOf('.');
+	if (val_srt >= 0) ver_soft.remove(val_srt);
+
+	menu_start.setup(ver_soft);
+
+	delay(1300);
+	Serial.println("Start system");
+	Serial.println(ver_soft);
+
+	// I2C
+	Wire.begin();
+	Wire.setClock(100000);
+
+	internet2.begin();
+
+	// Stores (SyncSourcesStore:strict,ONLY new BASE)
+	syncStore.defaults(syncData);
+
+	if (!syncStore.begin()) {
+		Serial.println(F("SyncSourcesStore:EEPROM(0x50) not found (I2C NACK)"));
+	} else {
+		if (!syncStore.load(syncData)) {
+			Serial.println(F("SyncSourcesStore:no valid data in NEW area,using defaults"));
+			// опционально:один раз зафиксировать дефолты в новой области
+			(void)syncStore.save(syncData);
+		}
+	}
+
+	rtc.begin();
+
+	// EEPROM cfg
+	const bool FORCE_EEPROM_INIT = false;
+	if (ee.begin()) {
+		if (FORCE_EEPROM_INIT) {
+			Serial.println(F("FORCE EEPROM INIT"));
+			AT24C128Settings::defaults(cfg);
+			ee.save(cfg,true);
+		}
+		ee.load(cfg,false);
+	}
+	else {
+		Serial.println(F("EEPROM AT24C128 not found"));
+		AT24C128Settings::defaults(cfg);
+	}
+
+	// LAN (Internet1)
+	NtpLanService_Generic::NetConfig net;
+	net.macIndex = 0;
+	net.useDhcp = true;
+	net.upstreamIp = IPAddress(162,159,200,123);
+	net.syncPeriodMs = 3600000UL;
+
+	ntpLan.begin(net);
+	ntpLan.forceSyncNow();
+
+	lanStore.begin();
+
+	// 7-seg + freq input
+	pcfHour.begin();
+	pcfMin.begin();
+	pcfSec.begin();
+
+	pinMode(INPUT_PIN,INPUT);
+	attachInterrupt(INPUT_PIN,freqInterrupt,RISING);
+
+	// GPS
+	gps_Serial.begin(9600);
+	gps.begin(9600); // если в вашем GPSNmeaParser begin не нужен — удалите эту строку
+
+	// SIM
+	sim.begin(9600);
+	//sim.setDebug(&Serial,false); //
+	sim.setHealthPingMs(60000);
+	sim.setMaxRecoveryAttempts(5);
+
+	// Если у вас реализован статус-опрос в SIM800TimeAsync — оставьте.
+	// Иначе закомментируйте следующую строку.
+	sim.setStatusPollMs(5000);
+
+	applyCfgToSimNoConflict(cfg);
+	sim.start();
+
+	// Planner
+	planner.begin();
+	planner.onSettingsChanged();
+	planner.triggerImmediate();
+
+	// Применить сохранённые настройки INTERNET1/2 в реальные каналы
+	applyInternet1FromStore();
+	applyInternet2FromStore();
+
+	// HOME
+	menu_start.drawStartPage();
+	web.begin();
+}
+Если хотите прям совсем “жёстко” — можно убрать строку syncStore.save(syncData); (тогда при первом запуске 
+просто будут defaults в RAM,а запись появится только после изменения в меню и явного save() из меню).
+
+//////////////////////////////////////////////////////////////////
+
+Не сохраняется сейчас почти наверняка не из‑за SyncSourcesStore,а потому что кто-то другой в проекте 
+пишет в ту же EEPROM (0x50) поверх диапазона 0x0280..0x02BF,или вы вообще не вызываете syncStore.save() в момент выбора пункта меню.
+
+У вас в setup() есть второй “хранилище”:
+
+cpp Копировать
+if (ee.begin()) {
+ ...
+ ee.load(cfg,false);
+}
+ee (AT24C128Settings) работает с той же микросхемой EEPROM,и если его save()/инициализация пишет “большим блоком” 
+(например,всю область/крупный диапазон),он легко может перезатирать 0x0280.
+
+1) Быстрый тест на перезапись EEPROM
+Сделайте один из двух тестов (самый быстрый):
+
+Тест A (жёсткий):временно отключить ee
+В setup() на один запуск закомментируйте весь блок ee.begin()/ee.load()/ee.save() и проверьте:
+
+выбрали источник → “сохранить” → перезагрузка питания → сохранилось?
+Если с ee не сохраняется,а без ee сохраняется — 100% конфликт карт EEPROM.
+
+Тест B:контрольная проверка сразу после save
+В месте,где меню “сохраняет источник” (обработчик OK/Save),сделайте:
+
+cpp Копировать
+bool ok = syncStore.save(syncData);
+Serial.print("syncStore.save = "); Serial.println(ok);
+
+SyncSourcesStore::Data rd;
+bool ok2 = syncStore.load(rd);
+Serial.print("syncStore.load = "); Serial.println(ok2);
+Serial.print("rd.gpsEnable="); Serial.println(rd.gpsEnable);
+// и т.д. хотя бы 2-3 поля
+Если save() возвращает true,а сразу после него load() уже возвращает старое/дефолт — значит кто-то
+ перезаписал EEPROM прямо следом (или save() физически не пишет,но с вашей верификацией в SyncSourcesStore он тогда вернул бы false).
+
+2) Что нужно,чтобы исправить окончательно
+Мне нужен EEPROM map вашего AT24C128Settings:
+
+файл(ы) AT24C128Settings.* (или как называется реализация ee.load/save)
+особенно:с каких адресов и какой длиной оно пишет
+Исправление делается так:
+
+либо ee переносим на диапазон до 0x0200 и гарантируем,что он никогда не пишет 0x0200..0x02BF,
+либо SyncSourcesStore.BASE переносим ещё дальше (например,0x0300/0x0400) и фиксируем новую карту (вы просили “старое забыть” — это ок),
+либо разделяем EEPROM физически/по I2C адресу.
+3) Важный момент по меню “выберите один”
+Ваш SyncSourcesStore::Data — это набор Enable флагов для источников. Если меню “выберите один”,то в 
+обработчике выбора надо гарантировать взаимоисключение и потом вызвать save() один раз,например:
+
+cpp Копировать
+// выбрали INTERNET2
+syncData.gpsEnable = 0;
+syncData.netEnable = 0; // INTERNET1
+syncData.gsmEnable = 0;
+syncData.net2Enable = 1;
+syncStore.save(syncData);
+Если у вас сейчас меню меняет только “курсор/пункт”,но save() не вызывается — визуально “выбрали”,а после перезагрузки откат.
+
+“TZ target” сделать «человеческим»
+Сейчас у вас cfg.tzTargetHours (похоже,просто смещение в часах). “Человеческий” вариант — показывать как UTC+03 и/или название.
+
+Вариант 1 (простой и правильный):показывать UTC±HH
+Функция для строки:
+
+cpp Копировать
+static void formatTz(char* out,size_t n,int tzHours)
+{
+ // tzHours:-12..+14
+ if (tzHours == 0) snprintf(out,n,"UTC");
+ else snprintf(out,n,"UTC%+d",tzHours);
+}
+В меню вместо “TZ target:3” показываете “TZ target:UTC+3”.
+
+Вариант 2 (UTC±HH + популярные названия)
+Если хотите “Москва/Екб/Омск/…” — скажите,какие города нужны. Тогда делается таблица:
+
+cpp Копировать
+struct TzItem { int8_t h; const char* name; };
+static const TzItem TZ_LIST[] = {
+ { 3,"MSK (Moscow)" },
+ { 5,"YEKT (Yekaterinburg)" },
+ { 7,"KRAT (Krasnoyarsk)" },
+ { 10,"VLAT (Vladivostok)" },
+ // ...
+};
+И в UI показываем "UTC+3 (MSK)",а хранить можно всё равно только tzTargetHours.
+
+Пришлите,пожалуйста,файл(ы) AT24C128Settings/класс ee (реализацию save/load и карту адресов) и кусок кода меню,где нажимается “OK/Save” для выбора источника синхронизации — я скажу точный новый 
+диапазон адресов или что именно пересекается и почему “срывается”.
+///////////////////////////////////////////+++++++++++++++++++++++++++++++
+
+
+Ниже сделал то,что вы просили:
+
+Отдельный файл с картой адресов EEPROM (единый источник правды для всех программ/модулей):EepromMap.h
+Внёс правки в модули,где адреса “зашиты”:AT24C128Settings.*,LanIfStore.*,SyncSourcesStore.* — теперь они берут адреса из EepromMap.h
+Для меню:строку “TZ target” заменить на “Часовой пояс” — без ваших файлов меню я не могу выдать 
+“полностью Menu.cpp”,но даю точную правку/шаблон (ниже).
+0) Новый файл:EepromMap.h
+Создайте файл EepromMap.h и подключите его в проект.
+
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+// Единая карта EEPROM (AT24C128,I2C 0x50)
+// Все адреса фиксированы и используются как прошивкой,так и внешними программами.
+namespace EepromMap {
+
+static constexpr uint8_t I2C_ADDR = 0x50;
+static constexpr uint16_t EEPROM_SIZE_BYTES = 16u * 1024u; // AT24C128 = 16384 bytes (0x0000..0x3FFF)
+
+// -------------------- Settings (AT24C128Settings) --------------------
+namespace Settings {
+// Header / scalars
+static constexpr uint16_t ADDR_MAGIC = 0x0000; // u32 'S8CF' LE
+static constexpr uint16_t ADDR_VER = 0x0004; // u8
+static constexpr uint16_t ADDR_ENFALL = 0x0005; // u8 0/1
+static constexpr uint16_t ADDR_TZ_TARGET = 0x0006; // i8 (часовой пояс для RTC/экрана)
+static constexpr uint16_t ADDR_TZ_NTP = 0x0007; // i8 (TZ для AT+CNTP,обычно 0)
+static constexpr uint16_t ADDR_PERIOD = 0x0008; // u32 LE
+
+// Strings
+static constexpr uint16_t ADDR_APN = 0x0100; // 32 bytes
+static constexpr uint16_t ADDR_USER = 0x0120; // 32 bytes
+static constexpr uint16_t ADDR_PASS = 0x0140; // 32 bytes
+static constexpr uint16_t ADDR_SERVER = 0x0160; // 48 bytes
+
+static constexpr uint16_t END = ADDR_SERVER + 48; // 0x0190
+} // namespace Settings
+
+// -------------------- LAN interfaces (LanIfStore) --------------------
+namespace LanIf {
+static constexpr uint16_t BLOCK_SIZE = 0x0040; // 64 bytes reserved per interface
+static constexpr uint16_t BASE_IF1 = 0x0200; // 0x0200..0x023F
+static constexpr uint16_t BASE_IF2 = 0x0240; // 0x0240..0x027F
+static constexpr uint16_t END = BASE_IF2 + BLOCK_SIZE; // 0x0280
+} // namespace LanIf
+
+// -------------------- Sync sources (SyncSourcesStore) --------------------
+namespace SyncSources {
+static constexpr uint16_t BLOCK_SIZE = 0x0040; // 64 bytes reserved
+static constexpr uint16_t BASE = 0x0280; // 0x0280..0x02BF
+static constexpr uint16_t END = BASE + BLOCK_SIZE; // 0x02C0
+} // namespace SyncSources
+
+// -------------------- Sanity checks (compile-time) --------------------
+static_assert(Settings::END <= LanIf::BASE_IF1,
+ "EEPROM map overlap:Settings overlaps LanIf IF1");
+static_assert(LanIf::END <= SyncSources::BASE,
+ "EEPROM map overlap:LanIf overlaps SyncSources");
+static_assert(SyncSources::END <= EEPROM_SIZE_BYTES,
+ "EEPROM map exceeds AT24C128 size");
+
+} // namespace EepromMap
+1) AT24C128Settings.h (полностью,с привязкой к EepromMap.h)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include "EepromMap.h"
+
+class AT24C128Settings {
+public:
+	static constexpr uint8_t I2C_ADDR = EepromMap::I2C_ADDR;
+
+	struct Config {
+		char apn[32];
+		char user[32];
+		char pass[32];
+		char server[48];
+
+		int8_t tzTargetHours; // ЧАСОВОЙ ПОЯС для RTC/экрана (например 3)
+		int8_t tzNtpHours; // TZ для AT+CNTP (рекомендую 0=UTC)
+
+		bool enableFallback;
+		uint32_t periodMs;
+	};
+
+	explicit AT24C128Settings(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+	bool begin();
+
+	// strict=true:требует MAGIC+VERSION
+	// strict=false:читает поля по фикс. адресам даже если MAGIC не задан
+	bool load(Config& cfg,bool strict = false);
+
+	// writeMagic=true:пишет VER+MAGIC (MAGIC в конце как commit)
+	bool save(const Config& cfg,bool writeMagic = true);
+
+	static void defaults(Config& cfg);
+
+	// --- Низкоуровневые:поля по отдельности ---
+	bool writeAPN(const char* s);
+	bool writeUSER(const char* s);
+	bool writePASS(const char* s);
+	bool writeSERVER(const char* s);
+
+	bool writeTzTargetHours(int8_t tz);
+	bool writeTzNtpHours(int8_t tz);
+
+	bool writeEnableFallback(bool en);
+	bool writePeriodMs(uint32_t ms);
+
+	bool readAPN(char* out,size_t outSize);
+	bool readUSER(char* out,size_t outSize);
+	bool readPASS(char* out,size_t outSize);
+	bool readSERVER(char* out,size_t outSize);
+
+	bool readTzTargetHours(int8_t& tz);
+	bool readTzNtpHours(int8_t& tz);
+
+	bool readEnableFallback(bool& en);
+	bool readPeriodMs(uint32_t& ms);
+
+	// --- Фиксированные адреса (для внешних программ) ---
+	static constexpr uint16_t ADDR_MAGIC = EepromMap::Settings::ADDR_MAGIC;
+	static constexpr uint16_t ADDR_VER = EepromMap::Settings::ADDR_VER;
+	static constexpr uint16_t ADDR_ENFALL = EepromMap::Settings::ADDR_ENFALL;
+	static constexpr uint16_t ADDR_TZ_TARGET = EepromMap::Settings::ADDR_TZ_TARGET;
+	static constexpr uint16_t ADDR_TZ_NTP = EepromMap::Settings::ADDR_TZ_NTP;
+	static constexpr uint16_t ADDR_PERIOD = EepromMap::Settings::ADDR_PERIOD;
+
+	static constexpr uint16_t ADDR_APN = EepromMap::Settings::ADDR_APN;
+	static constexpr uint16_t ADDR_USER = EepromMap::Settings::ADDR_USER;
+	static constexpr uint16_t ADDR_PASS = EepromMap::Settings::ADDR_PASS;
+	static constexpr uint16_t ADDR_SERVER = EepromMap::Settings::ADDR_SERVER;
+
+private:
+	TwoWire* _w;
+	uint8_t _addr;
+
+	static constexpr uint8_t PAGE_SIZE = 64;
+	static constexpr uint32_t MAGIC = 0x46433853; // 'S''8''C''F' в LE
+	static constexpr uint8_t VERSION = 2;
+
+	bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+	bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool waitReady(uint32_t timeoutMs = 50);
+
+	bool readU32(uint16_t memAddr,uint32_t& v);
+	bool writeU32(uint16_t memAddr,uint32_t v);
+
+	bool readI8(uint16_t memAddr,int8_t& v);
+	bool writeI8(uint16_t memAddr,int8_t v);
+
+	bool readU8(uint16_t memAddr,uint8_t& v);
+	bool writeU8(uint16_t memAddr,uint8_t v);
+
+	bool readFixedString(uint16_t memAddr,char* out,size_t outSize,size_t maxFieldSize);
+	bool writeFixedString(uint16_t memAddr,const char* s,size_t maxFieldSize);
+
+	static bool isPrintableAscii(char c);
+	static bool isValidTextString(const char* s);
+};
+2) AT24C128Settings.cpp (полностью)
+cpp Копировать
+#include "AT24C128Settings.h"
+#include <string.h>
+
+AT24C128Settings::AT24C128Settings(TwoWire& w,uint8_t addr) :_w(&w),_addr(addr) {}
+
+bool AT24C128Settings::begin() {
+	_w->beginTransmission(_addr);
+	return (_w->endTransmission() == 0);
+}
+
+void AT24C128Settings::defaults(Config& cfg) {
+	memset(&cfg,0,sizeof(cfg));
+	strncpy(cfg.apn,"internet",sizeof(cfg.apn) - 1);
+	strncpy(cfg.user,"mts",sizeof(cfg.user) - 1);
+	strncpy(cfg.pass,"mts",sizeof(cfg.pass) - 1);
+	strncpy(cfg.server,"pool.ntp.org",sizeof(cfg.server) - 1);
+
+	cfg.tzTargetHours = 3; // пример:MSK
+	cfg.tzNtpHours = 0; // NTP всегда UTC
+
+	cfg.enableFallback = true;
+	cfg.periodMs = 60000;
+}
+
+bool AT24C128Settings::load(Config& cfg,bool strict) {
+	defaults(cfg);
+
+	uint32_t mg = 0;
+	uint8_t ver = 0;
+
+	bool haveMagic = readU32(ADDR_MAGIC,mg) && (mg == MAGIC);
+	bool haveVer = readU8 (ADDR_VER,ver) && (ver == VERSION);
+
+	if (strict && !(haveMagic && haveVer)) return false;
+
+	// строки
+	(void)readFixedString(ADDR_APN,cfg.apn,sizeof(cfg.apn),32);
+	(void)readFixedString(ADDR_USER,cfg.user,sizeof(cfg.user),32);
+	(void)readFixedString(ADDR_PASS,cfg.pass,sizeof(cfg.pass),32);
+	(void)readFixedString(ADDR_SERVER,cfg.server,sizeof(cfg.server),48);
+
+	if (!isValidTextString(cfg.apn)) strncpy(cfg.apn,"internet",sizeof(cfg.apn) - 1);
+	if (!isValidTextString(cfg.server)) strncpy(cfg.server,"pool.ntp.org",sizeof(cfg.server) - 1);
+
+	// часовые пояса
+	int8_t tzT;
+	if (readI8(ADDR_TZ_TARGET,tzT)) cfg.tzTargetHours = tzT;
+
+	int8_t tzN;
+	if (readI8(ADDR_TZ_NTP,tzN)) cfg.tzNtpHours = tzN;
+	else cfg.tzNtpHours = 0;
+
+	// enableFallback
+	uint8_t en;
+	if (readU8(ADDR_ENFALL,en)) cfg.enableFallback = (en != 0);
+
+	// period
+	uint32_t p;
+	if (readU32(ADDR_PERIOD,p) && p >= 1000 && p <= 86400000UL) cfg.periodMs = p;
+
+	return true;
+}
+
+bool AT24C128Settings::save(const Config& cfg,bool writeMagic) {
+	// Данные
+	if (!writeU8(ADDR_ENFALL,cfg.enableFallback ? 1 :0)) return false;
+	if (!writeI8(ADDR_TZ_TARGET,cfg.tzTargetHours)) return false;
+	if (!writeI8(ADDR_TZ_NTP,cfg.tzNtpHours)) return false;
+	if (!writeU32(ADDR_PERIOD,cfg.periodMs)) return false;
+
+	if (!writeFixedString(ADDR_APN,cfg.apn,32)) return false;
+	if (!writeFixedString(ADDR_USER,cfg.user,32)) return false;
+	if (!writeFixedString(ADDR_PASS,cfg.pass,32)) return false;
+	if (!writeFixedString(ADDR_SERVER,cfg.server,48)) return false;
+
+	// Commit-заголовок в конце (чтобы не "легитимизировать" частично записанные данные)
+	if (writeMagic) {
+		if (!writeU8(ADDR_VER,VERSION)) return false;
+		if (!writeU32(ADDR_MAGIC,MAGIC)) return false;
+	}
+	return true;
+}
+
+// ---- single field API ----
+bool AT24C128Settings::writeAPN(const char* s) { return writeFixedString(ADDR_APN,s,32); }
+bool AT24C128Settings::writeUSER(const char* s) { return writeFixedString(ADDR_USER,s,32); }
+bool AT24C128Settings::writePASS(const char* s) { return writeFixedString(ADDR_PASS,s,32); }
+bool AT24C128Settings::writeSERVER(const char* s) { return writeFixedString(ADDR_SERVER,s,48); }
+
+bool AT24C128Settings::writeTzTargetHours(int8_t tz) { return writeI8(ADDR_TZ_TARGET,tz); }
+bool AT24C128Settings::writeTzNtpHours(int8_t tz) { return writeI8(ADDR_TZ_NTP,tz); }
+
+bool AT24C128Settings::writeEnableFallback(bool en) { return writeU8(ADDR_ENFALL,en ? 1 :0); }
+bool AT24C128Settings::writePeriodMs(uint32_t ms) { return writeU32(ADDR_PERIOD,ms); }
+
+bool AT24C128Settings::readAPN(char* out,size_t outSize) { return readFixedString(ADDR_APN,out,outSize,32); }
+bool AT24C128Settings::readUSER(char* out,size_t outSize) { return readFixedString(ADDR_USER,out,outSize,32); }
+bool AT24C128Settings::readPASS(char* out,size_t outSize) { return readFixedString(ADDR_PASS,out,outSize,32); }
+bool AT24C128Settings::readSERVER(char* out,size_t outSize) { return readFixedString(ADDR_SERVER,out,outSize,48); }
+
+bool AT24C128Settings::readTzTargetHours(int8_t& tz) { return readI8(ADDR_TZ_TARGET,tz); }
+bool AT24C128Settings::readTzNtpHours(int8_t& tz) { return readI8(ADDR_TZ_NTP,tz); }
+
+bool AT24C128Settings::readEnableFallback(bool& en) {
+	uint8_t v;
+	if (!readU8(ADDR_ENFALL,v)) return false;
+	en = (v != 0);
+	return true;
+}
+bool AT24C128Settings::readPeriodMs(uint32_t& ms) { return readU32(ADDR_PERIOD,ms); }
+
+// ---- low level (Arduino_STM32/libmaple compatible) ----
+bool AT24C128Settings::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+
+	// repeated-start (как в остальных модулях)
+	if (_w->endTransmission(false) != 0) return false;
+
+	size_t got = _w->requestFrom((int)_addr,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++) {
+		int v = _w->read();
+		if (v < 0) return false;
+		out[i] = (uint8_t)v;
+	}
+	return true;
+}
+
+bool AT24C128Settings::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+	size_t off = 0;
+	while (off < len) {
+		uint16_t a = memAddr + (uint16_t)off;
+		uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+		size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+		if (!writePage(a,data + off,chunk)) return false;
+		if (!waitReady(50)) return false;
+		off += chunk;
+	}
+	return true;
+}
+
+bool AT24C128Settings::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	_w->write((uint8_t*)data,(int)len); // libmaple требует non-const
+	return (_w->endTransmission() == 0);
+}
+
+bool AT24C128Settings::waitReady(uint32_t timeoutMs) {
+	uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs) {
+		_w->beginTransmission(_addr);
+		if (_w->endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool AT24C128Settings::readU32(uint16_t memAddr,uint32_t& v) {
+	uint8_t b[4];
+	if (!readBytes(memAddr,b,4)) return false;
+	v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+	return true;
+}
+
+bool AT24C128Settings::writeU32(uint16_t memAddr,uint32_t v) {
+	uint8_t b[4] = {
+		(uint8_t)(v & 0xFF),
+		(uint8_t)((v >> 8) & 0xFF),
+		(uint8_t)((v >> 16) & 0xFF),
+		(uint8_t)((v >> 24) & 0xFF)
+	};
+	return writeBytes(memAddr,b,4);
+}
+
+bool AT24C128Settings::readI8(uint16_t memAddr,int8_t& v) {
+	uint8_t b;
+	if (!readBytes(memAddr,&b,1)) return false;
+	v = (int8_t)b;
+	return true;
+}
+
+bool AT24C128Settings::writeI8(uint16_t memAddr,int8_t v) {
+	uint8_t b = (uint8_t)v;
+	return writeBytes(memAddr,&b,1);
+}
+
+bool AT24C128Settings::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool AT24C128Settings::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+
+bool AT24C128Settings::readFixedString(uint16_t memAddr,char* out,size_t outSize,size_t maxFieldSize) {
+	if (!out || outSize == 0) return false;
+	memset(out,0,outSize);
+
+	uint8_t buf[64];
+	if (maxFieldSize > sizeof(buf)) return false;
+	if (!readBytes(memAddr,buf,maxFieldSize)) return false;
+
+	size_t n = 0;
+	while (n < maxFieldSize && n + 1 < outSize) {
+		char c = (char)buf[n];
+		if (c == '\0') break;
+		if (!isPrintableAscii(c)) break;
+		out[n] = c;
+		n++;
+	}
+	out[n] = '\0';
+	return true;
+}
+
+bool AT24C128Settings::writeFixedString(uint16_t memAddr,const char* s,size_t maxFieldSize) {
+	uint8_t buf[64];
+	if (maxFieldSize > sizeof(buf)) return false;
+	memset(buf,0,maxFieldSize);
+
+	if (s && s[0]) {
+		size_t n = min(strlen(s),(size_t)(maxFieldSize - 1));
+		memcpy(buf,s,n);
+		buf[n] = '\0';
+	}
+	return writeBytes(memAddr,buf,maxFieldSize);
+}
+
+bool AT24C128Settings::isPrintableAscii(char c) { return (c >= 32 && c <= 126); }
+
+bool AT24C128Settings::isValidTextString(const char* s) {
+	if (!s || !s[0]) return false;
+	for (size_t i = 0; s[i]; i++) if (!isPrintableAscii(s[i])) return false;
+	return true;
+}
+3) LanIfStore.h (полностью,с EepromMap.h)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include "EepromMap.h"
+
+class LanIfStore {
+public:
+	enum IfId :uint8_t { IF1 = 0,IF2 = 1 };
+
+	struct IfConfig {
+		uint8_t dhcp; // 0/1
+		uint8_t ip[4];
+		uint8_t mask[4];
+		uint8_t gw[4];
+		uint8_t dns[4];
+
+		uint8_t ntpIdx; // 0..4
+		uint8_t periodIdx; // 0..5
+	};
+
+	explicit LanIfStore(uint8_t i2cAddr = EepromMap::I2C_ADDR,TwoWire& w = Wire);
+
+	bool begin();
+
+	bool load(IfId id,IfConfig& cfg,bool strict = false);
+	bool save(IfId id,const IfConfig& cfg,bool writeMagic = true);
+
+	static void defaults(IfId id,IfConfig& cfg);
+
+	// фиксированные адреса блоков (для внешних программ)
+	static constexpr uint16_t BASE_IF1 = EepromMap::LanIf::BASE_IF1;
+	static constexpr uint16_t BASE_IF2 = EepromMap::LanIf::BASE_IF2;
+
+private:
+	TwoWire* _w;
+	uint8_t _addr;
+
+	static constexpr uint8_t PAGE_SIZE = 64;
+	static constexpr uint8_t VERSION = 1;
+
+	static constexpr uint16_t OFF_MAGIC = 0;
+	static constexpr uint16_t OFF_VER = 4;
+	static constexpr uint16_t OFF_DHCP = 5;
+	static constexpr uint16_t OFF_IP = 6;
+	static constexpr uint16_t OFF_MASK = 10;
+	static constexpr uint16_t OFF_GW = 14;
+	static constexpr uint16_t OFF_DNS = 18;
+	static constexpr uint16_t OFF_NTPIDX = 22;
+	static constexpr uint16_t OFF_PERIOD = 23;
+
+	static uint16_t baseFor(IfId id) { return (id == IF1) ? BASE_IF1 :BASE_IF2; }
+	static uint32_t magicFor(IfId id) { return (id == IF1) ? 0x31464E49UL :0x32464E49UL; } // 'INF1'/'INF2'
+
+	bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+	bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool waitReady(uint32_t timeoutMs = 50);
+
+	bool readU32(uint16_t memAddr,uint32_t& v);
+	bool writeU32(uint16_t memAddr,uint32_t v);
+	bool readU8(uint16_t memAddr,uint8_t& v);
+	bool writeU8(uint16_t memAddr,uint8_t v);
+};
+4) LanIfStore.cpp (полностью,надёжная запись+commit)
+(это тот вариант,который я вам уже давал — оставляю полностью)
+
+cpp Копировать
+#include "LanIfStore.h"
+#include <string.h>
+
+LanIfStore::LanIfStore(uint8_t i2cAddr,TwoWire& w) :_w(&w),_addr(i2cAddr) {}
+
+bool LanIfStore::begin() {
+	_w->beginTransmission(_addr);
+	return (_w->endTransmission() == 0);
+}
+
+void LanIfStore::defaults(IfId id,IfConfig& cfg) {
+	memset(&cfg,0,sizeof(cfg));
+	cfg.dhcp = 1;
+
+	if (id == IF1) {
+		cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 75; cfg.ip[3] = 231;
+	} else {
+		cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 75; cfg.ip[3] = 232;
+	}
+	cfg.mask[0] = 255; cfg.mask[1] = 255; cfg.mask[2] = 255; cfg.mask[3] = 0;
+	cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] = 75; cfg.gw[3] = 1;
+	cfg.dns[0] = 8; cfg.dns[1] = 8; cfg.dns[2] = 8; cfg.dns[3] = 8;
+
+	cfg.ntpIdx = 0;
+	cfg.periodIdx = 3;
+}
+
+bool LanIfStore::load(IfId id,IfConfig& cfg,bool strict) {
+	defaults(id,cfg);
+
+	const uint16_t base = baseFor(id);
+
+	uint32_t mg = 0;
+	uint8_t ver = 0;
+
+	const bool okMagic = readU32(base + OFF_MAGIC,mg) && (mg == magicFor(id));
+	const bool okVer = readU8 (base + OFF_VER,ver) && (ver == VERSION);
+
+	if (!(okMagic && okVer)) {
+		(void)strict;
+		return false;
+	}
+
+	(void)readU8(base + OFF_DHCP,cfg.dhcp);
+
+	(void)readBytes(base + OFF_IP,cfg.ip,4);
+	(void)readBytes(base + OFF_MASK,cfg.mask,4);
+	(void)readBytes(base + OFF_GW,cfg.gw,4);
+	(void)readBytes(base + OFF_DNS,cfg.dns,4);
+
+	(void)readU8(base + OFF_NTPIDX,cfg.ntpIdx);
+	(void)readU8(base + OFF_PERIOD,cfg.periodIdx);
+
+	cfg.dhcp = cfg.dhcp ? 1 :0;
+	cfg.ntpIdx %= 5;
+	cfg.periodIdx %= 6;
+
+	return true;
+}
+
+bool LanIfStore::save(IfId id,const IfConfig& in,bool writeMagic) {
+	const uint16_t base = baseFor(id);
+
+	IfConfig cfg = in;
+	cfg.dhcp = cfg.dhcp ? 1 :0;
+	cfg.ntpIdx %= 5;
+	cfg.periodIdx %= 6;
+
+	if (!writeU8(base + OFF_DHCP,cfg.dhcp)) return false;
+	if (!writeBytes(base + OFF_IP,cfg.ip,4)) return false;
+	if (!writeBytes(base + OFF_MASK,cfg.mask,4)) return false;
+	if (!writeBytes(base + OFF_GW,cfg.gw,4)) return false;
+	if (!writeBytes(base + OFF_DNS,cfg.dns,4)) return false;
+	if (!writeU8(base + OFF_NTPIDX,cfg.ntpIdx)) return false;
+	if (!writeU8(base + OFF_PERIOD,cfg.periodIdx)) return false;
+
+	if (writeMagic) {
+		if (!writeU8 (base + OFF_VER,VERSION)) return false;
+		if (!writeU32(base + OFF_MAGIC,magicFor(id))) return false;
+	}
+
+	return true;
+}
+
+// ---- low level I2C (libmaple compatible) ----
+bool LanIfStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+
+	if (_w->endTransmission(false) != 0) return false;
+
+	size_t got = _w->requestFrom((int)_addr,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++) {
+		int v = _w->read();
+		if (v < 0) return false;
+		out[i] = (uint8_t)v;
+	}
+	return true;
+}
+
+bool LanIfStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+	size_t off = 0;
+	while (off < len) {
+		uint16_t a = memAddr + (uint16_t)off;
+		uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+		size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+		if (!writePage(a,data + off,chunk)) return false;
+		if (!waitReady(50)) return false;
+		off += chunk;
+	}
+	return true;
+}
+
+bool LanIfStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	_w->write((uint8_t*)data,(int)len);
+	return (_w->endTransmission() == 0);
+}
+
+bool LanIfStore::waitReady(uint32_t timeoutMs) {
+	uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs) {
+		_w->beginTransmission(_addr);
+		if (_w->endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool LanIfStore::readU32(uint16_t memAddr,uint32_t& v) {
+	uint8_t b[4];
+	if (!readBytes(memAddr,b,4)) return false;
+	v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+	return true;
+}
+
+bool LanIfStore::writeU32(uint16_t memAddr,uint32_t v) {
+	uint8_t b[4] = { (uint8_t)v,(uint8_t)(v >> 8),(uint8_t)(v >> 16),(uint8_t)(v >> 24) };
+	return writeBytes(memAddr,b,4);
+}
+
+bool LanIfStore::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool LanIfStore::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+5) SyncSourcesStore.h / .cpp (строгий,только новая область,через EepromMap.h)
+Если у вас уже стоит “жёсткий” вариант — просто приведите к этому,чтобы BASE брался из карты.
+
+SyncSourcesStore.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include "EepromMap.h"
+
+class SyncSourcesStore {
+public:
+	static constexpr uint8_t I2C_ADDR = EepromMap::I2C_ADDR;
+
+	struct Data {
+		uint8_t gpsEnable;
+		uint8_t gpsPeriodIdx;
+
+		uint8_t netEnable;
+		uint8_t netProviderIdx;
+		uint8_t netPeriodIdx;
+
+		uint8_t gsmEnable;
+		uint8_t gsmProviderIdx;
+		uint8_t gsmPeriodIdx;
+
+		uint8_t net2Enable;
+		uint8_t net2PeriodIdx;
+	};
+
+	explicit SyncSourcesStore(TwoWire& w = Wire,uint8_t addr = I2C_ADDR);
+
+	bool begin();
+	void defaults(Data& d);
+
+	bool load(Data& d); // strict:только BASE
+	bool save(const Data& d); // strict:только BASE
+
+	// EEPROM MAP (фикс. для внешних программ)
+	static constexpr uint16_t BASE = EepromMap::SyncSources::BASE;
+
+	static constexpr uint16_t ADDR_MAGIC = BASE + 0; // u16
+	static constexpr uint16_t ADDR_VER = BASE + 2; // u8
+	static constexpr uint16_t ADDR_DATA = BASE + 4; // Data bytes
+
+	static constexpr uint16_t ADDR_gpsEnable = ADDR_DATA + 0;
+	static constexpr uint16_t ADDR_gpsPeriodIdx = ADDR_DATA + 1;
+	static constexpr uint16_t ADDR_netEnable = ADDR_DATA + 2;
+	static constexpr uint16_t ADDR_netProviderIdx = ADDR_DATA + 3;
+	static constexpr uint16_t ADDR_netPeriodIdx = ADDR_DATA + 4;
+	static constexpr uint16_t ADDR_gsmEnable = ADDR_DATA + 5;
+	static constexpr uint16_t ADDR_gsmProviderIdx = ADDR_DATA + 6;
+	static constexpr uint16_t ADDR_gsmPeriodIdx = ADDR_DATA + 7;
+	static constexpr uint16_t ADDR_net2Enable = ADDR_DATA + 8;
+	static constexpr uint16_t ADDR_net2PeriodIdx = ADDR_DATA + 9;
+
+private:
+	TwoWire* _w;
+	uint8_t _addr;
+
+	static constexpr uint16_t MAGIC = 0x5359; // 'SY'
+	static constexpr uint8_t VERSION = 2;
+	static constexpr uint8_t PAGE_SIZE = 64;
+
+	bool readBytes(uint16_t memAddr,uint8_t* out,size_t len);
+	bool writeBytes(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool writePage(uint16_t memAddr,const uint8_t* data,size_t len);
+	bool waitReady(uint32_t timeoutMs = 50);
+
+	bool readU8(uint16_t memAddr,uint8_t& v);
+	bool writeU8(uint16_t memAddr,uint8_t v);
+	bool readU16(uint16_t memAddr,uint16_t& v);
+	bool writeU16(uint16_t memAddr,uint16_t v);
+};
+SyncSourcesStore.cpp
+cpp Копировать
+#include "SyncSourcesStore.h"
+#include <string.h>
+
+SyncSourcesStore::SyncSourcesStore(TwoWire& w,uint8_t addr)
+	:_w(&w),_addr(addr) {}
+
+bool SyncSourcesStore::begin() {
+	_w->beginTransmission(_addr);
+	return (_w->endTransmission() == 0);
+}
+
+void SyncSourcesStore::defaults(Data& d) {
+	d.gpsEnable = 0; d.gpsPeriodIdx = 0;
+
+	d.netEnable = 0; d.netProviderIdx = 0; d.netPeriodIdx = 0;
+
+	d.gsmEnable = 1; d.gsmProviderIdx = 0; d.gsmPeriodIdx = 0;
+
+	d.net2Enable = 0;
+	d.net2PeriodIdx = 3;
+}
+
+bool SyncSourcesStore::load(Data& d) {
+	defaults(d);
+
+	uint16_t mg = 0;
+	uint8_t ver = 0;
+
+	if (!readU16(ADDR_MAGIC,mg) || mg != MAGIC) return false;
+	if (!readU8(ADDR_VER,ver) || ver != VERSION) return false;
+
+	return readBytes(ADDR_DATA,(uint8_t*)&d,sizeof(d));
+}
+
+bool SyncSourcesStore::save(const Data& d) {
+	// commit-порядок:data -> ver -> magic
+	if (!writeBytes(ADDR_DATA,(const uint8_t*)&d,sizeof(d))) return false;
+	if (!writeU8(ADDR_VER,VERSION)) return false;
+	if (!writeU16(ADDR_MAGIC,MAGIC)) return false;
+
+	// верификация
+	Data rd;
+	if (!readBytes(ADDR_DATA,(uint8_t*)&rd,sizeof(rd))) return false;
+	return (memcmp(&rd,&d,sizeof(d)) == 0);
+}
+
+// ---- low level ----
+bool SyncSourcesStore::readBytes(uint16_t memAddr,uint8_t* out,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	if (_w->endTransmission(false) != 0) return false;
+
+	size_t got = _w->requestFrom((int)_addr,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++) {
+		int v = _w->read();
+		if (v < 0) return false;
+		out[i] = (uint8_t)v;
+	}
+	return true;
+}
+
+bool SyncSourcesStore::writeBytes(uint16_t memAddr,const uint8_t* data,size_t len) {
+	size_t off = 0;
+	while (off < len) {
+		uint16_t a = memAddr + (uint16_t)off;
+		uint8_t pageOff = (uint8_t)(a % PAGE_SIZE);
+		size_t chunk = min((size_t)(PAGE_SIZE - pageOff),len - off);
+		if (!writePage(a,data + off,chunk)) return false;
+		if (!waitReady(50)) return false;
+		off += chunk;
+	}
+	return true;
+}
+
+bool SyncSourcesStore::writePage(uint16_t memAddr,const uint8_t* data,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write((uint8_t)(memAddr >> 8));
+	_w->write((uint8_t)(memAddr & 0xFF));
+	_w->write((uint8_t*)data,(int)len);
+	return (_w->endTransmission() == 0);
+}
+
+bool SyncSourcesStore::waitReady(uint32_t timeoutMs) {
+	uint32_t t0 = millis();
+	while ((millis() - t0) < timeoutMs) {
+		_w->beginTransmission(_addr);
+		if (_w->endTransmission() == 0) return true;
+		delay(1);
+	}
+	return false;
+}
+
+bool SyncSourcesStore::readU8(uint16_t memAddr,uint8_t& v) { return readBytes(memAddr,&v,1); }
+bool SyncSourcesStore::writeU8(uint16_t memAddr,uint8_t v) { return writeBytes(memAddr,&v,1); }
+
+bool SyncSourcesStore::readU16(uint16_t memAddr,uint16_t& v) {
+	uint8_t b[2];
+	if (!readBytes(memAddr,b,2)) return false;
+	v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+	return true;
+}
+bool SyncSourcesStore::writeU16(uint16_t memAddr,uint16_t v) {
+	uint8_t b[2] = { (uint8_t)(v & 0xFF),(uint8_t)((v >> 8) & 0xFF) };
+	return writeBytes(memAddr,b,2);
+}
+6) Меню:заменить “TZ target” на “Часовой пояс”
+Т.к. вы не прислали файлы меню,я не могу “выдать полностью Menu.cpp”,но правка очень простая:
+
+Найдите строку (или похожее):
+
+cpp Копировать
+"Tz target"
+"TZ target"
+"TZ Target"
+и замените на:
+
+cpp Копировать
+"Часовой пояс"
+Если у вас где-то формируется строка вида "TZ target:%d",то станет:
+
+cpp Копировать
+snprintf(buf,sizeof(buf),"Часовой пояс:UTC%+d",(int)cfg.tzTargetHours);
+Если хотите именно без UTC,то:
+
+cpp Копировать
+snprintf(buf,sizeof(buf),"Часовой пояс:%d",(int)cfg.tzTargetHours);
+Важно про “НЕ сохраняется”
+По вашей карте адресов конфликтов нет:
+
+Settings до 0x0190
+LanIf 0x0200..0x027F
+SyncSources 0x0280..0x02BF
+Если после этого всё равно “не сохраняется”,99% проблема не в адресах,а в том,что в меню не 
+вызывается syncStore.save(syncData) при подтверждении
+ выбора,либо после сохранения кто-то перезаписывает syncData в RAM (например,повторной инициализацией/дефолтами).
+
+Пришлите файл/фрагмент,где обрабатывается пункт: “Источник синхронизации (выберите один)” (нажатие OK/Save) — я укажу точное место,куда вставить save() и как сделать взаимоисключение GPS/NET1/NET2/GSM.

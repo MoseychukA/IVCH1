@@ -1,0 +1,2371 @@
+Нужно добавить надзор (watchdog) для INTERNET2:периодически читать internet2.readStatus(),и если:
+
+модуль не отвечает по I2C несколько раз подряд,или
+модуль отвечает,но IP = 0.0.0.0 (DHCP/линк упал) дольше заданного времени,
+то выполнить повторное применение сетевых настроек (applyInternet2FromStore()),а 
+при необходимости — запросить синхронизацию/время ещё раз.
+
+Ниже готовый минимальный код,который вы добавляете в .ino и вызываете из loop().
+
+1) Добавить в .ino (например,под loop())
+cpp Копировать
+static bool isZeroIP(const IPAddress& ip) {
+	return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0;
+}
+
+// Надзор INTERNET2:если отвалился линк/DHCP/сам модуль — переприменяем конфиг
+void tickInternet2LinkSupervisor()
+{
+	static uint32_t lastCheckMs = 0;
+	static uint32_t lastGoodMs = 0;
+	static uint32_t lastReinitMs = 0;
+	static uint8_t failCount = 0;
+
+	const uint32_t now = millis();
+
+	// проверяем раз в 2 секунды
+	if ((int32_t)(now - lastCheckMs) < 0) return;
+	if (now - lastCheckMs < 2000) return;
+	lastCheckMs = now;
+
+	Internet2Client::Status st{};
+	bool ok = internet2.readStatus(st);
+
+	// критерий "сеть живая":модуль отвечает и имеет IP
+	bool alive = ok && !isZeroIP(st.ip);
+
+	if (alive) {
+		failCount = 0;
+		lastGoodMs = now;
+		return;
+	}
+
+	// если модуль не ответил — считаем фейл
+	if (!ok) {
+		if (failCount < 255) failCount++;
+	}
+
+	// условия для переподнятия:
+	// - 3 подряд неответа по I2C
+	// - или "нет IP" больше 15 сек
+	const bool noIpTooLong = (lastGoodMs != 0) && (now - lastGoodMs > 15000UL);
+	const bool tooManyFails = (failCount >= 3);
+
+	// антиспам:не чаще раза в 10 сек
+	if ((tooManyFails || noIpTooLong) && (now - lastReinitMs > 10000UL)) {
+		lastReinitMs = now;
+		failCount = 0;
+
+		Serial.println(F("[NET2] link/ip lost -> reapply config"));
+		applyInternet2FromStore(); // <-- главное:переприменить DHCP/Static на удалённый модуль по I2C
+
+		// опционально:попросить модуль сразу синхронизироваться (если включено)
+		// internet2.requestSyncNow();
+	}
+}
+2) Вызвать в loop()
+Просто добавьте одну строку (лучше рядом с web.tick()/internet2.setTime...):
+
+cpp Копировать
+tickInternet2LinkSupervisor();
+3) Почему это работает
+Если INTERNET2 “отвалился” как устройство (I2C не отвечает) — через 3 проверки вы сделаете applyInternet2FromStore() 
+(часто этого достаточно,если модуль завис/сбросился и ждёт конфиг).
+Если модуль отвечает,но DHCP/линк потерялся и IP стал 0.0.0.0 — через ~15 секунд
+ также переприменится конфиг и он снова поднимет сеть.
+4) Если отвал именно “железный” (зависает I2C или модуль зависает намертво)
+Тогда лучший вариант — иметь аппаратный RESET удалённого STM32F103CBT6 (линия reset/EN на основной модуль).
+ Если такой пин есть — добавим в watchdog ещё:
+
+дернуть reset,
+подождать 200–500 мс,
+applyInternet2FromStore().
+Скажите,есть ли физически пин reset/enable INTERNET2,и на каком GPIO он сидит — я вставлю точный код.
+
+Важный вопрос (чтобы настроить критерий “отвалился” правильно)
+В Internet2Client::Status есть поле link up/down или только ip/lastSyncOk/lastNtpUtc? 
+Если есть linkUp/phyLink — критерий можно сделать ещё точнее (линк пропал → переподнять DHCP сразу).
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — готовая “самопроверка + переподключение” на стороне INTERNET2 (STM32F103CBT6),используя ваши файлы. Я делаю так,чтобы:
+
+INTERNET2 сам восстанавливал сеть,если линк есть,но DHCP/IP “пропал” или стек подвис
+основной модуль мог при необходимости “пнуть” INTERNET2 по I2C командой REINIT NET (без пересылки всего NetCfg)
+протокол статуса остаётся 16 байт,совместимый:добавил только использование ранее нулевого buf[15] + старшие биты buf[1]
+Что меняется
+1) W5500NtpServerClient
+Добавлено:
+
+watchdog “линк есть,но IP не получен/0.0.0.0 слишком долго” → re-init Ethernet+UDP
+обработка Ethernet.maintain() (если DHCP renewal/rebind fail несколько раз) → re-init
+команда requestNetReinit() (установка флага; реинициализация выполняется в tick(),а не внутри I2C callback)
+2) I2CInternet2Proto
+Добавлено:
+
+CMD 2 = REINIT NET
+В STATUS[15] передаю счетчик сетевых реинициализаций (netReinitCount)
+В STATUS[1] старшие 4 бита = lastErr (0..15),младшие 4 бита как раньше (flags)
+Обновлённые файлы INTERNET2
+W5500NtpServerClient.h (полностью)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+class W5500NtpServerClient {
+public:
+	struct NetCfg {
+		uint8_t dhcp = 1;
+		uint8_t ip[4] = { 192,168,75,232 };
+		uint8_t mask[4] = { 255,255,255,0 };
+		uint8_t gw[4] = { 192,168,75,1 };
+		uint8_t dns[4] = { 8,8,8,8 };
+
+		uint8_t upstream[4] = { 162,159,200,123 }; // внешний NTP IP
+		uint32_t periodMs = 3600000UL;
+	};
+
+	struct Status {
+		bool linkUp = false;
+		bool dhcp = true;
+		bool haveMasterTime = false;
+		bool syncInProgress = false;
+
+		uint8_t ip[4] = { 0,0,0,0 };
+
+		bool lastSyncOk = false;
+		uint32_t lastNtpUtc = 0;
+		int32_t lastOffsetSec = 0;
+		uint32_t lastSyncMs = 0;
+
+		// --- NEW:for supervision/debug over I2C (packed into status bytes) ---
+		uint8_t netReinitCount = 0; // how many times we re-inited Ethernet/UDP
+		uint8_t lastErr = 0; // 0=ok,1=no-ip-too-long,2=dhcp-fail,3=manual-reinit,4=link-flap
+	};
+
+	void begin();
+	void tick();
+
+	void applyNetCfg(const NetCfg& cfg);
+	void requestSyncNow();
+
+	// from master:unix utc + ms (0..999)
+	void setMasterTimeUtc(uint32_t unixUtc,uint16_t ms);
+
+	// NEW:master can request network re-init (actual heavy work happens in tick())
+	void requestNetReinit();
+
+	// for status/debug
+	uint32_t nowUtcSeconds() const;
+
+	Status status() const { return _st; }
+
+	// UART clients
+	void printNowTo(Stream& s) const;
+
+private:
+	NetCfg _cfg{};
+	mutable Status _st{};
+
+	// base time from master
+	uint32_t _baseUnix = 0; // seconds
+	uint32_t _baseMillis = 0; // millis() at base
+	uint16_t _baseMs = 0; // 0..999 ms inside current second at baseMillis moment
+
+	uint32_t _nextSyncMs = 0;
+	bool _syncReq = false;
+
+	// internals
+	void ethBegin();
+	bool linkUp() const;
+
+	void tickNtpServer();
+	void tickNtpClient();
+
+	uint32_t syncUpstreamOnce(); // returns unix utc or 0
+
+	// --- точное время:секунды + дробь ---
+	void nowUtcSecFrac(uint32_t& unixSec,uint32_t& ntpFrac) const;
+	static uint32_t msToNtpFrac(uint16_t ms);
+
+	// --- Non-blocking upstream NTP sync FSM ---
+	enum SyncState :uint8_t { SYNC_IDLE = 0,SYNC_WAIT = 1 };
+	SyncState _syncState = SYNC_IDLE;
+	uint32_t _syncDeadlineMs = 0;
+	uint8_t _syncRetriesLeft = 0;
+
+	void startUpstreamSync(); // отправить запрос (не блокирует)
+	void pollUpstreamSync(); // опросить ответ/таймаут (не блокирует)
+	void finishUpstreamSync(bool ok,uint32_t ntpUtc);
+
+	// --- NEW:self-heal supervision ---
+	bool _wantNetReinit = false;
+	uint32_t _linkUpSinceMs = 0;
+	uint32_t _lastGoodIpMs = 0;
+	uint32_t _lastReinitMs = 0;
+	uint8_t _dhcpFailStreak = 0;
+
+	static bool ipValid(const uint8_t ip[4]);
+	void doNetReinit(uint8_t errCode);
+};
+W5500NtpServerClient.cpp (полностью)
+cpp Копировать
+#include "W5500NtpServerClient.h"
+
+#include <SPI.h>
+#include <IPAddress.h>
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+#include <string.h>
+
+// ---- W5500 on SPI1 ----
+#define USE_THIS_SS_PIN PA4
+#define CUR_PIN_MISO PA6
+#define CUR_PIN_MOSI PA7
+#define CUR_PIN_SCK PA5
+
+SPIClass SPI_New(CUR_PIN_MOSI,CUR_PIN_MISO,CUR_PIN_SCK);
+
+static EthernetUDP udpSrv; // local NTP server socket (port 123)
+static EthernetUDP udpCli; // upstream NTP client socket
+
+static const uint16_t NTP_PORT = 123;
+static const uint32_t NTP_UNIX_EPOCH_DELTA = 2208988800UL; // 1900->1970 seconds
+
+static uint32_t unixToNtp1900(uint32_t unixUtc) { return unixUtc + NTP_UNIX_EPOCH_DELTA; }
+static uint32_t ntp1900ToUnix(uint32_t ntpSec1900) { return ntpSec1900 - NTP_UNIX_EPOCH_DELTA; }
+
+// ---- state for edge detection / one-shot prints ----
+static bool s_prevLinkUp = false;
+static bool s_printedAfterConnect = false;
+
+// -------------------- link/time helpers --------------------
+bool W5500NtpServerClient::linkUp() const
+{
+	const char* s = Ethernet.linkReport();
+	if (!s) return false;
+
+	// КРИТИЧНО:"NO LINK" содержит подстроку "LINK"
+	if (strstr(s,"NO LINK") != nullptr) return false;
+
+	if (strcmp(s,"LINK") == 0) return true;
+	if (strstr(s,"LinkON") != nullptr) return true;
+	if (strstr(s,"LINKON") != nullptr) return true;
+	if (strcmp(s,"ON") == 0) return true;
+	if (strcmp(s,"UP") == 0) return true;
+
+	return false;
+}
+
+bool W5500NtpServerClient::ipValid(const uint8_t ip[4])
+{
+	// минимальная проверка "не нулевой и не 255.*"
+	return (ip[0] != 0 && ip[0] != 255);
+}
+
+uint32_t W5500NtpServerClient::msToNtpFrac(uint16_t ms)
+{
+	return (uint32_t)(((uint64_t)ms << 32) / 1000ULL);
+}
+
+void W5500NtpServerClient::nowUtcSecFrac(uint32_t& unixSec,uint32_t& ntpFrac) const
+{
+	if (_baseUnix == 0) { unixSec = 0; ntpFrac = 0; return; }
+
+	uint32_t nowMs = millis();
+	uint32_t dMs = nowMs - _baseMillis; // wrap-safe
+	uint64_t totalMs = (uint64_t)_baseMs + (uint64_t)dMs;
+
+	unixSec = _baseUnix + (uint32_t)(totalMs / 1000ULL);
+	uint16_t remMs = (uint16_t)(totalMs % 1000ULL);
+	ntpFrac = msToNtpFrac(remMs);
+}
+
+uint32_t W5500NtpServerClient::nowUtcSeconds() const
+{
+	uint32_t s,f;
+	nowUtcSecFrac(s,f);
+	return s;
+}
+
+// -------------------- begin/config --------------------
+void W5500NtpServerClient::begin()
+{
+	pinMode(USE_THIS_SS_PIN,OUTPUT);
+	digitalWrite(USE_THIS_SS_PIN,HIGH);
+
+	SPI_New.begin();
+
+	extern SPIClass* pCUR_SPI; // Ethernet_Generic global
+	pCUR_SPI = &SPI_New;
+
+	Ethernet.init(USE_THIS_SS_PIN);
+
+	ethBegin();
+
+	udpSrv.begin(NTP_PORT);
+	udpCli.begin(0);
+
+	_nextSyncMs = millis() + 1000;
+
+	_syncState = SYNC_IDLE;
+	_syncDeadlineMs = 0;
+	_syncRetriesLeft = 0;
+	_st.syncInProgress = false;
+
+	s_prevLinkUp = linkUp();
+	s_printedAfterConnect = false;
+
+	_linkUpSinceMs = s_prevLinkUp ? millis() :0;
+	_lastGoodIpMs = 0;
+	_lastReinitMs = 0;
+	_dhcpFailStreak = 0;
+	_wantNetReinit = false;
+	_st.netReinitCount = 0;
+	_st.lastErr = 0;
+}
+
+void W5500NtpServerClient::ethBegin()
+{
+	uint8_t mac[6] = { 0xDE,0xAD,0xBE,0xEF,0x02,0x02 };
+
+	extern SPIClass* pCUR_SPI;
+	pCUR_SPI = &SPI_New;
+
+	const bool lu = linkUp();
+	const bool wantDhcp = (_cfg.dhcp != 0);
+
+	if (wantDhcp && lu)
+	{
+		int ok = Ethernet.begin(mac,3000,1000);
+
+		if (!ok)
+		{
+			Serial.println(F("[ETH] DHCP failed -> fallback to static"));
+			Ethernet.begin(mac,
+				IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+				IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+				IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+				IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+		}
+	}
+	else
+	{
+		Ethernet.begin(mac,
+			IPAddress(_cfg.ip[0],_cfg.ip[1],_cfg.ip[2],_cfg.ip[3]),
+			IPAddress(_cfg.dns[0],_cfg.dns[1],_cfg.dns[2],_cfg.dns[3]),
+			IPAddress(_cfg.gw[0],_cfg.gw[1],_cfg.gw[2],_cfg.gw[3]),
+			IPAddress(_cfg.mask[0],_cfg.mask[1],_cfg.mask[2],_cfg.mask[3]));
+	}
+
+	Serial.print(F("linkReport=")); Serial.println(Ethernet.linkReport());
+	if (linkUp())
+	{
+		Serial.print(F("localIP=")); Serial.println(Ethernet.localIP());
+		Serial.print(F("gw=")); Serial.println(Ethernet.gatewayIP());
+		Serial.print(F("mask=")); Serial.println(Ethernet.subnetMask());
+		Serial.print(F("dns=")); Serial.println(Ethernet.dnsServerIP());
+	}
+	else
+	{
+		Serial.println(F("localIP=0.0.0.0 (link down)"));
+	}
+}
+
+void W5500NtpServerClient::applyNetCfg(const NetCfg& cfg)
+{
+	_cfg = cfg;
+
+	extern SPIClass* pCUR_SPI;
+	pCUR_SPI = &SPI_New;
+
+	ethBegin();
+
+	udpSrv.stop();
+	udpCli.stop();
+	udpSrv.begin(NTP_PORT);
+	udpCli.begin(0);
+
+	_syncState = SYNC_IDLE;
+	_st.syncInProgress = false;
+
+	s_printedAfterConnect = false;
+
+	// reset supervision timers
+	_wantNetReinit = false;
+	_dhcpFailStreak = 0;
+	_linkUpSinceMs = linkUp() ? millis() :0;
+	_lastGoodIpMs = 0;
+	_lastReinitMs = 0;
+	_st.lastErr = 0;
+}
+
+void W5500NtpServerClient::setMasterTimeUtc(uint32_t unixUtc,uint16_t ms)
+{
+	if (ms > 999) ms = 999;
+	_baseUnix = unixUtc;
+	_baseMillis = millis();
+	_baseMs = ms;
+	_st.haveMasterTime = (unixUtc != 0);
+}
+
+void W5500NtpServerClient::requestSyncNow()
+{
+	_syncReq = true;
+}
+
+void W5500NtpServerClient::requestNetReinit()
+{
+	_wantNetReinit = true;
+}
+
+// -------------------- self-heal core --------------------
+void W5500NtpServerClient::doNetReinit(uint8_t errCode)
+{
+	const uint32_t now = millis();
+
+	// антиспам:не чаще 1 раза в 10 секунд
+	if (now - _lastReinitMs < 10000UL) return;
+	_lastReinitMs = now;
+
+	_st.lastErr = errCode;
+	if (_st.netReinitCount < 255) _st.netReinitCount++;
+
+	Serial.print(F("[NET2] REINIT net,err="));
+	Serial.println((unsigned)errCode);
+
+	ethBegin();
+
+	udpSrv.stop();
+	udpCli.stop();
+	udpSrv.begin(NTP_PORT);
+	udpCli.begin(0);
+
+	// stop any in-progress upstream sync
+	if (_syncState != SYNC_IDLE) finishUpstreamSync(false,0);
+
+	_dhcpFailStreak = 0;
+	s_printedAfterConnect = false;
+
+	// after reinit allow time for DHCP
+	_linkUpSinceMs = linkUp() ? now :0;
+}
+
+// -------------------- main tick --------------------
+void W5500NtpServerClient::tick()
+{
+	const uint32_t now = millis();
+
+	const bool lu = linkUp();
+	_st.linkUp = lu;
+	_st.dhcp = (_cfg.dhcp != 0);
+
+	// manual reinit request (from master over I2C)
+	if (_wantNetReinit) {
+		_wantNetReinit = false;
+		doNetReinit(3 /*manual*/);
+	}
+
+	// LINK edge detect
+	if (!s_prevLinkUp && lu)
+	{
+		Serial.println(F("[ETH] Link UP -> re-init"));
+		_linkUpSinceMs = now;
+		doNetReinit(4 /*link-flap*/);
+	}
+	if (s_prevLinkUp && !lu)
+	{
+		// link went down:clear IP,stop sync quickly
+		_st.ip[0] = 0; _st.ip[1] = 0; _st.ip[2] = 0; _st.ip[3] = 0;
+		s_printedAfterConnect = false;
+
+		if (_syncState != SYNC_IDLE) finishUpstreamSync(false,0);
+
+		// do not keep DHCP failure streak while link down
+		_dhcpFailStreak = 0;
+		_linkUpSinceMs = 0;
+
+		s_prevLinkUp = lu;
+		return;
+	}
+	s_prevLinkUp = lu;
+
+	// Link up:read IP
+	IPAddress ip = Ethernet.localIP();
+	_st.ip[0] = ip[0];
+	_st.ip[1] = ip[1];
+	_st.ip[2] = ip[2];
+	_st.ip[3] = ip[3];
+
+	const bool okIp = ipValid(_st.ip);
+	if (okIp) _lastGoodIpMs = now;
+
+	// DHCP maintain (only when link up and dhcp enabled)
+	if (_cfg.dhcp) {
+		int m = Ethernet.maintain();
+		// typical codes:0 no action,1 renew fail,2 renew ok,3 rebind fail,4 rebind ok
+		if (m == 1 || m == 3) {
+			if (_dhcpFailStreak < 255) _dhcpFailStreak++;
+			if (_dhcpFailStreak >= 3) {
+				doNetReinit(2 /*dhcp-fail*/);
+			}
+		} else if (m == 2 || m == 4) {
+			_dhcpFailStreak = 0;
+		}
+	}
+
+	// Self-heal:link is up but no valid IP too long (DHCP stuck or stack glitch)
+	// wait a little after link up
+	if (!okIp) {
+		if (_linkUpSinceMs == 0) _linkUpSinceMs = now;
+
+		// если 8 секунд после link up нет IP — реинит
+		if (now - _linkUpSinceMs > 8000UL) {
+			doNetReinit(1 /*no-ip-too-long*/);
+		}
+	}
+
+	// One-shot print when connected and IP assigned
+	if (lu && okIp && !s_printedAfterConnect)
+	{
+		s_printedAfterConnect = true;
+
+		IPAddress mask = Ethernet.subnetMask();
+		IPAddress gw = Ethernet.gatewayIP();
+		IPAddress dns = Ethernet.dnsServerIP();
+
+		Serial.println(F("=== INTERNET2 CONNECTED (W5500) ==="));
+		Serial.print(F("DHCP=")); Serial.println(_cfg.dhcp ? 1 :0);
+
+		Serial.print(F("IP="));
+		Serial.print(ip[0]); Serial.print('.'); Serial.print(ip[1]); Serial.print('.');
+		Serial.print(ip[2]); Serial.print('.'); Serial.println(ip[3]);
+
+		Serial.print(F("MASK="));
+		Serial.print(mask[0]); Serial.print('.'); Serial.print(mask[1]); Serial.print('.');
+		Serial.print(mask[2]); Serial.print('.'); Serial.println(mask[3]);
+
+		Serial.print(F("GW="));
+		Serial.print(gw[0]); Serial.print('.'); Serial.print(gw[1]); Serial.print('.');
+		Serial.print(gw[2]); Serial.print('.'); Serial.println(gw[3]);
+
+		Serial.print(F("DNS="));
+		Serial.print(dns[0]); Serial.print('.'); Serial.print(dns[1]); Serial.print('.');
+		Serial.print(dns[2]); Serial.print('.'); Serial.println(dns[3]);
+
+		Serial.print(F("UPSTREAM_NTP="));
+		Serial.print(_cfg.upstream[0]); Serial.print('.'); Serial.print(_cfg.upstream[1]); Serial.print('.');
+		Serial.print(_cfg.upstream[2]); Serial.print('.'); Serial.println(_cfg.upstream[3]);
+
+		Serial.print(F("SYNC_PERIOD_MS=")); Serial.println((unsigned long)_cfg.periodMs);
+		Serial.println(F("================================"));
+	}
+
+	// Local NTP server tick
+	tickNtpServer();
+
+	// Upstream non-blocking client
+	tickNtpClient();
+}
+
+// -------------------- NTP server (local clients) --------------------
+void W5500NtpServerClient::tickNtpServer()
+{
+	int packetSize = udpSrv.parsePacket();
+	if (packetSize <= 0) return;
+
+	uint8_t req[48];
+	int n = udpSrv.read(req,48);
+	if (n < 48) return;
+
+	if (!_st.haveMasterTime) return;
+
+	uint32_t unixSec = 0,frac = 0;
+	nowUtcSecFrac(unixSec,frac);
+	if (unixSec == 0) return;
+
+	uint32_t txSec1900 = unixToNtp1900(unixSec);
+
+	uint8_t resp[48] = { 0 };
+
+	resp[0] = (0 << 6) | (4 << 3) | 4; // server
+	resp[1] = 1;
+	resp[2] = 6;
+	resp[3] = (uint8_t)-20;
+
+	resp[12] = 'L'; resp[13] = 'O'; resp[14] = 'C'; resp[15] = '2';
+
+	memcpy(&resp[24],&req[40],8);
+
+	resp[32] = (txSec1900 >> 24) & 0xFF;
+	resp[33] = (txSec1900 >> 16) & 0xFF;
+	resp[34] = (txSec1900 >> 8) & 0xFF;
+	resp[35] = (txSec1900) & 0xFF;
+	resp[36] = (frac >> 24) & 0xFF;
+	resp[37] = (frac >> 16) & 0xFF;
+	resp[38] = (frac >> 8) & 0xFF;
+	resp[39] = (frac) & 0xFF;
+
+	resp[40] = (txSec1900 >> 24) & 0xFF;
+	resp[41] = (txSec1900 >> 16) & 0xFF;
+	resp[42] = (txSec1900 >> 8) & 0xFF;
+	resp[43] = (txSec1900) & 0xFF;
+	resp[44] = (frac >> 24) & 0xFF;
+	resp[45] = (frac >> 16) & 0xFF;
+	resp[46] = (frac >> 8) & 0xFF;
+	resp[47] = (frac) & 0xFF;
+
+	udpSrv.beginPacket(udpSrv.remoteIP(),udpSrv.remotePort());
+	udpSrv.write(resp,48);
+	udpSrv.endPacket();
+}
+
+// -------------------- Upstream NTP client (non-blocking FSM) --------------------
+void W5500NtpServerClient::tickNtpClient()
+{
+	if (_syncState != SYNC_IDLE) {
+		pollUpstreamSync();
+		return;
+	}
+
+	uint32_t now = millis();
+	if (_syncReq || (int32_t)(now - _nextSyncMs) >= 0) {
+		_syncReq = false;
+		_nextSyncMs = now + _cfg.periodMs;
+
+		if (!_st.haveMasterTime) return;
+
+		startUpstreamSync();
+	}
+}
+
+void W5500NtpServerClient::startUpstreamSync()
+{
+	_st.syncInProgress = true;
+	_st.lastSyncOk = false;
+	_st.lastSyncMs = millis();
+
+	_syncState = SYNC_WAIT;
+	_syncDeadlineMs = millis() + 1200;
+	_syncRetriesLeft = 1;
+
+	IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+	uint8_t pkt[48] = { 0 };
+	pkt[0] = (0 << 6) | (4 << 3) | 3;
+	pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+	udpCli.beginPacket(up,NTP_PORT);
+	udpCli.write(pkt,48);
+	udpCli.endPacket();
+}
+
+void W5500NtpServerClient::pollUpstreamSync()
+{
+	if (!linkUp()) {
+		finishUpstreamSync(false,0);
+		return;
+	}
+
+	int sz = udpCli.parsePacket();
+	if (sz >= 48) {
+		uint8_t resp[48];
+		int n = udpCli.read(resp,48);
+		if (n >= 48) {
+			uint32_t sec1900 =
+				((uint32_t)resp[40] << 24) |
+				((uint32_t)resp[41] << 16) |
+				((uint32_t)resp[42] << 8) |
+				(uint32_t)resp[43];
+
+			if (sec1900 >= NTP_UNIX_EPOCH_DELTA) {
+				uint32_t ntpUtc = ntp1900ToUnix(sec1900);
+				finishUpstreamSync(true,ntpUtc);
+				return;
+			}
+		}
+	}
+
+	if ((int32_t)(millis() - _syncDeadlineMs) >= 0) {
+		if (_syncRetriesLeft > 0) {
+			_syncRetriesLeft--;
+
+			IPAddress up(_cfg.upstream[0],_cfg.upstream[1],_cfg.upstream[2],_cfg.upstream[3]);
+
+			uint8_t pkt[48] = { 0 };
+			pkt[0] = (0 << 6) | (4 << 3) | 3;
+			pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
+
+			udpCli.beginPacket(up,NTP_PORT);
+			udpCli.write(pkt,48);
+			udpCli.endPacket();
+
+			_syncDeadlineMs = millis() + 1200;
+			return;
+		}
+
+		finishUpstreamSync(false,0);
+		return;
+	}
+}
+
+void W5500NtpServerClient::finishUpstreamSync(bool ok,uint32_t ntpUtc)
+{
+	_syncState = SYNC_IDLE;
+	_st.syncInProgress = false;
+	_st.lastSyncMs = millis();
+
+	if (!ok || ntpUtc == 0) {
+		_st.lastSyncOk = false;
+		return;
+	}
+
+	uint32_t curUtc = nowUtcSeconds();
+	_st.lastNtpUtc = ntpUtc;
+	_st.lastOffsetSec = (int32_t)ntpUtc - (int32_t)curUtc;
+	_st.lastSyncOk = true;
+}
+
+uint32_t W5500NtpServerClient::syncUpstreamOnce()
+{
+	if (_syncState == SYNC_IDLE && _st.haveMasterTime) startUpstreamSync();
+	return 0;
+}
+
+// -------------------- UART clients --------------------
+void W5500NtpServerClient::printNowTo(Stream& s) const
+{
+	uint32_t sec,frac;
+	nowUtcSecFrac(sec,frac);
+
+	uint16_t ms = 0;
+	if (_baseUnix != 0) ms = (uint16_t)(((uint64_t)frac * 1000ULL) >> 32);
+
+	auto st = status();
+	s.print("UNIX:"); s.println((unsigned long)sec);
+	s.print("MS:"); s.println((unsigned)ms);
+	s.print("IP:"); s.print(st.ip[0]); s.print('.'); s.print(st.ip[1]); s.print('.');
+	s.print(st.ip[2]); s.print('.'); s.println(st.ip[3]);
+	s.print("SYNC_OK:"); s.println(st.lastSyncOk ? 1 :0);
+	s.print("OFFS:"); s.println(st.lastOffsetSec);
+}
+I2CInternet2Proto.h (полностью)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include "W5500NtpServerClient.h"
+
+// I2C slave protocol @0x42
+// Reg write:first byte is reg
+// 0x10 SET_TIME_UTC:u32 unixUtc LE + u16 ms LE
+// 0x20 NETCFG:u8 dhcp + ip[4]+mask[4]+gw[4]+dns[4]+upstream[4]+u32 periodMs
+// 0x30 CMD:u8 cmd
+// cmd=1 sync now
+// cmd=2 reinit net (Ethernet+UDP restart)
+// Read:0x80 STATUS (16 bytes)
+// [0]=protoVer (=1)
+// [1]=flags low nibble + lastErr high nibble
+// flags:bit0 linkUp,bit1 dhcp,bit2 haveMasterTime,bit3 syncInProgress
+// lastErr:upper 4 bits (0..15)
+// [2..5]=ip
+// [6..9]=lastOffsetSec (i32 LE)
+// [10..13]=lastNtpUtc (u32 LE)
+// [14]=lastSyncOk (0/1)
+// [15]=netReinitCount (u8)
+class I2CInternet2Proto {
+public:
+	static I2CInternet2Proto* instance;
+
+	explicit I2CInternet2Proto(W5500NtpServerClient& n) :_n(n) {}
+
+	static void onReceiveThunk(int n) { if (instance) instance->onReceive(n); }
+	static void onRequestThunk() { if (instance) instance->onRequest(); }
+
+	void resetReg() { _reg = 0x80; }
+
+	void onReceive(int n);
+	void onRequest();
+
+private:
+	W5500NtpServerClient& _n;
+	uint8_t _reg = 0x80;
+
+	void handleSetTime();
+	void handleNetCfg();
+	void handleCmd();
+
+	void writeStatus();
+};
+I2CInternet2Proto.cpp (полностью)
+cpp Копировать
+#include "I2CInternet2Proto.h"
+
+I2CInternet2Proto* I2CInternet2Proto::instance = nullptr;
+
+static uint32_t readU32LE(TwoWire& w) {
+	uint32_t v = 0;
+	v |= (uint32_t)(uint8_t)w.read();
+	v |= (uint32_t)(uint8_t)w.read() << 8;
+	v |= (uint32_t)(uint8_t)w.read() << 16;
+	v |= (uint32_t)(uint8_t)w.read() << 24;
+	return v;
+}
+static uint16_t readU16LE(TwoWire& w) {
+	uint16_t v = 0;
+	v |= (uint16_t)(uint8_t)w.read();
+	v |= (uint16_t)(uint8_t)w.read() << 8;
+	return v;
+}
+
+void I2CInternet2Proto::onReceive(int n) {
+	if (n <= 0) return;
+
+	_reg = (uint8_t)Wire.read(); // first byte = reg
+	n--;
+
+	switch (_reg) {
+	case 0x10:handleSetTime(); break;
+	case 0x20:handleNetCfg(); break;
+	case 0x30:handleCmd(); break;
+	default:
+		while (Wire.available()) Wire.read();
+		break;
+	}
+}
+
+void I2CInternet2Proto::handleSetTime() {
+	if (Wire.available() < 4) { while (Wire.available()) Wire.read(); return; }
+	uint32_t unixUtc = readU32LE(Wire);
+	uint16_t ms = 0;
+	if (Wire.available() >= 2) ms = readU16LE(Wire);
+	_n.setMasterTimeUtc(unixUtc,ms);
+	while (Wire.available()) Wire.read();
+}
+
+void I2CInternet2Proto::handleNetCfg() {
+	if (Wire.available() < (1 + 4 * 5 + 4)) { while (Wire.available()) Wire.read(); return; }
+
+	W5500NtpServerClient::NetCfg c;
+	c.dhcp = (uint8_t)Wire.read();
+
+	for (int i = 0; i < 4; i++) c.ip[i] = (uint8_t)Wire.read();
+	for (int i = 0; i < 4; i++) c.mask[i] = (uint8_t)Wire.read();
+	for (int i = 0; i < 4; i++) c.gw[i] = (uint8_t)Wire.read();
+	for (int i = 0; i < 4; i++) c.dns[i] = (uint8_t)Wire.read();
+	for (int i = 0; i < 4; i++) c.upstream[i] = (uint8_t)Wire.read();
+
+	c.periodMs = readU32LE(Wire);
+
+	_n.applyNetCfg(c);
+	while (Wire.available()) Wire.read();
+}
+
+void I2CInternet2Proto::handleCmd() {
+	if (Wire.available() < 1) { while (Wire.available()) Wire.read(); return; }
+	uint8_t cmd = (uint8_t)Wire.read();
+
+	if (cmd == 1) _n.requestSyncNow();
+	else if (cmd == 2) _n.requestNetReinit();
+
+	while (Wire.available()) Wire.read();
+}
+
+void I2CInternet2Proto::onRequest() {
+	// Master does:write(reg) then requestFrom
+	writeStatus();
+}
+
+void I2CInternet2Proto::writeStatus() {
+	auto st = _n.status();
+
+	uint8_t buf[16] = { 0 };
+	buf[0] = 1; // protoVer
+
+	// flags low nibble
+	uint8_t flags = 0;
+	if (st.linkUp) flags |= (1 << 0);
+	if (st.dhcp) flags |= (1 << 1);
+	if (st.haveMasterTime) flags |= (1 << 2);
+	if (st.syncInProgress) flags |= (1 << 3);
+
+	// lastErr high nibble (0..15)
+	uint8_t err = (uint8_t)(st.lastErr & 0x0F);
+	buf[1] = (uint8_t)((err << 4) | (flags & 0x0F));
+
+	buf[2] = st.ip[0]; buf[3] = st.ip[1]; buf[4] = st.ip[2]; buf[5] = st.ip[3];
+
+	int32_t off = st.lastOffsetSec;
+	buf[6] = (uint8_t)off; buf[7] = (uint8_t)(off >> 8); buf[8] = (uint8_t)(off >> 16); buf[9] = (uint8_t)(off >> 24);
+
+	uint32_t ntp = st.lastNtpUtc;
+	buf[10] = (uint8_t)ntp; buf[11] = (uint8_t)(ntp >> 8); buf[12] = (uint8_t)(ntp >> 16); buf[13] = (uint8_t)(ntp >> 24);
+
+	buf[14] = st.lastSyncOk ? 1 :0;
+
+	// NEW:count of network reinits (helps master understand "module is flapping")
+	buf[15] = st.netReinitCount;
+
+	Wire.write(buf,sizeof(buf));
+}
+Что ещё нужно на основном модуле (мастер),чтобы “переподключить” INTERNET2
+У вас уже есть applyInternet2FromStore() — это пересылка NETCFG. Теперь можно добавить мягкий вариант:
+
+если Internet2Client::readStatus() отвечает,но ip=0 долго или lastErr!=0 → отправить CMD=2 (requestNetReinit)
+если не отвечает по I2C → тогда уже applyInternet2FromStore() (или аппаратный reset,если появится)
+Чтобы я внес это корректно,нужен ваш Internet2Client.h/.cpp (мастер). Там должен быть метод отправки CMD; если его нет — добавлю.
+
+Уточнение (чтобы не было “сам себя убивает”)
+На INTERNET2 tick() должен вызываться часто (хотя бы раз в 10–50 мс). Если он вызывается редко/блокируется,watchdog
+ будет реагировать с задержкой. Если у вас есть “тяжёлые” задержки в loop — скажите,я предложу неблокирующий вариант ещё жёстче.
+
+Если пришлёте Internet2Client.h/.cpp с основной платы — сделаю вторую половину:надзор на мастере + команда CMD=2 и 
+логика “сначала soft reinit,потом reapply cfg”.
+
+////////////////////////////////////********************************************************************
+
+Нужно синхронизировать мастерскую часть (Internet2Client) с тем,что мы добавили на INTERNET2‑модуле:
+
+CMD=2 (reinit net) по регистру 0x30
+в STATUS[1] теперь:нижние 4 бита = flags,верхние 4 бита = lastErr
+STATUS[15] теперь:netReinitCount
+Ниже — обновлённые файлы Internet2Client.h/.cpp целиком (обратно совместимы:если на слейве ещё старый протокол — lastErr=0,netReinitCount=0).
+
+Internet2Client.h (обновлённый)
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <Wire.h>
+#include <IPAddress.h>
+
+class Internet2Client {
+public:
+	struct Status {
+		uint8_t protoVer = 0;
+
+		// raw status byte[1] from slave:
+		// low nibble:flags (bit0 linkUp,bit1 dhcp,bit2 haveMasterTime,bit3 syncInProgress)
+		// high nibble:lastErr (0..15)
+		uint8_t raw1 = 0;
+
+		// decoded
+		uint8_t flags = 0; // 0..15 (low nibble)
+		uint8_t lastErr = 0; // 0..15 (high nibble)
+
+		IPAddress ip = IPAddress(0,0,0,0);
+
+		int32_t lastOffsetSec = 0;
+		uint32_t lastNtpUtc = 0;
+		bool lastSyncOk = false;
+
+		// NEW (if slave supports it; else will be 0)
+		uint8_t netReinitCount = 0;
+
+		// helpers
+		bool linkUp() const { return (flags & (1 << 0)) != 0; }
+		bool dhcp() const { return (flags & (1 << 1)) != 0; }
+		bool haveMasterTime() const { return (flags & (1 << 2)) != 0; }
+		bool syncInProgress() const { return (flags & (1 << 3)) != 0; }
+	};
+
+	explicit Internet2Client(TwoWire& w = Wire,uint8_t addr = 0x42);
+
+	bool begin();
+
+	bool setTimeUnixUtc(uint32_t unixUtc,uint16_t ms = 0);
+
+	bool applyNetCfg(bool dhcp,
+		IPAddress ip,
+		IPAddress mask,
+		IPAddress gw,
+		IPAddress dns,
+		IPAddress ntpUpstream,
+		uint32_t periodMs);
+
+	bool requestSyncNow();
+
+	// NEW:soft "reconnect" on INTERNET2 module (Ethernet+UDP restart)
+	bool requestNetReinit();
+
+	bool readStatus(Status& out);
+
+private:
+	TwoWire* _w;
+	uint8_t _addr;
+
+	bool writeReg(uint8_t reg,const uint8_t* data,size_t len);
+	bool readReg(uint8_t reg,uint8_t* data,size_t len);
+};
+Internet2Client.cpp (обновлённый)
+cpp Копировать
+#include "Internet2Client.h"
+
+Internet2Client::Internet2Client(TwoWire& w,uint8_t addr)
+	:_w(&w),_addr(addr) {}
+
+bool Internet2Client::begin() {
+	_w->beginTransmission(_addr);
+	return (_w->endTransmission() == 0);
+}
+
+bool Internet2Client::writeReg(uint8_t reg,const uint8_t* data,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write(reg);
+	for (size_t i = 0; i < len; i++) _w->write(data[i]);
+	return (_w->endTransmission() == 0);
+}
+
+bool Internet2Client::readReg(uint8_t reg,uint8_t* data,size_t len) {
+	_w->beginTransmission(_addr);
+	_w->write(reg);
+
+	// STM32duino поддерживает endTransmission(false)
+	if (_w->endTransmission(false) != 0) return false;
+
+	size_t got = _w->requestFrom((int)_addr,(int)len);
+	if (got != len) return false;
+
+	for (size_t i = 0; i < len; i++) data[i] = (uint8_t)_w->read();
+	return true;
+}
+
+bool Internet2Client::setTimeUnixUtc(uint32_t unixUtc,uint16_t ms) {
+	uint8_t b[6];
+	b[0] = (uint8_t)(unixUtc);
+	b[1] = (uint8_t)(unixUtc >> 8);
+	b[2] = (uint8_t)(unixUtc >> 16);
+	b[3] = (uint8_t)(unixUtc >> 24);
+	b[4] = (uint8_t)(ms);
+	b[5] = (uint8_t)(ms >> 8);
+	return writeReg(0x10,b,sizeof(b));
+}
+
+bool Internet2Client::applyNetCfg(bool dhcp,
+	IPAddress ip,
+	IPAddress mask,
+	IPAddress gw,
+	IPAddress dns,
+	IPAddress ntpUpstream,
+	uint32_t periodMs) {
+
+	uint8_t b[1 + 4 * 5 + 4];
+	b[0] = dhcp ? 1 :0;
+
+	int k = 1;
+	auto putIp = [&](IPAddress a) {
+		b[k++] = a[0]; b[k++] = a[1]; b[k++] = a[2]; b[k++] = a[3];
+	};
+
+	putIp(ip);
+	putIp(mask);
+	putIp(gw);
+	putIp(dns);
+	putIp(ntpUpstream);
+
+	b[k++] = (uint8_t)(periodMs);
+	b[k++] = (uint8_t)(periodMs >> 8);
+	b[k++] = (uint8_t)(periodMs >> 16);
+	b[k++] = (uint8_t)(periodMs >> 24);
+
+	return writeReg(0x20,b,sizeof(b));
+}
+
+bool Internet2Client::requestSyncNow() {
+	uint8_t cmd = 1;
+	return writeReg(0x30,&cmd,1);
+}
+
+bool Internet2Client::requestNetReinit() {
+	uint8_t cmd = 2; // NEW cmd
+	return writeReg(0x30,&cmd,1);
+}
+
+bool Internet2Client::readStatus(Status& out) {
+	uint8_t b[16];
+	if (!readReg(0x80,b,sizeof(b))) return false;
+
+	out.protoVer = b[0];
+
+	out.raw1 = b[1];
+	out.flags = (uint8_t)(b[1] & 0x0F);
+	out.lastErr = (uint8_t)((b[1] >> 4) & 0x0F);
+
+	out.ip = IPAddress(b[2],b[3],b[4],b[5]);
+
+	out.lastOffsetSec = (int32_t)(
+		(uint32_t)b[6] |
+		((uint32_t)b[7] << 8) |
+		((uint32_t)b[8] << 16) |
+		((uint32_t)b[9] << 24));
+
+	out.lastNtpUtc =
+		(uint32_t)b[10] |
+		((uint32_t)b[11] << 8) |
+		((uint32_t)b[12] << 16) |
+		((uint32_t)b[13] << 24);
+
+	out.lastSyncOk = (b[14] != 0);
+
+	// NEW (old slaves used to send 0 here)
+	out.netReinitCount = b[15];
+
+	return true;
+}
+Рекомендованный алгоритм “если отвалился — переподключить” на основном модуле
+Теперь у вас есть два уровня восстановления:
+
+мягко:internet2.requestNetReinit() (cmd=2)
+жёстче:applyInternet2FromStore() (перепослать NETCFG по I2C)
+Если хотите — я дам готовую tickInternet2LinkSupervisor() под этот протокол 
+(с приоритетом:сначала cmd=2,если не помогло — apply). Скажите только:считаете “отвалился” как I2C не отвечает или 
+как linkUp=0 / ip=0.0.0.0 дольше N секунд? (обычно оба условия).
+
+////////////////////////////////////////////////////////////////////////////////////
+
+Ниже готовый “надзор INTERNET2” на основном модуле (STM32F103VGT6) по вашему условию:
+
+если linkUp==0 или ip==0.0.0.0 дольше N секунд → переподключаем.
+сначала мягко:посылаем CMD=2 (internet2.requestNetReinit())
+если не помогло за M секунд / слишком много попыток → жёстко:applyInternet2FromStore() (перешлёт NETCFG по I2C)
+есть антиспам и счетчики,чтобы не долбить постоянно
+1) Вставьте в .ino (или отдельный .cpp) этот код
+cpp Копировать
+static bool isZeroIP(const IPAddress& ip) {
+	return (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+}
+
+void tickInternet2LinkSupervisor()
+{
+	// --- tuning ---
+	const uint32_t CHECK_MS = 1000; // как часто читаем status
+	const uint32_t DOWN_N_MS = 8000; // N секунд "down",после которых начинаем лечить
+	const uint32_t SOFT_COOLDOWN_MS = 5000;// не чаще чем раз в 5с soft reinit
+	const uint32_t HARD_COOLDOWN_MS = 15000;// не чаще чем раз в 15с apply cfg
+	const uint32_t SOFT_TO_HARD_MS = 20000;// если за 20с не ожило -> hard
+	const uint8_t MAX_SOFT_TRIES = 3; // после 3 soft -> hard
+
+	static uint32_t lastCheckMs = 0;
+
+	static uint32_t downSinceMs = 0; // когда началось "down"
+	static uint32_t lastSoftMs = 0;
+	static uint32_t lastHardMs = 0;
+	static uint8_t softTries = 0;
+
+	const uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	Internet2Client::Status st;
+	bool ok = internet2.readStatus(st);
+	if (!ok) {
+		// Если I2C не ответил,это отдельный кейс. По вашему условию мы лечим link/ip,
+		// но тут тоже логично считать как "down".
+		if (downSinceMs == 0) downSinceMs = now;
+	} else {
+		const bool linkUp = st.linkUp();
+		const bool ipOk = !isZeroIP(st.ip);
+		const bool up = linkUp && ipOk;
+
+		if (up) {
+			// всё хорошо -> сброс состояния
+			downSinceMs = 0;
+			softTries = 0;
+			return;
+		}
+
+		// down по вашему условию
+		if (downSinceMs == 0) downSinceMs = now;
+
+		// не лечим,пока не прошло N секунд
+		if (now - downSinceMs < DOWN_N_MS) return;
+
+		// 1) soft reinit
+		const bool canSoft = (now - lastSoftMs >= SOFT_COOLDOWN_MS);
+		const bool needHardBySoftCount = (softTries >= MAX_SOFT_TRIES);
+		const bool needHardByTime = (now - downSinceMs >= SOFT_TO_HARD_MS);
+
+		if (!needHardBySoftCount && !needHardByTime) {
+			if (canSoft) {
+				lastSoftMs = now;
+				softTries++;
+
+				Serial.print(F("[NET2] down "));
+				Serial.print((unsigned)((now - downSinceMs) / 1000));
+				Serial.println(F("s -> soft reinit (CMD=2)"));
+
+				(void)internet2.requestNetReinit();
+			}
+			return;
+		}
+
+		// 2) hard reapply config
+		if (now - lastHardMs >= HARD_COOLDOWN_MS) {
+			lastHardMs = now;
+
+			Serial.print(F("[NET2] down "));
+			Serial.print((unsigned)((now - downSinceMs) / 1000));
+			Serial.println(F("s -> HARD reapply config"));
+
+			applyInternet2FromStore();
+		}
+	}
+}
+2) Вызовите в loop()
+Добавьте одну строку (лучше ближе к web.tick()):
+
+cpp Копировать
+tickInternet2LinkSupervisor();
+Как это будет работать в реальности
+INTERNET2 “отвалился” (linkDown или ip=0.0.0.0) → через N=8 секунд начнёт лечить
+сначала несколько раз отправит CMD=2 (мягкий reinit Ethernet/UDP на удалённом модуле)
+если за 20 секунд или после 3 попыток не ожило — выполнит applyInternet2FromStore() (перешлёт весь NETCFG)
+Важно
+Этот код использует новые поля Status::linkUp() и Status::ip из обновлённого Internet2Client.
+На INTERNET2 стороне должен быть поддержан CMD=2 (мы добавляли в I2CInternet2Proto + W5500NtpServerClient::requestNetReinit()).
+Если хотите,могу также:
+
+печатать в лог st.lastErr и st.netReinitCount (удобно диагностировать “флап”)
+сделать отдельный случай “I2C не отвечает” (попытаться applyInternet2FromStore()
+ реже и/или дергать аппаратный reset,если он появится).
+ 
+ //*********************************************************************
+ 
+ 1) Надзор INTERNET1 (W5500 на основном STM32):автовосстановление сети
+У вас INTERNET1 поднимается через applyInternet1FromStore() (и оно уже печатает DHCP‑логи).
+ Значит “переподключение” = периодически вызывать applyInternet1FromStore() когда:
+
+Ethernet.localIP()==0.0.0.0 или
+Ethernet.linkReport() говорит “NO LINK”
+дольше N секунд.
+
+Добавьте в .ino (рядом с надзором INTERNET2) такой код:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+
+static bool isZeroIP(const IPAddress& ip) {
+	return (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+}
+
+static bool eth1LinkUp()
+{
+	const char* s = Ethernet.linkReport();
+	if (!s) return false;
+	if (strstr(s,"NO LINK") != nullptr) return false;
+	if (strcmp(s,"LINK") == 0) return true;
+	if (strstr(s,"LinkON") != nullptr) return true;
+	if (strstr(s,"LINKON") != nullptr) return true;
+	if (strcmp(s,"ON") == 0) return true;
+	if (strcmp(s,"UP") == 0) return true;
+	return false;
+}
+
+void tickInternet1LinkSupervisor()
+{
+	// --- tuning ---
+	const uint32_t CHECK_MS = 1000;
+	const uint32_t DOWN_N_MS = 8000; // N секунд down
+	const uint32_t REAPPLY_COOLDOWN_MS = 10000; // не чаще 10с
+
+	static uint32_t lastCheckMs = 0;
+	static uint32_t downSinceMs = 0;
+	static uint32_t lastReapplyMs = 0;
+
+	const uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	const bool linkUp = eth1LinkUp();
+	const bool ipOk = !isZeroIP(Ethernet.localIP());
+	const bool up = linkUp && ipOk;
+
+	if (up) {
+		downSinceMs = 0;
+		return;
+	}
+
+	if (downSinceMs == 0) downSinceMs = now;
+
+	if (now - downSinceMs < DOWN_N_MS) return;
+
+	if (now - lastReapplyMs < REAPPLY_COOLDOWN_MS) return;
+	lastReapplyMs = now;
+
+	Serial.print(F("[NET1] down "));
+	Serial.print((unsigned)((now - downSinceMs) / 1000));
+	Serial.println(F("s -> reapply config"));
+
+	applyInternet1FromStore();
+}
+И вызовите в loop():
+
+cpp Копировать
+tickInternet1LinkSupervisor();
+Если у вас applyInternet1FromStore() блокирует на DHCP ~3 секунды — это нормально,потому что мы вызываем не чаще раза в 10 секунд.
+
+2) Меню HOME:вместо IP “0.0.0.0” выводить “NOT CONNECTED”
+В вашем Menu.cpp это делается в Menu::drawHomeDynamic() где печатаются gIp1Str и gIp2Str.
+
+Замените два участка (IP1 и IP2) на вариант с проверкой:
+
+cpp Копировать
+static bool isIpStrZero(const char* s)
+{
+	return s && (strcmp(s,"0.0.0.0") == 0 || s[0] == 0);
+}
+IP1 блок (заменить)
+Было:
+
+cpp Копировать
+if (strcmp(_lastIp,gIp1Str) != 0) {
+ strncpy(_lastIp,gIp1Str,sizeof(_lastIp) - 1);
+ ...
+ tft->drawString(_lastIp,80,Y_IP1);
+}
+Сделайте:
+
+cpp Копировать
+const char* ip1Show = isIpStrZero(gIp1Str) ? "NOT CONNECTED" :gIp1Str;
+
+if (strcmp(_lastIp,ip1Show) != 0) {
+	strncpy(_lastIp,ip1Show,sizeof(_lastIp) - 1);
+	_lastIp[sizeof(_lastIp) - 1] = 0;
+	tft->fillRect(80,Y_IP1,240,20,TFT_BLACK);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->drawString(_lastIp,80,Y_IP1);
+}
+IP2 блок (аналогично)
+cpp Копировать
+const char* ip2Show = isIpStrZero(gIp2Str) ? "NOT CONNECTED" :gIp2Str;
+
+if (strcmp(_lastIp2,ip2Show) != 0) {
+	strncpy(_lastIp2,ip2Show,sizeof(_lastIp2) - 1);
+	_lastIp2[sizeof(_lastIp2) - 1] = 0;
+	tft->fillRect(80,Y_IP2,240,20,TFT_BLACK);
+	tft->setTextColor(TFT_WHITE,TFT_BLACK);
+	tft->drawString(_lastIp2,80,Y_IP2);
+}
+Вопрос на уточнение (чтобы надзор INTERNET1 был “идеальным”)
+applyInternet1FromStore() у вас всегда делает DHCP begin даже при статике,или читает LanIfStore и 
+выбирает DHCP/Static корректно? Если пришлёте applyInternet1FromStore() — я подстрою логику надзора 
+(например,не дергать DHCP при linkDown,а ждать linkUp).
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+У вас в одном .ino две одинаковые функции:
+
+cpp Копировать
+static bool isZeroIP(const IPAddress& ip)
+по строкам ~446 и ~530. Это и даёт redefinition.
+
+Как исправить (правильно и навсегда)
+Вариант А (рекомендую):оставить одну,вторую удалить
+Оставьте одну реализацию isZeroIP(...) (любую).
+Вторую — просто удалите.
+Вариант B:переименовать одну из них
+Если обе нужны “по смыслу” (обычно нет),переименуйте одну,например:
+
+для INTERNET1:
+cpp Копировать
+static bool isZeroIP1(const IPAddress& ip) { ... }
+для INTERNET2:
+cpp Копировать
+static bool isZeroIP2(const IPAddress& ip) { ... }
+и замените вызовы в соответствующем supervisor.
+
+Вариант C:сделать её общей и переиспользовать
+Оставьте одну функцию вверху файла (до всех tick...Supervisor()):
+
+cpp Копировать
+static inline bool isZeroIP(const IPAddress& ip) {
+ return ip[0]==0 && ip[1]==0 && ip[2]==0 && ip[3]==0;
+}
+и в остальных местах не объявляйте её повторно.
+
+Почему так произошло
+Вы добавили “надзор INTERNET2” и “надзор INTERNET1”,и оба блока содержали одинаковый helper isZeroIP.
+ В .ino это один translation unit,поэтому двойное определение запрещено.
+
+Если пришлёте куски кода вокруг строк 430–540 (оба определения),я скажу,какое именно проще удалить/как поправить без ручного поиска.
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Ниже — точные шаги,куда и что вставить,чтобы isZeroIP() была static inline в общем заголовке и не было дублей.
+
+1) Создать файл NetHelpers.h
+Положите в папку проекта рядом с .ino и .cpp.
+
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+#include <IPAddress.h>
+#include <string.h>
+
+// IPAddress -> "нулевой IP"
+static inline bool isZeroIP(const IPAddress& ip) {
+	return (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+}
+
+// строка IP -> "нулевой/пустой"
+static inline bool isZeroIpStr(const char* s) {
+	return (s == nullptr) || (s[0] == 0) || (strcmp(s,"0.0.0.0") == 0);
+}
+2) .ino:подключить заголовок и удалить дубли isZeroIP
+В вашем .ino в блоке include’ов добавьте после #include <Ethernet_Generic.hpp> (или рядом):
+
+cpp Копировать
+#include "NetHelpers.h"
+То есть станет так:
+
+cpp Копировать
+#include "Internet2Client.h"
+#include "WebUI.h"
+#include <Ethernet_Generic.hpp>
+
+#include "NetHelpers.h"
+Дальше по проекту:
+
+удалите все определения вида:
+cpp Копировать
+static bool isZeroIP(const IPAddress& ip) { ... }
+Они вам больше не нужны — вместо них будет использоваться NetHelpers.h.
+
+3) Menu.cpp:подключить NetHelpers.h и использовать isZeroIpStr
+В начале Menu.cpp,после <string.h> добавьте:
+
+cpp Копировать
+#include "NetHelpers.h"
+Пример:
+
+cpp Копировать
+#include "Menu.h"
+#include <TFT_eSPI.h>
+#include <string.h>
+#include "NetHelpers.h"
+Дальше в Menu.cpp:
+
+если у вас есть локальная функция static bool isIpStrZero(const char* s) — удалите её
+в Menu::drawHomeDynamic() используйте:
+cpp Копировать
+const char* ip1Show = isZeroIpStr(gIp1Str) ? "NOT CONNECTED" :gIp1Str;
+const char* ip2Show = isZeroIpStr(gIp2Str) ? "NOT CONNECTED" :gIp2Str;
+Почему это решит проблему
+static inline в заголовке:
+
+не даёт конфликтов линковки между разными .cpp
+в .ino и в Menu.cpp будет одна и та же логика
+убирает повторяющиеся куски кода
+Если после этих правок компилятор вдруг скажет,что strcmp не найден (редко,но бывает в некоторых 
+сборках) — значит забыли #include <string.h> в NetHelpers.h (в моём варианте он уже добавлен).
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+У вас логика в целом правильная,но “не реагирует на отключение” почти всегда из‑за того,что eth1LinkUp()
+ определяет линк по строке (linkReport()),а:
+
+IP при выдергивании кабеля остаётся прежним (не 0.0.0.0)
+linkReport() в некоторых сборках не даёт надёжного NO LINK
+Правильно:опираться на Ethernet.linkStatus() + сделать реакцию на edge (LINK DOWN/UP)
+Ниже даю готовые функции:замените вашу eth1LinkUp() и tickInternet1LinkSupervisor().
+
+1) eth1LinkUp() — надёжно через linkStatus() (с fallback)
+cpp Копировать
+#include <Ethernet_Generic.hpp> // должно быть подключено
+
+static bool eth1LinkUp()
+{
+	// Надёжно для W5500 (если поддерживается библиотекой)
+	auto ls = Ethernet.linkStatus(); // LinkON / LinkOFF / Unknown
+	if (ls == LinkON) return true;
+	if (ls == LinkOFF) return false;
+
+	// fallback (если Unknown или у вас нестабильно)
+	const char* s = Ethernet.linkReport();
+	if (!s) return false;
+	if (strstr(s,"NO LINK") != nullptr) return false;
+	if (strcmp(s,"LINK") == 0) return true;
+	if (strstr(s,"LinkON") != nullptr) return true;
+	if (strstr(s,"LINKON") != nullptr) return true;
+	if (strcmp(s,"ON") == 0) return true;
+	if (strcmp(s,"UP") == 0) return true;
+	return false;
+}
+2) tickInternet1LinkSupervisor() — реагируем на отключение и переподнимаем при восстановлении
+Ключевая идея:когда кабель выдернули — просто фиксируем DOWN (и логируем). Когда кабель вернулся — сразу переприменяем конфиг (DHCP).
+
+cpp Копировать
+void tickInternet1LinkSupervisor()
+{
+	const uint32_t CHECK_MS = 1000;
+	const uint32_t NOIP_N_MS = 8000; // если линк есть,а IP=0.0.0.0 дольше N сек -> лечим
+	const uint32_t REAPPLY_COOLDOWN_MS = 10000; // не чаще 10 сек
+
+	static uint32_t lastCheckMs = 0;
+	static uint32_t noIpSinceMs = 0;
+	static uint32_t lastReapplyMs = 0;
+	static bool prevLinkUp = true;
+
+	const uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	const bool linkUp = eth1LinkUp();
+
+	// EDGE:кабель выдернули
+	if (prevLinkUp && !linkUp) {
+		Serial.println(F("[NET1] LINK DOWN"));
+		noIpSinceMs = 0; // пока линка нет,не считаем no-ip таймер
+	}
+
+	// EDGE:кабель вставили обратно -> переподнимаем DHCP/Static
+	if (!prevLinkUp && linkUp) {
+		Serial.println(F("[NET1] LINK UP -> reapply config"));
+		if (now - lastReapplyMs >= 2000) { // небольшая защита от дребезга
+			lastReapplyMs = now;
+			applyInternet1FromStore();
+		}
+	}
+
+	prevLinkUp = linkUp;
+
+	// Если линка нет — лечить бессмысленно (DHCP всё равно не поднимется)
+	if (!linkUp) return;
+
+	// Линк есть -> если IP нулевой,ждём N секунд и переприменяем
+	const bool ipOk = !isZeroIP(Ethernet.localIP());
+	if (ipOk) {
+		noIpSinceMs = 0;
+		return;
+	}
+
+	if (noIpSinceMs == 0) noIpSinceMs = now;
+	if (now - noIpSinceMs < NOIP_N_MS) return;
+
+	if (now - lastReapplyMs < REAPPLY_COOLDOWN_MS) return;
+	lastReapplyMs = now;
+
+	Serial.print(F("[NET1] IP=0.0.0.0 for "));
+	Serial.print((unsigned)((now - noIpSinceMs) / 1000));
+	Serial.println(F("s -> reapply config"));
+
+	applyInternet1FromStore();
+}
+Если Ethernet.linkStatus() не компилируется
+Тогда скажите текст ошибки компиляции — под вашу версию Ethernet_Generic сделаю альтернативу (чтение PHYCFGR W5500 через драйвер). 
+Но в большинстве сборок linkStatus() есть и это сразу решает “не реагирует”.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Сейчас у вас “не реагирует на выдернутый кабель” по двум причинам:
+
+IP не обязан становиться 0.0.0.0 при отключении кабеля (особенно если у вас уже включён static fallback) — поэтому проверка IP почти бесполезна для детекта обрыва.
+Ваша eth1LinkUp() фактически почти наверняка работает через fallback Ethernet.linkReport(),потому что #ifdef W5100_H у вас не срабатывает (макрос может быть не определён),а linkReport() в вашей сборке может не обновляться надёжно.
+Надёжный способ для W5500:читать PHYCFGR бит LNK через W5100.readPHYCFGR() (SPI‑чтение регистра PHY).
+
+Ниже — конкретные правки.
+
+1) В .ino добавьте include (чтобы гарантированно был W5100)
+Добавьте рядом с Ethernet include:
+
+cpp Копировать
+#include <utility/w5100.h>
+(Если не найдётся — скажите,подскажу точный путь под вашу версию Ethernet_Generic.)
+
+2) Замените eth1LinkUp() на жёсткую версию (без ifdef и без linkReport)
+cpp Копировать
+static bool eth1LinkUp()
+{
+	// W5500 PHYCFGR bit0 = LNK (1=UP,0=DOWN)
+	// На "плавающем" SPI часто читается 0xFF — считаем это DOWN.
+	uint8_t phy = W5100.readPHYCFGR();
+	if (phy == 0xFF || phy == 0x00) return false;
+	return (phy & 0x01) != 0;
+}
+3) Исправьте инициализацию prevLinkUp (чтобы корректно отрабатывать EDGE)
+Сейчас static bool prevLinkUp = true; может ломать логику. Сделайте так:
+
+cpp Копировать
+void tickInternet1LinkSupervisor()
+{
+	const uint32_t CHECK_MS = 1000;
+	const uint32_t NOIP_N_MS = 8000;
+	const uint32_t REAPPLY_COOLDOWN_MS = 10000;
+
+	static uint32_t lastCheckMs = 0;
+	static uint32_t noIpSinceMs = 0;
+	static uint32_t lastReapplyMs = 0;
+
+	static bool prevInited = false;
+	static bool prevLinkUp = false;
+
+	const uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	const bool linkUp = eth1LinkUp();
+
+	if (!prevInited) {
+		prevInited = true;
+		prevLinkUp = linkUp;
+		// не печатаем EDGE на первом вызове
+	}
+
+	// EDGE:кабель выдернули
+	if (prevLinkUp && !linkUp) {
+		Serial.println(F("[NET1] LINK DOWN"));
+		noIpSinceMs = 0;
+	}
+
+	// EDGE:кабель вставили обратно
+	if (!prevLinkUp && linkUp) {
+		Serial.println(F("[NET1] LINK UP -> reapply config"));
+		if (now - lastReapplyMs >= 2000) {
+			lastReapplyMs = now;
+			applyInternet1FromStore();
+		}
+	}
+
+	prevLinkUp = linkUp;
+
+	if (!linkUp) return;
+
+	// опционально:IP контроль (актуально только если DHCP,но не мешает)
+	const bool ipOk = !isZeroIP(Ethernet.localIP());
+	if (ipOk) {
+		noIpSinceMs = 0;
+		return;
+	}
+
+	if (noIpSinceMs == 0) noIpSinceMs = now;
+	if (now - noIpSinceMs < NOIP_N_MS) return;
+
+	if (now - lastReapplyMs < REAPPLY_COOLDOWN_MS) return;
+	lastReapplyMs = now;
+
+	Serial.print(F("[NET1] IP=0.0.0.0 for "));
+	Serial.print((unsigned)((now - noIpSinceMs) / 1000));
+	Serial.println(F("s -> reapply config"));
+
+	applyInternet1FromStore();
+}
+4) Быстрая проверка,что PHY реально меняется при выдергивании кабеля
+На время отладки добавьте в supervisor раз в секунду:
+
+cpp Копировать
+uint8_t phy = W5100.readPHYCFGR();
+Serial.print(F("[NET1] PHYCFGR=0x"));
+Serial.println(phy,HEX);
+Дёргаете кабель:
+
+должно переключаться по биту 0 (LNK).
+Важно про отображение “NOT CONNECTED”
+Даже после этого IP может остаться “192.168…” при обрыве линка (static),и HOME будет показывать IP,если gIp1Str берётся из localIP().
+
+Если хотите,чтобы HOME показывал NOT CONNECTED при выдернутом кабеле,нужно либо:
+
+в updateIp1Feed1Hz() ставить gIp1Str="0.0.0.0" когда eth1LinkUp()==false,либо
+в Menu.cpp дополнительно учитывать eth1LinkUp() (а не только строку IP).
+Если пришлёте updateIp1Feed1Hz() / NetFeed где формируется gIp1Str — внесу туда точную правку.
+
+----------------------------+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+<utility/w5100.h> не находится значит у вас другая раскладка заголовков в установленной Ethernet_Generic (или подключён “.hpp” без реализации/utility).
+
+Надёжный путь:подключить реальный заголовок библиотеки Ethernet (не .hpp),после этого W5100 обычно становится доступен без отдельного utility/....
+
+Вариант 1 (рекомендую):подключить Ethernet_Generic.h
+В вашем .ino замените:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+на:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+(и оставьте только один из них; обычно .hpp не нужен).
+
+После этого попробуйте такой eth1LinkUp():
+
+cpp Копировать
+static bool eth1LinkUp()
+{
+	// W5500 PHYCFGR bit0 = LNK (1=UP,0=DOWN)
+	uint8_t phy = W5100.readPHYCFGR();
+	if (phy == 0xFF || phy == 0x00) return false;
+	return (phy & 0x01) != 0;
+}
+Если W5100 не объявлен — добавьте сразу после include:
+
+cpp Копировать
+extern W5100Class W5100;
+(в большинстве сборок не требуется,но иногда помогает).
+
+Вариант 2:найти “правильный” путь заголовка в вашей библиотеке
+Откройте папку библиотеки Arduino:
+
+Windows:Документы/Arduino/libraries/Ethernet_Generic/
+дальше src/
+Посмотрите,как реально называется файл:
+
+w5100.h
+W5100.h
+utility/w5100.h
+utility/W5100.h
+иногда Ethernet_Generic/src/utility/w5100.h
+И подключите ровно его. Часто срабатывает один из вариантов:
+
+cpp Копировать
+#include <w5100.h>
+или
+
+cpp Копировать
+#include <W5100.h>
+или
+
+cpp Копировать
+#include "utility/w5100.h"
+Мини-проверка (чтобы понять,что линк читается именно из PHY)
+После того как W5100.readPHYCFGR() заработает,временно добавьте в tickInternet1LinkSupervisor():
+
+cpp Копировать
+Serial.print(F("[NET1] PHYCFGR=0x"));
+Serial.println(W5100.readPHYCFGR(),HEX);
+Дёргаете кабель:
+
+бит0 должен меняться 1↔0.
+Скажите,пожалуйста:
+
+какая у вас версия Ethernet_Generic (из Library Manager),и
+существует ли у вас файл .../Ethernet_Generic/src/utility/ и что в нём лежит,
+и я дам точный include под вашу установку,без перебора вариантов.
+
+/////////////////////////////////////////////////////////////////
+
+Можно сделать “такую же” проверку как на внешнем модуле — и вы её уже делали (через Ethernet.linkReport()),но
+она менее надёжна:IP может оставаться прежним,а linkReport() в некоторых сборках обновляется не всегда.
+На внешнем модуле у вас контроль линка живёт внутри одного стека и там этого часто достаточно.
+
+У вас сейчас другая проблема:в вашей версии Ethernet_Generic/src/utility/w5100.h действительно нет readPHYCFGR(),
+поэтому компилятор и ругается. Но PHYCFGR можно прочитать напрямую через низкоуровневое чтение регистра W5500.
+
+Правка:чтение линка INTERNET1 через регистр PHYCFGR (без readPHYCFGR())
+1) В .ino подключите правильные заголовки
+Замените/добавьте:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+#include "utility/w5100.h"
+(Если у вас уже есть <Ethernet_Generic.hpp> — уберите его,оставьте .h.)
+
+2) Добавьте функцию чтения PHYCFGR и eth1LinkUp()
+cpp Копировать
+// W5500 common register PHYCFGR = 0x002E,bit0 = LNK (1=UP,0=DOWN)
+static inline uint8_t w5500ReadPHYCFGR()
+{
+	// В вашей версии нет readPHYCFGR(),но обычно есть read(uint16_t)
+	return W5100.read(0x002E);
+}
+
+static bool eth1LinkUp()
+{
+	uint8_t phy = w5500ReadPHYCFGR();
+
+	// если чип/шина не отвечают,часто прилетает 0x00 или 0xFF
+	if (phy == 0x00 || phy == 0xFF) return false;
+
+	return (phy & 0x01) != 0;
+}
+3) Уберите все места,где вызывали W5100.readPHYCFGR()
+Замените их на w5500ReadPHYCFGR().
+
+Например,в отладке:
+
+cpp Копировать
+Serial.print(F("[NET1] PHYCFGR=0x"));
+Serial.println(w5500ReadPHYCFGR(),HEX);
+Если W5100.read(0x002E) тоже не скомпилируется
+Тогда пришлите фрагмент utility/w5100.h (кусок с объявлением класса W5100Class),и я 
+подстрою чтение под реальные методы вашей версии (иногда это W5100.read(uint16_t addr,uint8_t cb)/readSn(...)/и т.п.).
+
+Почему “IP=0.0.0.0” не годится для детекта кабеля
+Даже при кабеле OFF ваш код может перейти на static fallback и иметь “валидный” IP,хотя линка физически нет.
+ Поэтому нужен именно PHY‑бит линка.
+
+После этой правки INTERNET1 watchdog начнёт реагировать именно на “кабель выдернули/вставили”,потому что PHYCFGR меняется аппаратно.
+
+//////////////////////////////////////////////////////////////////////////////////////
+
+У вас сейчас две разные проблемы,и они связаны.
+
+1) Почему вы получили “multiple definition … Ethernet/W5100/DHCP/UDP…”
+Это классическая ситуация,когда реализация Ethernet_Generic компилируется дважды:
+
+один раз из вашего .ino (вы подключили “реализационный” заголовок/impl),
+второй раз из NtpLanService_Generic.cpp (там тоже подтягивается реализация Ethernet_Generic).
+У Ethernet_Generic есть два типа заголовков:
+
+Ethernet_Generic.h — только объявления
+Ethernet_Generic.hpp или *_Impl.h — объявления + реализация (header-only style)
+Если “реализацию” включить в двух .cpp/ino одновременно → линкер валится множественными определениями (как у вас).
+
+Как исправить правильно
+Сделайте правило:только один translation unit в проекте включает реализацию.
+
+Рекомендованный вариант для вас:
+
+В .ino оставьте:
+cpp Копировать
+#include <Ethernet_Generic.hpp> // ОДИН РАЗ В ПРОЕКТЕ
+В остальных ваших .cpp (включая NtpLanService_Generic.cpp,WebUI.cpp и т.п.) используйте только:
+cpp Копировать
+#include <Ethernet_Generic.h>
+Уберите из .ino то,что тянет реализацию повторно:
+не подключайте Ethernet_Generic.h вместе с .hpp
+не подключайте utility/w5100.h/w5100_Impl.h в .ino (они могут тащить реализации)
+Итого:реализация (.hpp) — только в .ino. Остальные — .h.
+
+2) Как сделать детект “кабель выдернули” на INTERNET1 без readPHYCFGR()
+В вашей версии W5100Class действительно нет readPHYCFGR(),но есть (и это видно в логе линкера) метод:
+
+W5100Class::getLinkStatus()
+То есть можно сделать проверку как на внешнем модуле,но надёжнее — напрямую через getLinkStatus().
+
+Важно
+Чтобы использовать W5100,вам не нужно включать utility/w5100.h (это и вызвало кучу дублей). Достаточно,чтобы в
+ проекте где-то был подключён Ethernet_Generic (у вас он уже есть).
+
+Код eth1LinkUp() (для .ino)
+После того как вы вернёте includes к правилу выше,добавьте:
+
+cpp Копировать
+// INTERNET1 link status from W5500 driver
+static bool eth1LinkUp()
+{
+	// getLinkStatus():0 = down,1 = up (в вашей сборке именно так)
+	return (W5100.getLinkStatus() != 0);
+}
+Если компилятор скажет “W5100 not declared”,добавьте перед функцией:
+
+cpp Копировать
+extern W5100Class W5100;
+(обычно не требуется,но иногда помогает).
+
+3) Почему “не реагирует”
+Проверка по IP почти никогда не реагирует на выдергивание кабеля (IP остаётся прежним). Реагировать 
+надо по линку,и W5100.getLinkStatus() как раз для этого.
+
+Что сделать прямо сейчас (пошагово)
+В .ino оставьте #include <Ethernet_Generic.hpp> как было изначально.
+Уберите добавленные #include <Ethernet_Generic.h> и #include "utility/w5100.h" из .ino.
+В NtpLanService_Generic.cpp (и других .cpp,если там есть) замените Ethernet_Generic.hpp → Ethernet_Generic.h.
+Поставьте eth1LinkUp() через W5100.getLinkStatus() (код выше).
+Если хотите,пришлите первые ~30 строк NtpLanService_Generic.cpp (где include’ы) — я скажу точную замену,чтобы 
+линкер больше никогда не падал на “multiple definition”.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+У вас сейчас в этом фрагменте сразу 3 проблемы,из‑за которых “не реагирует”/ведёт себя непредсказуемо.
+
+1) Вы вызываете w5500ReadPHYCFGR() но функция закомментирована
+В tickInternet1LinkSupervisor() у вас есть:
+
+cpp Копировать
+uint8_t phy = w5500ReadPHYCFGR();
+а сама w5500ReadPHYCFGR() закомментирована. Это либо не компилируется,либо вы вставили куски в разных 
+местах и отладка не соответствует реальному коду.
+
+Решение
+Если вы перешли на W5100.getLinkStatus() — уберите весь PHY debug целиком. Он не нужен.
+
+2) prevLinkUp инициализировано как true → edge-логика ломается
+У вас:
+
+cpp Копировать
+static bool prevLinkUp = true;
+Если при запуске линка нет (а у вас в логе NO LINK),то вы сразу получите “LINK DOWN” один раз,а 
+дальше при реальном “выдернули кабель” может не сработать корректно.
+
+Решение
+Инициализировать prevLinkUp первым реальным значением.
+
+3) Эти функции вообще не должны жить внутри NtpLanService_Generic.cpp
+tickInternet1LinkSupervisor() — это логика приложения,она использует applyInternet1FromStore() и 
+ашу политику восстановления. Держать это внутри файла библиотеки/сервиса (который сам работает с Ethernet) — плохая
+ идея и часто приводит к конфликтам/зависимостям.
+
+Рекомендация:вынесите eth1LinkUp() и tickInternet1LinkSupervisor() в .ino или отдельный NetSupervisors.cpp.
+
+Правильный рабочий вариант (без PHYCFGR,через W5100.getLinkStatus())
+1) eth1LinkUp()
+Оставьте так (это подходит вашей версии библиотеки — у вас getLinkStatus() реально есть,что видно по логам линкера):
+
+cpp Копировать
+extern W5100Class W5100;
+
+static bool eth1LinkUp()
+{
+	return (W5100.getLinkStatus() != 0); // 0=down,1=up
+}
+2) tickInternet1LinkSupervisor() — исправленный
+cpp Копировать
+void tickInternet1LinkSupervisor()
+{
+	const uint32_t CHECK_MS = 1000;
+	const uint32_t REAPPLY_COOLDOWN_MS = 10000;
+
+	static uint32_t lastCheckMs = 0;
+	static uint32_t lastReapplyMs = 0;
+
+	static bool prevInited = false;
+	static bool prevLinkUp = false;
+
+	const uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	const bool linkUp = eth1LinkUp();
+
+	// корректная инициализация edge-детектора
+	if (!prevInited) {
+		prevInited = true;
+		prevLinkUp = linkUp;
+		return;
+	}
+
+	// EDGE:кабель выдернули
+	if (prevLinkUp && !linkUp) {
+		Serial.println(F("[NET1] LINK DOWN"));
+	}
+
+	// EDGE:кабель вставили обратно -> переподнимаем DHCP/Static
+	if (!prevLinkUp && linkUp) {
+		Serial.println(F("[NET1] LINK UP -> reapply config"));
+		if (now - lastReapplyMs >= REAPPLY_COOLDOWN_MS) {
+			lastReapplyMs = now;
+			applyInternet1FromStore();
+		}
+	}
+
+	prevLinkUp = linkUp;
+}
+Важно
+Этот supervisor не использует IP вообще — и это правильно,потому что IP при обрыве линка может оставаться прежним.
+
+4) Почему “такая же проверка как на внешнем модуле” не всегда годится
+На внешнем модуле вы делали проверку через Ethernet.linkReport()/состояние в одном контуре. 
+На основном модуле у вас ещё есть:
+
+сервисы,которые могут держать статику при NO LINK,
+разные куски кода,к
+
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Сейчас вы упёрлись в два факта вашей сборки Ethernet_Generic:
+
+W5100Class не виден из вашего .ino → поэтому W5100Class “does not name a type”.
+Как только вы начинаете подтягивать “не те” заголовки (.hpp/*_Impl.h) в нескольких местах — получаете
+ multiple definition на Ethernet/W5100/DHCP/EthernetUDP.
+Это ровно потому,что у вас библиотека устроена как “частично header‑only”:если включить
+ реализацию больше одного раза — линкер падает.
+
+Надёжное решение:реализацию Ethernet_Generic подключать ровно в одном .cpp,а везде остальном — только декларации. 
+И там же сделать маленькую “обёртку” для чтения линка INTERNET1.
+
+Шаг 1. В проект добавьте файл EthernetGenericImpl.cpp
+Создайте в папке скетча новый файл EthernetGenericImpl.cpp (имя любое,но лучше так),и вставьте:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp> // ТОЛЬКО ЗДЕСЬ!
+#include "utility/w5100.h" // только объявление W5100Class/W5100
+
+extern "C" bool eth1LinkUpW5500()
+{
+	// 0 = down,!=0 = up (по вашей библиотеке getLinkStatus() существует)
+	return (W5100.getLinkStatus() != 0);
+}
+Это:
+
+гарантирует,что реализация Ethernet_Generic (.hpp) компилируется один раз
+даёт вам функцию eth1LinkUpW5500() без необходимости видеть W5100Class в .ino
+Шаг 2. В .ino уберите Ethernet_Generic.hpp
+В вашем .ino замените:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+на:
+
+cpp Копировать
+#include <Ethernet_Generic.h> // только объявления
+И НЕ подключайте utility/w5100.h в .ino.
+
+Шаг 3. В .ino используйте обёртку
+Где у вас supervisor INTERNET1 — добавьте объявление:
+
+cpp Копировать
+extern "C" bool eth1LinkUpW5500();
+И замените проверку линка на:
+
+cpp Копировать
+const bool linkUp = eth1LinkUpW5500();
+Например:
+
+cpp Копировать
+void tickInternet1LinkSupervisor()
+{
+	const uint32_t CHECK_MS = 1000;
+	const uint32_t REAPPLY_COOLDOWN_MS = 10000;
+
+	static uint32_t lastCheckMs = 0;
+	static uint32_t lastReapplyMs = 0;
+	static bool prevInited = false;
+	static bool prevLinkUp = false;
+
+	uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	bool linkUp = eth1LinkUpW5500();
+
+	if (!prevInited) { prevInited = true; prevLinkUp = linkUp; return; }
+
+	if (prevLinkUp && !linkUp) {
+		Serial.println(F("[NET1] LINK DOWN"));
+	}
+
+	if (!prevLinkUp && linkUp) {
+		Serial.println(F("[NET1] LINK UP -> reapply config"));
+		if (now - lastReapplyMs >= REAPPLY_COOLDOWN_MS) {
+			lastReapplyMs = now;
+			applyInternet1FromStore();
+		}
+	}
+
+	prevLinkUp = linkUp;
+}
+Шаг 4. Проверьте,что НИГДЕ больше не подключён Ethernet_Generic.hpp
+Очень важно:Ethernet_Generic.hpp должен быть только в EthernetGenericImpl.cpp.
+
+В остальных файлах (NtpLanService_Generic.cpp,WebUI.*,и т.д.) — только:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+Почему нельзя “как на внешнем модуле”
+Можно,но там вы опирались на Ethernet.linkReport()/свой контур. На основном модуле правильный детект 
+“кабель выдернули” — это getLinkStatus() (PHY),а не IP.
+
+Если сделаете шаги 1–4,то:
+
+исчезнут multiple definition … Ethernet/W5100/DHCP/UDP
+появится стабильный детект линка INTERNET1 (реакция на выдернутый кабель)
+Если хотите — пришлите ваш текущий список include’ов в WebUI.h (там раньше было Ethernet_Generic.hpp),
+я скажу что именно заменить на .h,чтобы гарантированно 
+не было повторного включения реализации.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+У вас сейчас Ethernet_Generic.hpp попал в несколько единиц компиляции (в TimeSyncPlanner.cpp,в WebUI.h,
+скорее всего ещё где‑то). В вашей версии Ethernet_Generic.hpp содержит реализацию,поэтому линкер и валится “multiple definition”.
+
+Правило для вашего проекта:
+
+Ethernet_Generic.hpp можно подключать ТОЛЬКО в одном .cpp (например,в EthernetGenericImpl.cpp).
+ Во всех остальных .cpp/.h/.ino — только Ethernet_Generic.h (декларации).
+
+1) Исправить TimeSyncPlanner.cpp
+Сейчас у вас:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+#include <EthernetUdp.h>
+Замените на:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+#include <EthernetUdp.h>
+Ethernet_Generic.hpp убрать полностью из TimeSyncPlanner.cpp.
+
+2) Исправить WebUI.h
+Сейчас у вас в WebUI.h:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp> // только декларации (без реализации)
+Это неверно (в .hpp у вас как раз реализация). Сделайте так:
+
+cpp Копировать
+#include <Ethernet_Generic.h> // только объявления
+И комментарий поправьте (или удалите).
+
+3) Проверить,что Ethernet_Generic.hpp остался только в одном месте
+По проекту сделайте поиск Ethernet_Generic.hpp и оставьте его только в одном файле,например:
+
+EthernetGenericImpl.cpp (единственное место с .hpp)
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+#include "utility/w5100.h"
+
+extern "C" bool eth1LinkUpW5500()
+{
+ return (W5100.getLinkStatus() != 0);
+}
+А в остальных файлах:
+
+.ino
+NtpLanService_Generic.cpp
+WebUI.cpp
+TimeSyncPlanner.cpp
+любые другие
+должно быть только:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+4) Отдельно:у вас в сообщении виден #pragma once внутри .cpp
+Это должно быть только в .h,а не в .cpp. Если у вас реально #pragma once попал в TimeSyncPlanner.cpp — удалите 
+его оттуда (иначе будет бардак со сборкой,хотя напрямую это не причина multiple definition).
+
+Если скажете,в каких файлах сейчас ещё встречается Ethernet_Generic.hpp,я точечно перечислю,где оставить/где 
+заменить,чтобы сборка гарантированно прошла.
+
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+У вас сейчас одновременно две вещи:
+
+multiple definition … Ethernet/W5100/DHCP/UDP… — значит реализация Ethernet_Generic компилируется в нескольких единицах (в .ino и ещё в .cpp).
+undefined reference to eth1LinkUpW5500 — значит файл,где вы должны были определить эту функцию,не попал в сборку (или имя/extern "C" не совпало).
+Ниже — рабочая схема “одна единица с .hpp”,которая убирает оба класса ошибок.
+
+A) Убираем multiple definition:.hpp должен быть ТОЛЬКО в одном .cpp
+1) Во всех файлах,кроме одного,используем только .h
+Сделайте глобальный поиск по проекту:
+
+Ethernet_Generic.hpp
+w5100_Impl.h
+и везде замените на декларации:
+
+#include <Ethernet_Generic.h>
+не подключайте w5100_Impl.h нигде
+Конкретно у вас:
+.ino → должно быть #include <Ethernet_Generic.h> (НЕ .hpp)
+TimeSyncPlanner.cpp → #include <Ethernet_Generic.h> (НЕ .hpp)
+WebUI.h/.cpp → #include <Ethernet_Generic.h> (НЕ .hpp)
+NtpLanService_Generic.cpp → #include <Ethernet_Generic.h> (у вас уже так)
+Сейчас по логу видно,что Ethernet‑реализация всё ещё попадает и в .ino (файл Ver.IVCH_26_01_24_03.cpp.o:first defined here). 
+Значит в .ino всё ещё где-то подключён .hpp или impl.
+
+2) Создаём ОДИН файл,который включает .hpp (реализацию)
+Создайте в папке скетча (там же,где ваш .ino) новый файл:
+
+EthernetGenericImpl.cpp
+cpp Копировать
+#include <Ethernet_Generic.hpp> // ТОЛЬКО ЗДЕСЬ (реализация)
+#include "utility/w5100.h" // чтобы был W5100.getLinkStatus()
+
+extern "C" bool eth1LinkUpW5500(void)
+{
+ return (W5100.getLinkStatus() != 0);
+}
+Важно:
+
+файл должен лежать в той же папке,что .ino
+расширение .cpp
+после добавления файла лучше сделать “Скетч → Экспортировать скомпилированный бинарник” или просто пересобрать 
+(Arduino IDE иногда не сразу подхватывает новые файлы,если они добавлены не через интерфейс)
+B) Убираем undefined reference eth1LinkUpW5500:правильное объявление
+В .ino добавьте объявление (до использования):
+
+cpp Копировать
+extern "C" bool eth1LinkUpW5500(void);
+И в supervisor используйте:
+
+cpp Копировать
+bool linkUp = eth1LinkUpW5500();
+Если после этого всё равно undefined reference — значит EthernetGenericImpl.cpp не компилируется/не попал в билд.
+ Проверьте,что файл действительно в папке скетча.
+
+C) Что убрать/заменить прямо сейчас по вашим кускам
+1) TimeSyncPlanner.cpp
+Уберите:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+Поставьте:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+2) WebUI.h
+Уберите:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+Поставьте:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+3) .ino
+Уберите #include <Ethernet_Generic.hpp> если он ещё где-то остался. Должно быть:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+Почему у вас всё “взрывается” от линкера
+Потому что в вашей поставке Ethernet_Generic.hpp (и/или w5100_Impl.h) содержит реальные определения 
+классов/глобальных объектов (Ethernet,W5100,DhcpClass,vtables и т.д.). Как только это попадает в 2+ .cpp — линкер
+ закономерно пишет “multiple definition”.
+
+Если хотите,пришлите:
+
+первые ~30 строк вашего .ino (все include’ы),
+include-блоки TimeSyncPlanner.cpp и WebUI.h
+Я скажу точечно,где у вас ещё остался .hpp/*_Impl.h,который продолжает давать “multiple definition”.
+
+//-------------++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+У вас причина “multiple definition” одна:в проекте где‑то всё ещё подключается реализация 
+Ethernet_Generic как header‑only (через Ethernet_Generic.hpp и/или w5100_Impl.h) в нескольких .cpp/.ino одновременно.
+ Поэтому один и тот же код Ethernet/W5100/DHCP/UDP попадает в:
+
+Ver.IVCH_26_01_24_03.cpp.o (это ваш .ino)
+NtpLanService_Generic.cpp.o
+TimeSyncPlanner.cpp.o
+WebUI.cpp.o
+и линкер ругается на дубли.
+
+Правило для вашей версии Ethernet_Generic
+Ethernet_Generic.hpp нельзя подключать в проекте вообще (или можно только в одном месте,но у вас уже есть 
+собранные .cpp библиотеки — проще запретить полностью).
+
+1) Сделайте так,чтобы в проекте НЕ было Ethernet_Generic.hpp
+Сделайте поиск по проекту:Ethernet_Generic.hpp
+
+И замените везде на:
+
+cpp Копировать
+#include <Ethernet_Generic.h>
+Конкретно у вас это минимум:
+
+.ino
+TimeSyncPlanner.cpp
+WebUI.h и/или WebUI.cpp (если где-то осталось)
+любые другие файлы,где вы раньше вставляли .hpp
+Также сделайте поиск:w5100_Impl.h и уберите его отовсюду (его нельзя включать в проект напрямую).
+
+После этого multiple definition уйдёт.
+
+Важно:после таких замен лучше сделать “чистую” сборку (перезапустить IDE или удалить временную папку сборки),
+чтобы не цеплялся старый объектник.
+
+2) Как получить LINK UP/DOWN INTERNET1 без доступа к W5100Class в .ino
+Не тяните utility/w5100.h в .ino. Сделайте маленькую обёртку в отдельном .cpp,который и так собирается вместе с проектом.
+
+Создайте Eth1Link.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+bool eth1LinkUpW5500();
+Создайте Eth1Link.cpp
+cpp Копировать
+#include "Eth1Link.h"
+
+#include <Ethernet_Generic.h>
+#include "utility/w5100.h" // тут лежит объявление W5100Class/W5100
+
+bool eth1LinkUpW5500()
+{
+	// getLinkStatus() у вас точно есть (это видно в логах линкера)
+	return (W5100.getLinkStatus() != 0); // 0=down,1=up
+}
+В .ino подключите и используйте
+cpp Копировать
+#include "Eth1Link.h"
+
+static bool eth1LinkUp() { return eth1LinkUpW5500(); }
+Дальше ваш tickInternet1LinkSupervisor() работает по linkUp (IP не используйте для детекта кабеля).
+
+3) Почему у вас был undefined reference eth1LinkUpW5500
+Потому что файла с реализацией этой функции не было в сборке (не создали .cpp в папке проекта или он 
+не подхватился IDE). С вариантом Eth1Link.cpp это решается.
+
+Если после пункта (1) всё ещё будут multiple definition,значит где-то остался Ethernet_Generic.hpp или w5100_Impl.h.
+ Пришлите результаты поиска по проекту (список файлов,где встречается
+ Ethernet_Generic.hpp/w5100_Impl.h) — я укажу,что именно убрать.
+ 
+ 
+ ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 
+ В вашем .ino сейчас две ошибки,которые и держат линкер в “multiple definition” и “undefined reference”:
+
+1) multiple definition Ethernet/W5100/...
+Это означает:реализация Ethernet_Generic всё ещё компилируется в нескольких единицах.
+ В вашем случае это почти наверняка из‑за того,что где‑то в проекте осталось:
+
+#include <Ethernet_Generic.hpp> (он НЕ “только декларации”,а с реализацией)
+либо подключается w5100_Impl.h
+Вы сами показали,что у вас было в TimeSyncPlanner.cpp и WebUI.h:
+
+cpp Копировать
+#include <Ethernet_Generic.hpp>
+Пока это не убрать — линкер будет падать всегда.
+
+Что сделать
+В проекте сделайте поиск Ethernet_Generic.hpp и удалите/замените везде на:
+cpp Копировать
+#include <Ethernet_Generic.h>
+Минимум:
+
+TimeSyncPlanner.cpp → .hpp заменить на .h
+WebUI.h → .hpp заменить на .h
+любые другие файлы,где встречается .hpp
+Сделайте поиск w5100_Impl.h и убедитесь,что его нет ни в одном вашем файле.
+
+В .ino можно вообще не подключать Ethernet напрямую (как у вас сейчас) — это нормально,если остальные модули включают .h.
+
+После этого multiple definition ... уйдёт.
+
+2) undefined reference eth1LinkUpW5500 + плохая строка в .ino
+У вас в .ino есть вот это (глобально,вне функций):
+
+cpp Копировать
+//extern "C" bool eth1LinkUpW5500();
+const bool linkUp = eth1LinkUpW5500();
+Это нельзя:
+
+вы закомментировали объявление функции,
+вы вызываете функцию при глобальной инициализации (до setup()),что вообще опасно.
+Правильно
+В .ino должно быть так:
+
+cpp Копировать
+#include "Eth1Link.h" // уже есть
+
+// НИКАКИХ вызовов eth1LinkUpW5500() на глобальном уровне!
+А внутри tickInternet1LinkSupervisor():
+
+cpp Копировать
+bool linkUp = eth1LinkUpW5500();
+То есть:
+
+строку const bool linkUp = eth1LinkUpW5500(); — удалить
+extern "C"... вам не нужен,если вы сделали Eth1Link.h как обычный C++ header.
+3) Проверьте,как должны выглядеть файлы Eth1Link (чтобы всё собралось)
+Eth1Link.h
+cpp Копировать
+#pragma once
+#include <Arduino.h>
+
+bool eth1LinkUpW5500();
+Eth1Link.cpp
+cpp Копировать
+#include "Eth1Link.h"
+#include <Ethernet_Generic.h>
+#include "utility/w5100.h"
+
+bool eth1LinkUpW5500()
+{
+	return (W5100.getLinkStatus() != 0); // 0=down,1=up
+}
+4) Короткий чек-лист перед новой сборкой
+В проекте 0 вхождений Ethernet_Generic.hpp.
+В проекте 0 вхождений w5100_Impl.h.
+В .ino нет строки const bool linkUp = eth1LinkUpW5500();.
+Eth1Link.cpp реально лежит в папке скетча и участвует в сборке.
+Если после этого линкер всё ещё ругнётся на multiple definition,значит Ethernet_Generic.hpp тянется через какой-то
+ ваш заголовок. Тогда пришлите первые 20 строк We
