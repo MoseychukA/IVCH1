@@ -1,8 +1,17 @@
+//=========================================================================================
 #include "TimeSyncPlanner.h"
 
 #include <IPAddress.h>
 #include <Ethernet_Generic.hpp>
 #include <EthernetUdp.h>
+
+// ---------- LED pulse (реализовать в .ino) ----------
+// src:1=GPS (LED1 PE13),2=INTERNET1 (LED2 PE12),3=INTERNET2 (LED3 PE11),4=GSM (LED4 PB0)
+extern void pulseSyncLed(uint8_t src);
+static constexpr uint8_t SYNC_LED_GPS = 1;
+static constexpr uint8_t SYNC_LED_NET1 = 2;
+static constexpr uint8_t SYNC_LED_NET2 = 3;
+// GSM LED (4) зажигаетс€ в .ino там,где вы делаете rtc.setTime() по SIM800
 
 // ---------- NTP over Ethernet (INTERNET1 / W5500 local) ----------
 static const IPAddress kNtpServers[5] = {
@@ -142,7 +151,11 @@ void TimeSyncPlanner::tick() {
 		if (_internet2->readStatus(st)) {
 			if (st.lastSyncOk && st.lastNtpUtc != 0 && st.lastNtpUtc != _net2LastSeenNtpUtc) {
 				_net2LastSeenNtpUtc = st.lastNtpUtc;
+
+				// «апись времени в DS3231 (INTERNET2)
 				setRtcFromUnixUtc(st.lastNtpUtc);
+				pulseSyncLed(SYNC_LED_NET2); // LED3 на 500 мс
+
 				_net2Pending = false;
 				onTimeUpdated();
 				return;
@@ -166,7 +179,7 @@ void TimeSyncPlanner::tick() {
 	(void)tryStartGps(now, false);
 	if (tryStartNet(now, false)) return; // INTERNET1 (W5500 local)
 	if (tryStartNet2(now, false)) return; // INTERNET2 (I2C)
-	(void)tryStartGsm(now, false); // GSM CCLK
+	(void)tryStartGsm(now, false); // GSM CCLK (rtc.setTime делаетс€ у вас в .ino по событию SIM)
 }
 
 // ---------- GPS ----------
@@ -187,6 +200,9 @@ bool TimeSyncPlanner::tryStartGps(uint32_t now, bool immediate) {
 
 	uint8_t dsDow = ds3231DowFromDow0(dow0_sun(y, mo, d));
 	_rtc.setTime((uint8_t)s, (uint8_t)mi, (uint8_t)h, dsDow, (uint8_t)d, (uint8_t)mo, (uint16_t)y);
+
+	// LED1 на 500 мс (GPS + запись DS3231)
+	pulseSyncLed(SYNC_LED_GPS);
 
 	return true;
 }
@@ -211,7 +227,10 @@ bool TimeSyncPlanner::tryStartNet(uint32_t now, bool immediate) {
 		return false;
 	}
 
+	// «апись времени в DS3231 (INTERNET1)
 	setRtcFromUnixUtc(unixUtc);
+	pulseSyncLed(SYNC_LED_NET1); // LED2 на 500 мс
+
 	onTimeUpdated();
 	return true;
 }

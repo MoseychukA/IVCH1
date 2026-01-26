@@ -627,8 +627,52 @@ void tickInternet1LinkSupervisor()
 	applyInternet1FromStore();
 }
 
+//================================================================================
 
+#define LED1_PIN PE13 // GPS
+#define LED2_PIN PE12 // INTERNET1
+#define LED3_PIN PE11 // INTERNET2
+#define LED4_PIN PB0 // GSM
 
+static uint32_t gLedOffMs[5] = { 0,0,0,0,0 };
+
+static void ledsInit()
+{
+	pinMode(LED1_PIN, OUTPUT);
+	pinMode(LED2_PIN, OUTPUT);
+	pinMode(LED3_PIN, OUTPUT);
+	pinMode(LED4_PIN, OUTPUT);
+
+	digitalWrite(LED1_PIN, LOW);
+	digitalWrite(LED2_PIN, LOW);
+	digitalWrite(LED3_PIN, LOW);
+	digitalWrite(LED4_PIN, LOW);
+}
+
+enum SyncLedSrc :uint8_t { SYNC_GPS = 1, SYNC_NET1 = 2, SYNC_NET2 = 3, SYNC_GSM = 4 };
+
+void pulseSyncLed(uint8_t src) // будет вызываться из TimeSyncPlanner.cpp и из loop() (GSM)
+{
+	uint32_t off = millis() + 500;
+	gLedOffMs[src] = off;
+
+	switch (src) {
+	case SYNC_GPS:digitalWrite(LED1_PIN, HIGH); break;
+	case SYNC_NET1:digitalWrite(LED2_PIN, HIGH); break;
+	case SYNC_NET2:digitalWrite(LED3_PIN, HIGH); break;
+	case SYNC_GSM:digitalWrite(LED4_PIN, HIGH); break;
+	default:break;
+	}
+}
+
+static void tickSyncLedPulses()
+{
+	uint32_t now = millis();
+	if (gLedOffMs[SYNC_GPS] && (int32_t)(now - gLedOffMs[SYNC_GPS]) >= 0) { gLedOffMs[SYNC_GPS] = 0; digitalWrite(LED1_PIN, LOW); }
+	if (gLedOffMs[SYNC_NET1] && (int32_t)(now - gLedOffMs[SYNC_NET1]) >= 0) { gLedOffMs[SYNC_NET1] = 0; digitalWrite(LED2_PIN, LOW); }
+	if (gLedOffMs[SYNC_NET2] && (int32_t)(now - gLedOffMs[SYNC_NET2]) >= 0) { gLedOffMs[SYNC_NET2] = 0; digitalWrite(LED3_PIN, LOW); }
+	if (gLedOffMs[SYNC_GSM] && (int32_t)(now - gLedOffMs[SYNC_GSM]) >= 0) { gLedOffMs[SYNC_GSM] = 0; digitalWrite(LED4_PIN, LOW); }
+}
 
 
 //================================================================================
@@ -637,6 +681,15 @@ void setup()
 	// отпустить PWRKEY
 	pinMode(PE0, OUTPUT);
 	digitalWrite(PE0, LOW);
+	pinMode(PA0, INPUT_PULLUP); // SW5:0 = запрет сохранения
+	ledsInit();
+	//pulseSyncLed(1);
+	//delay(300);
+	//pulseSyncLed(2);
+	//delay(300);
+	//pulseSyncLed(3);
+	//delay(300);
+	//pulseSyncLed(4);
 
 	Serial.begin(115200);
 
@@ -732,6 +785,7 @@ void setup()
 	// HOME
 	menu_start.drawStartPage();
 	web.begin();
+	ledsInit();
 }
 
 void loop()
@@ -868,6 +922,7 @@ void loop()
 
 			rtc.setTime((uint8_t)s, (uint8_t)mi, (uint8_t)h,
 				dsDow, (uint8_t)d, (uint8_t)mo, (uint16_t)y);
+			pulseSyncLed(SYNC_GSM);
 
 			snprintf(gDateStr, sizeof(gDateStr), "%02d.%02d.%04d", d, mo, y);
 			snprintf(gTimeStr, sizeof(gTimeStr), "%02d:%02d:%02d", h, mi, s);
@@ -888,6 +943,7 @@ void loop()
 	tickInternet1LinkSupervisor();
 	tickInternet2LinkSupervisor();
 	web.tick();
+	tickSyncLedPulses();
 }
 
 
