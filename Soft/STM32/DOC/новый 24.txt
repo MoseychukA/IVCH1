@@ -1,0 +1,120 @@
+Сделать “реальный приход данных времени по интернет‑каналам” в рамках одного menu.cpp можно только если 
+в проекте есть фактические таймстемпы “время получено по NET1/NET2”.
+
+Сейчас у вас для IP1/IP2 используется прокси (не нулевой IP → считаем “живой”),это не “реальный приход времени”.
+
+Чтобы:
+
+не ломать сборку,
+и при этом перейти на реальный критерий,
+я добавляю в menu.cpp weak‑extern таймстемпы,которые (если они определены где‑то в проекте) будут 
+использоваться,а если нет — будет показываться [X] (то есть “реального времени по интернету не фиксируем”).
+
+Что нужно добавить в проект (желательно)
+Где‑то в вашем коде (не в menu.cpp) обновляйте при успешной синхронизации времени:
+
+cpp Копировать
+uint32_t gNet1TimeRxMs = millis(); // когда реально получили время по INTERNET1
+uint32_t gNet2TimeRxMs = millis(); // когда реально получили время по INTERNET2
+Правки ТОЛЬКО в menu.cpp
+1) Добавить weak‑extern переменные (вверху,рядом с другими extern)
+Добавьте после блока extern для Net/GSM:
+
+cpp Копировать
+// --- OPTIONAL:real time-receive timestamps for Internet channels ---
+// If these symbols are defined elsewhere,[T]/[X] for IP1/IP2 will reflect REAL time reception.
+// If not defined,[T] will never appear (only [X]) => no false positives.
+extern uint32_t gNet1TimeRxMs __attribute__((weak));
+extern uint32_t gNet2TimeRxMs __attribute__((weak));
+2) В chIp1Ok() и chIp2Ok() использовать эти таймстемпы,если они реально присутствуют
+Замените текущие функции chIp1Ok() и chIp2Ok() на:
+
+cpp Копировать
+static inline bool chIp1Ok(uint32_t now)
+{
+	// require source enabled
+	if (syncData.netEnable == 0) return false;
+
+	// If symbol exists,use REAL time-reception timestamp
+	if ((uintptr_t)&gNet1TimeRxMs != 0) {
+		return isFreshByPeriod(gNet1TimeRxMs,periodIdxToMs(syncData.netPeriodIdx),now);
+	}
+
+	// No real timestamp available => do NOT fake it
+	return false;
+}
+
+static inline bool chIp2Ok(uint32_t now)
+{
+	if (syncData.net2Enable == 0) return false;
+
+	if ((uintptr_t)&gNet2TimeRxMs != 0) {
+		return isFreshByPeriod(gNet2TimeRxMs,periodIdxToMs(syncData.net2PeriodIdx),now);
+	}
+
+	return false;
+}
+Примечание:здесь используется uintptr_t,поэтому если у вас нет включения <stdint.h> (обычно есть через Arduino),
+можно добавить #include <stdint.h> в начало файла. 
+На STM32/Arduino обычно это не требуется,но если компилятор ругнётся — добавим.
+
+Что получится
+На HOME в строках IP1/IP2 значки [T]/[X] будут показывать именно факт получения времени по этим каналам.
+LED2/LED3 (если вы их используете через LED2_PIN/LED3_PIN) тоже начнут отражать реальную синхронизацию времени,а не “есть IP”.
+Если вы скажете,как в вашем проекте уже называется “успешная синхронизация по интернету” (переменные/методы planner/TimeFeed),
+я могу подключиться к ним напрямую без добавления новых глобальных переменных.
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+Да,в NtpLanService_Generic есть ровно то,что нужно для “реального прихода времени по INTERNET1”:
+
+lastSuccessMs() — millis() момента последней успешной синхронизации времени
+lastSyncOk() — результат последней попытки (менее удобен,может “дёргаться” после неудачной попытки)
+Для индикации [T]/[X] по INTERNET1 правильнее опираться именно на lastSuccessMs() и проверять “период +30%”.
+
+Как использовать в menu.cpp (INTERNET1 / IP1)
+Убедитесь,что extern NtpLanService_Generic ntpLan; уже есть (у вас есть).
+
+Замените логику chIp1Ok(now) на использование ntpLan.lastSuccessMs():
+
+cpp Копировать
+static inline bool chIp1Ok(uint32_t now)
+{
+	if (syncData.netEnable == 0) return false;
+
+	const uint32_t lastOk = ntpLan.lastSuccessMs(); // реальный момент прихода времени
+	return isFreshByPeriod(lastOk,periodIdxToMs(syncData.netPeriodIdx),now);
+}
+Тут не надо использовать lastSyncOk() — он отражает последнюю попытку и может стать
+ false даже при недавнем успешном получении времени.
+
+После этого значок [T]/[X] в строке IP1 на HOME будет отражать реальный факт получения времени по NTP (INTERNET1).
+
+INTERNET2 / IP2
+По INTERNET2 вы показали только Internet2Client::Status в старом menu.cpp (там было st.ip),но в 
+предоставленных сейчас файлах нет Internet2Client.h/.cpp,поэтому я не могу безопасно сказать,есть ли там:
+
+lastSuccessMs
+lastSyncOk
+или иной timestamp
+Без этого нельзя сделать “реальный приход времени” по IP2 без угадываний и риска сломать сборку.
+
+Что нужно от вас
+Пришлите,пожалуйста,файлы:
+
+Internet2Client.h
+(если нужно) Internet2Client.cpp
+И я сделаю для chIp2Ok(now) аналогично:
+
+брать lastSuccessMs (или эквивалент) из internet2
+проверять isFreshByPeriod(lastOk,periodIdxToMs(syncData.net2PeriodIdx),now)
+Дополнительно (важно)
+После перехода IP1 на ntpLan.lastSuccessMs() переменные-прокси gChIp1RxMs и обновление по “IP не нулевой” 
+становятся не нужны для INTERNET1. Их можно оставить (не мешают),но лучше потом почистить,когда подтвердим INTERNET2.
+
+Если вы пришлёте Internet2Client.h,я сразу:
+
+сделаю chIp2Ok(now) “по реальному приходу времени”,
+выдам полный menu.cpp целиком с обновлённой логикой [T]/[X] для обоих интернет‑каналов.
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++

@@ -1,0 +1,1267 @@
+
+/*
+ Программа модуля часов и измерения питающей сети.
+ Дисплей ST7789 SPI 170x320
+ Микроконтроллер STM32F103VGT6
+ Среда программирования Arduino IDE
+ Плата:Generic STM32F1 series (STMicroelectronics_GenF1)
+
+ 
+*/
+
+#include <Arduino.h>
+
+#include "PCF8575_simple.h"
+#include <Wire.h>
+#include <stdint.h>
+#include <math.h>
+
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <SD.h>
+
+#include "Menu.h"
+#include "Buttons.h"
+
+#include "SIM800TimeAsync.h"
+#include "AT24C128Settings.h"
+#include "SyncSourcesStore.h"
+#include "TimeSyncPlanner.h"
+
+#include "TimeFeed.h"
+#include "NetFeed.h"
+#include "RTCSupport.h"
+#include "GPSNmeaParser.h"
+
+#include "EthConfig.h"
+#include "NtpLanService_Generic.h"
+#include "LanIfStore.h"
+#include "Internet2Client.h"
+#include "WebUI.h"
+#include <Ethernet_Generic.hpp>
+#include "NetHelpers.h"
+#include <IWatchdog.h>
+
+WebUI web(80);
+
+// -------------------- Pins / UI --------------------
+#define SW1_PIN PC3
+#define SW2_PIN PC2
+#define SW3_PIN PC1
+#define SW4_PIN PC0
+
+// 7-seg via PCF8575
+#define PCF_HOUR 0x21
+#define PCF_MIN 0x22
+#define PCF_SEC 0x23
+
+#define INPUT_PIN PA1
+
+// -------------------- TFT/Menu/Buttons --------------------
+TFT_eSPI tft = TFT_eSPI();
+Menu menu_start(&tft);
+
+Button btnSW1(SW1_PIN);
+Button btnSW2(SW2_PIN);
+Button btnSW3(SW3_PIN);
+Button btnSW4(SW4_PIN);
+
+// -------------------- PCF8575 --------------------
+PCF8575_simple pcfHour(PCF_HOUR);
+PCF8575_simple pcfMin(PCF_MIN);
+PCF8575_simple pcfSec(PCF_SEC);
+
+const uint8_t segTable[10] = {
+ 0b00111111,0b00000110,0b01011011,0b01001111,0b01100110,
+ 0b01101101,0b01111101,0b00000111,0b01111111,0b01101111
+};
+
+// -------------------- Frequency measure --------------------
+volatile uint32_t diff_sum = 0;
+volatile uint16_t diff_count = 0;
+volatile bool skip = false;
+float frequency = 0.0f;
+
+#ifndef dtostrf
+char* dtostrf(double val, signed char width, unsigned char prec, char* sout) {
+	sprintf(sout, "%*.*f", width, prec, val);
+	return sout;
+}
+#endif
+
+void freqInterrupt() {
+	static uint32_t prev = 0;
+	if (skip) { skip = false; return; }
+	skip = true;
+
+	uint32_t now = micros();
+	if (prev > 0) {
+		uint32_t diff = now - prev;
+		diff_sum += diff;
+		diff_count++;
+	}
+	prev = now;
+}
+
+static void setPCF(PCF8575_simple& pcf, uint8_t first, uint8_t second) {
+	uint16_t word = 0;
+	word |= (first & 0xFF);
+	word |= ((uint16_t)second) << 8;
+	pcf.write16(word);
+}
+
+static void displayFrequency(float freq)
+{
+	if (isnan(freq) || freq < 0 || freq > 99.9999) {
+		setPCF(pcfHour, 0xFF, 0xFF);
+		setPCF(pcfMin, 0xFF, 0xFF);
+		setPCF(pcfSec, 0xFF, 0xFF);
+		return;
+	}
+
+	if (freq > 99.9999) freq = 99.9999;
+	if (freq < 0) freq = 0.0;
+
+	uint8_t d1 = (uint8_t)(freq / 10);
+	uint8_t d2 = (uint8_t)(fmod(freq, 10));
+	uint16_t fract = (uint16_t)(fmod(freq, 1) * 10000);
+
+	uint8_t f1 = (fract / 1000) % 10;
+	uint8_t f2 = (fract / 100) % 10;
+	uint8_t f3 = (fract / 10) % 10;
+	uint8_t f4 = (fract / 1) % 10;
+
+	uint8_t dig[6];
+	dig[0] = ~segTable[d1];
+	dig[1] = ~segTable[d2] & ~(0b10000000); // точка
+	dig[2] = ~segTable[f1];
+	dig[3] = ~segTable[f2];
+	dig[4] = ~segTable[f3];
+	dig[5] = ~segTable[f4];
+
+	setPCF(pcfHour, dig[0], dig[1]);
+	setPCF(pcfMin, dig[2], dig[3]);
+	setPCF(pcfSec, dig[4], dig[5]);
+}
+
+static void displayTime(uint8_t hours, uint8_t minutes, uint8_t seconds) {
+	setPCF(pcfHour, ~segTable[hours / 10], ~segTable[hours % 10]);
+	setPCF(pcfMin, ~segTable[minutes / 10], ~segTable[minutes % 10]);
+	setPCF(pcfSec, ~segTable[seconds / 10], ~segTable[seconds % 10]);
+}
+
+// -------------------- Calendar/Epoch helpers (ОДНА копия) --------------------
+static int32_t daysFromCivil(int y, int m, int d) {
+	y -= (m <= 2);
+	const int era = (y >= 0 ? y : y - 399) / 400;
+	const unsigned yoe = (unsigned)(y - era * 400);
+	const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + (unsigned)d - 1;
+	const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	return (int32_t)(era * 146097 + (int)doe - 719468);
+}
+
+static void civilFromDays(int32_t z, int& y, int& m, int& d) {
+	z += 719468;
+	const int era = (z >= 0 ? z : z - 146096) / 146097;
+	const unsigned doe = (unsigned)(z - era * 146097);
+	const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	y = (int)yoe + era * 400;
+	const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	const unsigned mp = (5 * doy + 2) / 153;
+	d = (int)(doy - (153 * mp + 2) / 5 + 1);
+	m = (int)(mp + (mp < 10 ? 3 : -9));
+	y += (m <= 2);
+}
+
+static int64_t toEpochSeconds(int y, int mo, int d, int h, int mi, int s) {
+	int32_t days = daysFromCivil(y, mo, d);
+	return (int64_t)days * 86400LL + (int64_t)h * 3600LL + (int64_t)mi * 60LL + (int64_t)s;
+}
+
+static void fromEpochSeconds(int64_t t, int& y, int& mo, int& d, int& h, int& mi, int& s) {
+	int64_t days = t / 86400LL;
+	int64_t rem = t % 86400LL;
+	if (rem < 0) { rem += 86400LL; days -= 1; }
+	civilFromDays((int32_t)days, y, mo, d);
+	h = (int)(rem / 3600LL); rem %= 3600LL;
+	mi = (int)(rem / 60LL);
+	s = (int)(rem % 60LL);
+}
+
+// local(net) -> UTC по tzq_net
+static void localToUTC(int& y, int& mo, int& d, int& h, int& mi, int& s, int tzQuarterHours) {
+	const int offsetMin = tzQuarterHours * 15;
+	int64_t epochLocal = toEpochSeconds(y, mo, d, h, mi, s);
+	int64_t epochUTC = epochLocal - (int64_t)offsetMin * 60LL;
+	fromEpochSeconds(epochUTC, y, mo, d, h, mi, s);
+}
+
+// UTC -> local(target) по tzq_target
+static void utcToLocal(int& y, int& mo, int& d, int& h, int& mi, int& s, int tzQuarterHours) {
+	const int offsetMin = tzQuarterHours * 15;
+	int64_t epochUTC = toEpochSeconds(y, mo, d, h, mi, s);
+	int64_t epochLocal = epochUTC + (int64_t)offsetMin * 60LL;
+	fromEpochSeconds(epochLocal, y, mo, d, h, mi, s);
+}
+
+// DOW helpers
+static uint8_t dow0_sun(int y, int m, int d) {
+	static int t[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+	if (m < 3) y -= 1;
+	return (uint8_t)((y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7);
+}
+static uint8_t ds3231DowFromDow0(uint8_t dow0) { return (dow0 == 0) ? 7 : dow0; }
+
+// DS3231 local -> unix UTC by tzTargetHours
+static uint32_t unixUtcFromRtcLocal(const RTCTime& t, int8_t tzTargetHours) {
+	int64_t local = toEpochSeconds(t.year, t.month, t.dayOfMonth, t.hour, t.minute, t.second);
+	int64_t utc = local - (int64_t)tzTargetHours * 3600LL;
+	if (utc < 0) utc = 0;
+	return (uint32_t)utc;
+}
+
+// unix UTC -> DS3231 local by tzTargetHours
+static void rtcLocalFromUnixUtc(uint32_t unixUtc, int8_t tzTargetHours, RTCTime& out) {
+	int64_t local = (int64_t)unixUtc + (int64_t)tzTargetHours * 3600LL;
+	int y, mo, d, h, mi, s;
+	fromEpochSeconds(local, y, mo, d, h, mi, s);
+
+	out.year = (uint16_t)y; out.month = (uint8_t)mo; out.dayOfMonth = (uint8_t)d;
+	out.hour = (uint8_t)h; out.minute = (uint8_t)mi; out.second = (uint8_t)s;
+
+	// dayOfWeek как в вашем RTCSupport:1..7 (Mon..Sun)
+	static int tt[] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+	int yy = y; if (mo < 3) yy -= 1;
+	uint8_t dow0 = (uint8_t)((yy + yy / 4 - yy / 100 + yy / 400 + tt[mo - 1] + d) % 7); // 0=Sun
+	out.dayOfWeek = (dow0 == 0) ? 7 : dow0;
+}
+
+// -------------------- GPS --------------------
+/*
+ PA3 = USART2_RX (GPS TX -> PA3)
+ PA2 = USART2_TX (опционально)
+*/
+HardwareSerial gps_Serial(PA3, PA2);
+GPSNmeaParser gps(gps_Serial);
+
+// -------------------- SIM800 UART4 --------------------
+HardwareSerial MODEM(PC11, PC10); // RX,TX (UART4:PC11/PC10)
+static const uint8_t PWRKEY_PIN = PE0; // через NPN на землю
+static const bool PWRKEY_ACTIVE_HIGH = true; // "нажать"=HIGH
+SIM800TimeAsync sim(MODEM, PWRKEY_PIN, PWRKEY_ACTIVE_HIGH);
+
+// -------------------- I2C EEPROM stores / Net services (глобально,для extern в Menu.cpp) --------------------
+AT24C128Settings ee(Wire, 0x50);
+AT24C128Settings::Config cfg;
+
+SyncSourcesStore syncStore(Wire, 0x50);
+SyncSourcesStore::Data syncData;
+
+RealtimeClock rtc;
+
+NtpLanService_Generic ntpLan(rtc, cfg);
+
+LanIfStore lanStore(0x50, Wire);
+
+Internet2Client internet2(Wire, 0x42);
+
+// Планировщик (ВАЖНО:после sim/gps/rtc/cfg/syncData/internet2)
+TimeSyncPlanner planner(sim, gps, rtc, cfg, syncData, &internet2);
+
+// -------------------- NTP lists/periods (shared with Menu order) --------------------
+static const IPAddress kNtpUpstreamIp[5] = {
+ IPAddress(162,159,200,123),
+ IPAddress(162,159,200,1),
+ IPAddress(129,6,15,28),
+ IPAddress(132,163,96,1),
+ IPAddress(216,239,35,0)
+};
+
+static uint32_t periodMsFromIdx(uint8_t idx)
+{
+	static const uint32_t ms[6] = {
+	60000UL,// 1 мин
+	600000UL,// 10 мин
+	1800000UL,// 30 мин
+	3600000UL,// 1 час
+	21600000UL,// 6 часов
+	43200000UL // 12 часов
+	};
+	return ms[idx % 6];
+}
+
+// -------------------- Config -> SIM --------------------
+static void applyCfgToSimNoConflict(const AT24C128Settings::Config& c)
+{
+	SIM800TimeAsync::NtpConfig ntp;
+	ntp.apn = c.apn;
+	ntp.user = c.user;
+	ntp.pass = c.pass;
+	ntp.server = c.server;
+	ntp.tzHours = c.tzNtpHours; // для AT+CNTP (обычно 0)
+	ntp.enableFallback = c.enableFallback;
+
+	sim.setNtpConfig(ntp);
+
+	// Чтобы не конфликтовать с planner:внутренний период "далеко"
+	sim.setPeriodMs(86400000UL); // 1 сутки
+}
+
+// -------------------- INTERNET apply (extern used by Menu.cpp) --------------------
+void applyInternet1FromStore()
+{
+	LanIfStore::IfConfig c;
+	lanStore.load(LanIfStore::IF1, c, false);
+
+	ntpLan.applyLanConfig(
+		c.dhcp != 0,
+		IPAddress(c.ip[0], c.ip[1], c.ip[2], c.ip[3]),
+		IPAddress(c.dns[0], c.dns[1], c.dns[2], c.dns[3]),
+		IPAddress(c.gw[0], c.gw[1], c.gw[2], c.gw[3]),
+		IPAddress(c.mask[0], c.mask[1], c.mask[2], c.mask[3])
+	);
+
+	ntpLan.applyUpstream(
+		kNtpUpstreamIp[c.ntpIdx % 5],
+		periodMsFromIdx(c.periodIdx)
+	);
+
+	planner.onSettingsChanged();
+}
+
+void applyInternet2FromStore()
+{
+	LanIfStore::IfConfig c;
+	lanStore.load(LanIfStore::IF2, c, false);
+
+	const bool dhcp = (c.dhcp != 0);
+
+	IPAddress up = kNtpUpstreamIp[c.ntpIdx % 5];
+	uint32_t per = periodMsFromIdx(c.periodIdx);
+
+	// ВАЖНО:
+	// если DHCP=ON,реальные IP/MASK/GW/DNS модуль получит сам от DHCP.
+	// Поэтому сюда отправляем нули (или можно отправить сохранённые как fallback,
+	// но только если прошивка INTERNET2 гарантированно их игнорирует при DHCP=ON).
+	IPAddress ip = dhcp ? IPAddress(0, 0, 0, 0) : IPAddress(c.ip[0], c.ip[1], c.ip[2], c.ip[3]);
+	IPAddress mask = dhcp ? IPAddress(0, 0, 0, 0) : IPAddress(c.mask[0], c.mask[1], c.mask[2], c.mask[3]);
+	IPAddress gw = dhcp ? IPAddress(0, 0, 0, 0) : IPAddress(c.gw[0], c.gw[1], c.gw[2], c.gw[3]);
+	IPAddress dns = dhcp ? IPAddress(0, 0, 0, 0) : IPAddress(c.dns[0], c.dns[1], c.dns[2], c.dns[3]);
+
+	internet2.applyNetCfg(
+		dhcp,
+		ip,
+		mask,
+		gw,
+		dns,
+		up,
+		per
+	);
+
+	// сразу дать модулю актуальное время (UTC)
+	RTCTime nowLocal = rtc.getTime();
+	uint32_t unixUtc = unixUtcFromRtcLocal(nowLocal, cfg.tzTargetHours);
+	uint16_t ms = (uint16_t)(millis() % 500);
+	internet2.setTimeUnixUtc(unixUtc, ms);
+}
+
+// -------------------- IP feed update (HOME) --------------------
+static void updateIp1Feed1Hz()
+{
+	static uint32_t t0 = 0;
+	uint32_t now = millis();
+	if (now - t0 < 1000) return;
+	t0 = now;
+
+	char buf[16];
+
+	// ВАЖНО:индикация по LINK,а не по IP
+	if (!eth1LinkUp()) {
+		strncpy(buf, "0.0.0.0", sizeof(buf));
+		buf[sizeof(buf) - 1] = 0;
+	}
+	else {
+		IPAddress ip = ntpLan.localIP();
+		snprintf(buf, sizeof(buf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+	}
+
+	if (strcmp(gIp1Str, buf) != 0) {
+		strncpy(gIp1Str, buf, sizeof(gIp1Str) - 1);
+		gIp1Str[sizeof(gIp1Str) - 1] = 0;
+		gIpUpdated = true;
+	}
+}
+
+static void updateIp2Feed1Hz()
+{
+	static uint32_t t0 = 0;
+	uint32_t now = millis();
+	if (now - t0 < 1000) return;
+	t0 = now;
+
+	Internet2Client::Status st;
+	if (internet2.readStatus(st)) {
+		char buf[16];
+		snprintf(buf, sizeof(buf), "%u.%u.%u.%u", st.ip[0], st.ip[1], st.ip[2], st.ip[3]);
+		if (strcmp(gIp2Str, buf) != 0) {
+			strncpy(gIp2Str, buf, sizeof(gIp2Str) - 1);
+			gIp2Str[15] = 0;
+			gIpUpdated = true;
+		}
+	}
+}
+
+//================================================================================
+static void tickInternet2TimePushEdge()
+{
+	static uint8_t lastSec = 255;
+	static uint32_t lastEdgeMs = 0;
+	static uint32_t unixUtcAtEdge = 0;
+
+	RTCTime t = rtc.getTime(); // локальное время
+	if (t.second != lastSec) {
+		lastSec = t.second;
+
+		// считаем UTC unix по локальному времени и cfg.tzTargetHours
+		unixUtcAtEdge = unixUtcFromRtcLocal(t, cfg.tzTargetHours);
+
+		// отметка момента обнаружения границы секунды
+		lastEdgeMs = millis();
+
+		// отправляем "ровно начало секунды"
+		internet2.setTimeUnixUtc(unixUtcAtEdge, 0);
+		return;
+	}
+
+	// (опционально) подстраховка:если долго не было отправки,можно обновить ms-фазу
+	// например раз в 5 секунд:
+	static uint32_t tGuard = 0;
+	if (millis() - tGuard > 5000) {
+		tGuard = millis();
+		if (unixUtcAtEdge != 0) {
+			uint32_t d = millis() - lastEdgeMs;
+			uint32_t unixUtcNow = unixUtcAtEdge + d / 1000UL;
+			uint16_t msNow = (uint16_t)(d % 1000UL);
+			internet2.setTimeUnixUtc(unixUtcNow, msNow);
+		}
+	}
+}
+
+//================================================================================
+
+
+void tickInternet2LinkSupervisor()
+{
+	// --- tuning ---
+	const uint32_t CHECK_MS = 1000; // как часто читаем status
+	const uint32_t DOWN_N_MS = 8000; // N секунд "down",после которых начинаем лечить
+	const uint32_t SOFT_COOLDOWN_MS = 5000;// не чаще чем раз в 5с soft reinit
+	const uint32_t HARD_COOLDOWN_MS = 15000;// не чаще чем раз в 15с apply cfg
+	const uint32_t SOFT_TO_HARD_MS = 20000;// если за 20с не ожило -> hard
+	const uint8_t MAX_SOFT_TRIES = 3; // после 3 soft -> hard
+
+	static uint32_t lastCheckMs = 0;
+
+	static uint32_t downSinceMs = 0; // когда началось "down"
+	static uint32_t lastSoftMs = 0;
+	static uint32_t lastHardMs = 0;
+	static uint8_t softTries = 0;
+
+	const uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	Internet2Client::Status st;
+	bool ok = internet2.readStatus(st);
+	if (!ok) {
+		// Если I2C не ответил,это отдельный кейс. По вашему условию мы лечим link/ip,
+		// но тут тоже логично считать как "down".
+		if (downSinceMs == 0) downSinceMs = now;
+	}
+	else {
+		const bool linkUp = st.linkUp();
+		const bool ipOk = !isZeroIP(st.ip);
+		const bool up = linkUp && ipOk;
+
+		if (up) {
+			// всё хорошо -> сброс состояния
+			downSinceMs = 0;
+			softTries = 0;
+			return;
+		}
+
+		// down по вашему условию
+		if (downSinceMs == 0) downSinceMs = now;
+
+		// не лечим,пока не прошло N секунд
+		if (now - downSinceMs < DOWN_N_MS) return;
+
+		// 1) soft reinit
+		const bool canSoft = (now - lastSoftMs >= SOFT_COOLDOWN_MS);
+		const bool needHardBySoftCount = (softTries >= MAX_SOFT_TRIES);
+		const bool needHardByTime = (now - downSinceMs >= SOFT_TO_HARD_MS);
+
+		if (!needHardBySoftCount && !needHardByTime) {
+			if (canSoft) {
+				lastSoftMs = now;
+				softTries++;
+
+				Serial.print(F("[NET2] down "));
+				Serial.print((unsigned)((now - downSinceMs) / 1000));
+				Serial.println(F("s -> soft reinit (CMD=2)"));
+
+				(void)internet2.requestNetReinit();
+			}
+			return;
+		}
+
+		// 2) hard reapply config
+		if (now - lastHardMs >= HARD_COOLDOWN_MS) {
+			lastHardMs = now;
+
+			Serial.print(F("[NET2] down "));
+			Serial.print((unsigned)((now - downSinceMs) / 1000));
+			Serial.println(F("s -> HARD reapply config"));
+
+			applyInternet2FromStore();
+		}
+	}
+}
+
+//-----------------------------------------------------------------------
+
+
+
+static bool eth1LinkUp()
+{
+	const char* s = Ethernet.linkReport();
+	if (!s) return false;
+
+	// КРИТИЧНО:"NO LINK" содержит "LINK"
+	if (strstr(s, "NO LINK") != nullptr) return false;
+	if (strstr(s, "NO_CABLE") != nullptr) return false;
+	if (strstr(s, "NOLINK") != nullptr) return false;
+
+	// варианты строк зависят от версии библиотеки
+	if (strcmp(s, "LINK") == 0) return true;
+	if (strstr(s, "LinkON") != nullptr) return true;
+	if (strstr(s, "LINKON") != nullptr) return true;
+	if (strcmp(s, "ON") == 0) return true;
+	if (strcmp(s, "UP") == 0) return true;
+
+	// если вернулось что-то непонятное — считаем "линк есть" только если НЕ похоже на "NO"
+	// (иначе будет вечный DOWN на нестандартных строках)
+	if (strstr(s, "NO") != nullptr) return false;
+
+	return true;
+}
+
+
+void tickInternet1LinkSupervisor()
+{
+	const uint32_t CHECK_MS = 1000;
+	const uint32_t NOIP_N_MS = 8000; // если линк есть,а IP=0.0.0.0 дольше N сек -> лечим
+	const uint32_t REAPPLY_COOLDOWN_MS = 10000; // не чаще 10 сек
+
+	static uint32_t lastCheckMs = 0;
+	static uint32_t noIpSinceMs = 0;
+	static uint32_t lastReapplyMs = 0;
+
+	static bool prevInited = false;
+	static bool prevLinkUp = false;
+
+	const uint32_t now = millis();
+	if (now - lastCheckMs < CHECK_MS) return;
+	lastCheckMs = now;
+
+	const bool linkUp = eth1LinkUp();
+
+	// корректная инициализация (первый вызов — без EDGE)
+	if (!prevInited) {
+		prevInited = true;
+		prevLinkUp = linkUp;
+		return;
+	}
+
+	// EDGE:кабель выдернули
+	if (prevLinkUp && !linkUp) {
+		Serial.println(F("[NET1] LINK DOWN"));
+		noIpSinceMs = 0; // пока линка нет,не считаем no-ip таймер
+	}
+
+	// EDGE:кабель вставили обратно -> переподнимаем DHCP/Static
+	if (!prevLinkUp && linkUp) {
+		Serial.println(F("[NET1] LINK UP -> reapply config"));
+		if (now - lastReapplyMs >= 2000) { // защита от дребезга/повторов
+			lastReapplyMs = now;
+			applyInternet1FromStore();
+		}
+	}
+
+	prevLinkUp = linkUp;
+
+	// Если линка нет — лечить бессмысленно (DHCP всё равно не поднимется)
+	if (!linkUp) return;
+
+	// Линк есть -> если IP нулевой,ждём N секунд и переприменяем
+	const bool ipOk = !isZeroIP(Ethernet.localIP());
+	if (ipOk) {
+		noIpSinceMs = 0;
+		return;
+	}
+
+	if (noIpSinceMs == 0) noIpSinceMs = now;
+	if (now - noIpSinceMs < NOIP_N_MS) return;
+
+	if (now - lastReapplyMs < REAPPLY_COOLDOWN_MS) return;
+	lastReapplyMs = now;
+
+	Serial.print(F("[NET1] IP=0.0.0.0 for "));
+	Serial.print((unsigned)((now - noIpSinceMs) / 1000));
+	Serial.println(F("s -> reapply config"));
+
+	applyInternet1FromStore();
+}
+
+//================================================================================
+
+#define LED1_PIN PE13 // GPS
+#define LED2_PIN PE12 // INTERNET1
+#define LED3_PIN PE11 // INTERNET2
+#define LED4_PIN PB0 // GSM
+
+static uint32_t gLedOffMs[5] = { 0,0,0,0,0 };
+
+static void ledsInit()
+{
+	pinMode(LED1_PIN, OUTPUT);
+	pinMode(LED2_PIN, OUTPUT);
+	pinMode(LED3_PIN, OUTPUT);
+	pinMode(LED4_PIN, OUTPUT);
+
+	digitalWrite(LED1_PIN, LOW);
+	digitalWrite(LED2_PIN, LOW);
+	digitalWrite(LED3_PIN, LOW);
+	digitalWrite(LED4_PIN, LOW);
+}
+
+enum SyncLedSrc :uint8_t { SYNC_GPS = 1, SYNC_NET1 = 2, SYNC_NET2 = 3, SYNC_GSM = 4 };
+
+void pulseSyncLed(uint8_t src) // будет вызываться из TimeSyncPlanner.cpp и из loop() (GSM)
+{
+	uint32_t off = millis() + 500;
+	gLedOffMs[src] = off;
+
+	switch (src) {
+	case SYNC_GPS:digitalWrite(LED1_PIN, HIGH); break;
+	case SYNC_NET1:digitalWrite(LED2_PIN, HIGH); break;
+	case SYNC_NET2:digitalWrite(LED3_PIN, HIGH); break;
+	case SYNC_GSM:digitalWrite(LED4_PIN, HIGH); break;
+	default:break;
+	}
+}
+
+static void tickSyncLedPulses()
+{
+	uint32_t now = millis();
+	if (gLedOffMs[SYNC_GPS] && (int32_t)(now - gLedOffMs[SYNC_GPS]) >= 0) { gLedOffMs[SYNC_GPS] = 0; digitalWrite(LED1_PIN, LOW); }
+	if (gLedOffMs[SYNC_NET1] && (int32_t)(now - gLedOffMs[SYNC_NET1]) >= 0) { gLedOffMs[SYNC_NET1] = 0; digitalWrite(LED2_PIN, LOW); }
+	if (gLedOffMs[SYNC_NET2] && (int32_t)(now - gLedOffMs[SYNC_NET2]) >= 0) { gLedOffMs[SYNC_NET2] = 0; digitalWrite(LED3_PIN, LOW); }
+	if (gLedOffMs[SYNC_GSM] && (int32_t)(now - gLedOffMs[SYNC_GSM]) >= 0) { gLedOffMs[SYNC_GSM] = 0; digitalWrite(LED4_PIN, LOW); }
+}
+//================================================================================
+void pumpUiButtons()
+{
+	btnSW1.update();
+	btnSW2.update();
+	btnSW3.update();
+	btnSW4.update();
+
+	if (btnSW1.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW1);
+	if (btnSW1.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW1);
+
+	if (btnSW2.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW2);
+	if (btnSW2.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW2);
+
+	if (btnSW3.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW3);
+	if (btnSW3.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW3);
+
+	if (btnSW4.getEdge() == EDGE_PRESSED) menu_start.onButtonPressed(BTN_SW4);
+	if (btnSW4.getEdge() == EDGE_RELEASED) menu_start.onButtonReleased(BTN_SW4);
+}
+
+//================================================================================
+static constexpr uint8_t chipSelectSD = PA8;
+static bool gSdOk = false;
+
+static File gLog; // по желанию
+
+bool SetupSD()
+{
+	// гарантируем,что SD не выбрана до init
+	pinMode(chipSelectSD, OUTPUT);
+	digitalWrite(chipSelectSD, HIGH);
+
+	// НЕ блокируем работу системы
+	if (!SD.begin(chipSelectSD)) {
+		gSdOk = false;
+		return false;
+	}
+
+	gSdOk = true;
+
+	// (опционально) открыть лог-файл
+	gLog = SD.open("ivch.log", FILE_WRITE);
+	// если файл не открылся — SD всё равно считается доступной
+	return true;
+}
+
+
+extern bool gSdOk;
+extern File gLog;
+static constexpr const char* kLogName = "ivch.log";
+
+bool SdLogOpenIfNeeded()
+{
+	if (!gSdOk) return false;
+
+	if (gLog) return true; // already open
+
+	gLog = SD.open(kLogName, FILE_WRITE);
+	return (bool)gLog;
+}
+
+// Закрыть лог (для /log/clear и перед reset при желании)
+void SdLogClose()
+{
+	if (!gSdOk) return;
+
+	if (gLog) {
+		gLog.flush();
+		gLog.close();
+	}
+}
+
+// Пишем строку с временем
+void SdLogLine(const char* msg)
+{
+	if (!gSdOk) return;
+	if (!msg) return;
+
+	if (!SdLogOpenIfNeeded()) return;
+
+	// Timestamp
+	char ts[32];
+
+	// Пробуем RTC:если год выглядит разумно
+	RTCTime t = rtc.getTime(); // у вас это есть
+	if (t.year >= 2000 && t.year <= 2099) {
+		snprintf(ts, sizeof(ts), "%02u.%02u.%04u %02u:%02u:%02u ",
+			(unsigned)t.dayOfMonth, (unsigned)t.month, (unsigned)t.year,
+			(unsigned)t.hour, (unsigned)t.minute, (unsigned)t.second);
+	}
+	else {
+		snprintf(ts, sizeof(ts), "ms:%lu ", (unsigned long)millis());
+	}
+
+	// Запись
+	gLog.print(ts);
+	gLog.println(msg);
+
+	// Надёжность:можно делать реже,но безопаснее flush всегда
+	gLog.flush();
+}
+//================================================================================
+
+
+// WDT timeout (microseconds)
+static constexpr uint32_t WDT_TIMEOUT_US = 8000000UL; // 8 seconds
+
+// Checkpoint IDs 
+enum :uint16_t {
+	CHK_NONE = 0,
+	CHK_BOOT = 1,
+	CHK_LOOP_BEGIN = 2,
+
+	CHK_GPS_TICK = 10,
+	CHK_NET1_TICK = 20,
+	CHK_IP_FEEDS = 21,
+
+	CHK_NET2_TIME_PUSH = 30,
+	CHK_NET2_EDGE = 31,
+
+	CHK_SIM_TICK = 40,
+	CHK_PLANNER_TICK = 41,
+
+	CHK_FREQ_1HZ = 50,
+
+	CHK_MENU_UPDATE = 60,
+
+	CHK_SIM_TIME_APPLY = 70,
+	CHK_NETFEED_FROM_SIM = 71,
+
+	CHK_SUPERVISORS = 80,
+	CHK_WEB_TICK = 81,
+	CHK_SYNCLED = 82
+};
+
+
+// ---------- checkpoint storage ----------
+// Prefer BKP registers when available on STM32F1.
+// Fallback:.noinit (survives reset,not power loss).
+
+// Fallback storage (.noinit)
+__attribute__((section(".noinit"))) static uint32_t gChkNoInit = 0;
+
+static inline void checkpointWrite(uint16_t v)
+{
+#if defined(BKP) && defined(RCC) // STM32F1 has BKP
+	// Enable PWR and BKP clocks,allow backup access
+	RCC->APB1ENR |= RCC_APB1ENR_PWREN;
+	RCC->APB1ENR |= RCC_APB1ENR_BKPEN;
+	PWR->CR |= PWR_CR_DBP;
+
+	BKP->DR1 = v; // store checkpoint
+	BKP->DR2 = (uint16_t)~v; // simple invert for validation
+#else
+	gChkNoInit = v;
+#endif
+}
+
+static inline uint16_t checkpointRead()
+{
+#if defined(BKP) && defined(RCC)
+	uint16_t v = (uint16_t)BKP->DR1;
+	uint16_t iv = (uint16_t)BKP->DR2;
+	if ((uint16_t)~v != iv) return 0; // invalid/never set
+	return v;
+#else
+	return (uint16_t)gChkNoInit;
+#endif
+}
+
+static inline void setCheckpoint(uint16_t id)
+{
+	checkpointWrite(id);
+}
+//1.3 Удобная печать checkpoint в лог
+
+static const char* checkpointName(uint16_t id)
+{
+	switch (id) {
+	case CHK_NONE:return "NONE";
+	case CHK_BOOT:return "BOOT";
+	case CHK_LOOP_BEGIN:return "LOOP_BEGIN";
+
+	case CHK_GPS_TICK:return "GPS_TICK";
+	case CHK_NET1_TICK:return "NET1_TICK";
+	case CHK_IP_FEEDS:return "IP_FEEDS";
+
+	case CHK_NET2_TIME_PUSH:return "NET2_TIME_PUSH";
+	case CHK_NET2_EDGE:return "NET2_EDGE";
+
+	case CHK_SIM_TICK:return "SIM_TICK";
+	case CHK_PLANNER_TICK:return "PLANNER_TICK";
+
+	case CHK_FREQ_1HZ:return "FREQ_1HZ";
+	case CHK_MENU_UPDATE:return "MENU_UPDATE";
+
+	case CHK_SIM_TIME_APPLY:return "SIM_TIME_APPLY";
+	case CHK_NETFEED_FROM_SIM:return "NETFEED_FROM_SIM";
+
+	case CHK_SUPERVISORS:return "SUPERVISORS";
+	case CHK_WEB_TICK:return "WEB_TICK";
+	case CHK_SYNCLED:return "SYNCLED";
+
+	default:return "UNKNOWN";
+	}
+}
+//1.4 Логирование причины watchdog reset(в начале setup)
+
+static void logResetCauseAndCheckpoint()
+{
+	// IWatchdog.isReset(true) вернет true если был reset от IWDG и сразу очистит флаг
+	bool wasIwdg = IWatchdog.isReset(true);
+
+	if (wasIwdg) {
+		uint16_t chk = checkpointRead();
+
+		char line[96];
+		snprintf(line, sizeof(line), "RESET:IWDG lastChk=%u(%s)", (unsigned)chk, checkpointName(chk));
+		SdLogLine(line);
+	}
+}
+
+static void watchdogInit()
+{
+	// отметим,что дошли до старта WDT
+	setCheckpoint(CHK_BOOT);
+
+	IWatchdog.begin(WDT_TIMEOUT_US);
+
+	if (!IWatchdog.isEnabled()) {
+		// Не блокируем навсегда,но можно логнуть
+		SdLogLine("WDT:FAILED_TO_ENABLE");
+	}
+	else {
+		SdLogLine("WDT:ENABLED");
+	}
+}
+
+static inline void watchdogKick()
+{
+	IWatchdog.reload();
+}
+
+//================================================================================
+
+
+void setup()
+{
+	// отпустить PWRKEY
+	pinMode(PE0, OUTPUT);
+	digitalWrite(PE0, LOW);
+	pinMode(PA0, INPUT_PULLUP); // SW5:0 = запрет сохранения
+	ledsInit();
+
+	Serial.begin(115200);
+
+	// версия
+	String ver_soft = __FILE__;
+	int val_srt = ver_soft.lastIndexOf('\\');
+	if (val_srt >= 0) ver_soft.remove(0, val_srt + 1);
+	val_srt = ver_soft.lastIndexOf('.');
+	if (val_srt >= 0) ver_soft.remove(val_srt);
+
+	menu_start.setup(ver_soft);
+
+	delay(1000);
+	Serial.println("Start system");
+	Serial.println(ver_soft);
+
+	// I2C
+	Wire.begin();
+	Wire.setClock(100000);
+
+	internet2.begin();
+
+	syncStore.defaults(syncData);
+	if (syncStore.begin()) 
+	{
+		bool ok = syncStore.load(syncData);
+		Serial.print("SyncSourcesStore.load="); Serial.println(ok);
+	}
+
+	rtc.begin();
+
+	// EEPROM cfg
+	const bool FORCE_EEPROM_INIT = false;
+	if (ee.begin()) {
+		if (FORCE_EEPROM_INIT) {
+			Serial.println(F("FORCE EEPROM INIT"));
+			AT24C128Settings::defaults(cfg);
+			ee.save(cfg, true);
+		}
+		ee.load(cfg, false);
+	}
+	else {
+		Serial.println(F("EEPROM AT24C128 not found"));
+		AT24C128Settings::defaults(cfg);
+	}
+
+	// LAN (Internet1)
+	NtpLanService_Generic::NetConfig net;
+	net.macIndex = 0;
+	net.useDhcp = true;
+	net.upstreamIp = IPAddress(162, 159, 200, 123);
+	net.syncPeriodMs = 3600000UL;
+
+	ntpLan.begin(net);
+	ntpLan.forceSyncNow();
+
+	lanStore.begin();
+
+	// 7-seg + freq input
+	pcfHour.begin();
+	pcfMin.begin();
+	pcfSec.begin();
+
+	pinMode(INPUT_PIN, INPUT);
+	attachInterrupt(INPUT_PIN, freqInterrupt, RISING);
+
+	// GPS
+	gps_Serial.begin(9600);
+	gps.begin(9600); // если в вашем GPSNmeaParser begin не нужен — удалите эту строку
+
+	// SIM
+	sim.begin(9600);
+	//sim.setDebug(&Serial,false); //
+	sim.setHealthPingMs(60000);
+	sim.setMaxRecoveryAttempts(5);
+
+	// Если у вас реализован статус-опрос в SIM800TimeAsync — оставьте.
+	// Иначе закомментируйте следующую строку.
+	//!!sim.setStatusPollMs(5000);
+
+	applyCfgToSimNoConflict(cfg);
+	sim.start();
+
+	// Planner
+	planner.begin();
+	planner.onSettingsChanged();
+	planner.triggerImmediate();
+
+	// Применить сохранённые настройки INTERNET1/2 в реальные каналы
+	applyInternet1FromStore();
+	applyInternet2FromStore();
+
+	// HOME
+	menu_start.drawStartPage();
+	web.begin();
+
+	bool sdOk = SetupSD();
+	if (sdOk)
+	{
+		SdLogLine("BOOT:SD OK");
+		Serial.println("BOOT:SD OK");
+	}
+	else
+	{
+		SdLogLine("BOOT:SD NO"); // ничего не сделает,если SD нет
+		Serial.println("BOOT:SD NO");
+	}
+
+	// ВАЖНО:до включения watchdog пишем причину прошлого сброса
+	logResetCauseAndCheckpoint();
+	watchdogInit();
+
+	//SdLogLine("Start system");
+	//SdLogLine("Version:");
+	//SdLogLine(ver_soft.c_str());
+
+	SdLogLine("Start system");
+	{
+		char b[96];
+		snprintf(b, sizeof(b), "Version:%s", ver_soft.c_str());
+		SdLogLine(b);
+	}
+
+}
+
+
+void loop()
+{
+	const uint32_t now = millis();
+
+	// --- loop begin ---
+	setCheckpoint(CHK_LOOP_BEGIN);
+	watchdogKick();
+
+	pumpUiButtons();
+
+	// --- GPS parsing ---
+	setCheckpoint(CHK_GPS_TICK);
+	watchdogKick();
+	gps.tick();
+	watchdogKick();
+
+	pumpUiButtons();
+
+	// --- Internet1 tick ---
+	setCheckpoint(CHK_NET1_TICK);
+	watchdogKick();
+	ntpLan.tick();
+	watchdogKick();
+
+	pumpUiButtons();
+
+	// --- IP feeds (for HOME) ---
+	setCheckpoint(CHK_IP_FEEDS);
+	watchdogKick();
+	updateIp1Feed1Hz();
+	updateIp2Feed1Hz();
+	watchdogKick();
+
+	if (gIpUpdated) { gIpUpdated = false; menu_start.invalidateHome(); }
+
+	// --- Periodically push RTC time to Internet2 (UTC) ---
+	static uint32_t tSend = 0;
+	if (now - tSend > 500)
+	{
+		tSend = now;
+
+		setCheckpoint(CHK_NET2_TIME_PUSH);
+		watchdogKick();
+
+		RTCTime nowLocal = rtc.getTime();
+		uint32_t unixUtc = unixUtcFromRtcLocal(nowLocal, cfg.tzTargetHours);
+		internet2.setTimeUnixUtc(unixUtc, 0);
+
+		watchdogKick();
+	}
+
+	// --- Internet2 edge/tick ---
+	setCheckpoint(CHK_NET2_EDGE);
+	watchdogKick();
+	tickInternet2TimePushEdge();
+	watchdogKick();
+
+	// --- SIM tick ---
+	setCheckpoint(CHK_SIM_TICK);
+	watchdogKick();
+	sim.tick();
+	watchdogKick();
+
+	pumpUiButtons();
+
+	// --- Planner tick (GPS > NET2 > NET(sim NTP) > GSM(sim)) ---
+	setCheckpoint(CHK_PLANNER_TICK);
+	watchdogKick();
+	planner.tick();
+	watchdogKick();
+
+	// --- Frequency calc (1 Hz) ---
+	setCheckpoint(CHK_FREQ_1HZ);
+	watchdogKick();
+
+	static uint32_t lastFreqUpdate = 0;
+	static float lastMeasuredFreq = 0.0f;
+
+	if (now - lastFreqUpdate > 1000) {
+		noInterrupts();
+		uint16_t n = diff_count;
+		uint32_t sum = diff_sum;
+		diff_count = 0;
+		diff_sum = 0;
+		interrupts();
+
+		if (n > 0) {
+			float Tavg = (float)sum / n;
+			frequency = (1e6f / Tavg);
+			lastMeasuredFreq = frequency;
+		}
+		lastFreqUpdate = now;
+	}
+
+	watchdogKick();
+
+	// --- 7-seg display (when menu not active) ---
+	if (!menu_start.isActive())
+	{
+		static bool lastBtnState = HIGH;
+		static uint32_t lastDebounce = 0;
+		bool btnState = digitalRead(SW4_PIN);
+
+		if (btnState != lastBtnState) {
+			lastDebounce = now;
+			lastBtnState = btnState;
+		}
+		bool btnStableState = lastBtnState;
+		if ((now - lastDebounce) > 25) btnStableState = btnState;
+
+		static uint8_t prev_hour = 255, prev_min = 255, prev_sec = 255;
+		static uint32_t prevFreqInt = 0, prevFreqFrac = 0;
+
+		if (btnStableState == LOW)
+		{
+			uint32_t curFreqInt = (uint32_t)lastMeasuredFreq;
+			uint32_t curFreqFrac = (uint32_t)((lastMeasuredFreq - curFreqInt) * 10000.0);
+			if (curFreqInt != prevFreqInt || curFreqFrac != prevFreqFrac) {
+				displayFrequency(lastMeasuredFreq);
+				prevFreqInt = curFreqInt;
+				prevFreqFrac = curFreqFrac;
+			}
+		}
+		else
+		{
+			RTCTime t = rtc.getTime();
+			if (t.hour != prev_hour || t.minute != prev_min || t.second != prev_sec) {
+				displayTime(t.hour, t.minute, t.second);
+				prev_hour = t.hour;
+				prev_min = t.minute;
+				prev_sec = t.second;
+
+				snprintf(gDateStr, sizeof(gDateStr), "%02u.%02u.%04u",
+					(unsigned)t.dayOfMonth, (unsigned)t.month, (unsigned)t.year);
+				snprintf(gTimeStr, sizeof(gTimeStr), "%02u:%02u:%02u",
+					(unsigned)t.hour, (unsigned)t.minute, (unsigned)t.second);
+				gTimeUpdated = true;
+			}
+		}
+	}
+
+	// --- Menu update (HOME refresh every 500ms inside Menu.cpp) ---
+	setCheckpoint(CHK_MENU_UPDATE);
+	watchdogKick();
+	menu_start.update();
+	watchdogKick();
+
+	pumpUiButtons();
+
+	// --- Time received from SIM -> set RTC (to cfg.tzTargetHours local) ---
+	if (sim.hasNewTime())
+	{
+		setCheckpoint(CHK_SIM_TIME_APPLY);
+		watchdogKick();
+
+		String raw = sim.lastCCLKRaw();
+
+		int y, mo, d, h, mi, s, tzq_net;
+		if (SIM800TimeAsync::parseCCLK(raw, y, mo, d, h, mi, s, tzq_net))
+		{
+			// 1) local(net) -> UTC
+			localToUTC(y, mo, d, h, mi, s, tzq_net);
+
+			// 2) UTC -> local(target TZ from cfg)
+			int tzq_target = (int)cfg.tzTargetHours * 4;
+			utcToLocal(y, mo, d, h, mi, s, tzq_target);
+
+			uint8_t dsDow = ds3231DowFromDow0(dow0_sun(y, mo, d));
+
+			rtc.setTime((uint8_t)s, (uint8_t)mi, (uint8_t)h,
+				dsDow, (uint8_t)d, (uint8_t)mo, (uint16_t)y);
+			pulseSyncLed(SYNC_GSM);
+
+			snprintf(gDateStr, sizeof(gDateStr), "%02d.%02d.%04d", d, mo, y);
+			snprintf(gTimeStr, sizeof(gTimeStr), "%02d:%02d:%02d", h, mi, s);
+			gTimeUpdated = true;
+			menu_start.invalidateHome();
+
+			planner.onTimeUpdated();
+		}
+
+		watchdogKick();
+	}
+
+	// --- Net status cache for display ---
+	setCheckpoint(CHK_NETFEED_FROM_SIM);
+	watchdogKick();
+	NetFeed_UpdateFromSim(sim);
+	watchdogKick();
+
+	if (gNetUpdated)
+	{
+		gNetUpdated = false;
+		menu_start.invalidateHome();
+	}
+
+	// --- Supervisors + WEB + LEDs ---
+	setCheckpoint(CHK_SUPERVISORS);
+	watchdogKick();
+	tickInternet1LinkSupervisor();
+	tickInternet2LinkSupervisor();
+	watchdogKick();
+
+	setCheckpoint(CHK_WEB_TICK);
+	watchdogKick();
+	web.tick();
+	watchdogKick();
+
+	setCheckpoint(CHK_SYNCLED);
+	watchdogKick();
+	tickSyncLedPulses();
+	watchdogKick();
+}
+
+
+
